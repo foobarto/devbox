@@ -40,7 +40,7 @@ brew install --HEAD foobarto/tap/devbox
 
 Installs `devbox` and `devbox-ai-proxy` on your `PATH`. It's a `--HEAD` install
 (tracks the latest `main`). The current stable GitHub release is
-[`v1.0.2`](https://github.com/foobarto/devbox/releases/tag/v1.0.2); source
+[`v1.0.3`](https://github.com/foobarto/devbox/releases/tag/v1.0.3); source
 archives are available from that release. Config lives under `~/.config/devbox/`
 (or `$XDG_CONFIG_HOME/devbox`).
 
@@ -97,7 +97,7 @@ Flags combine, e.g. `devbox --ssh-agent --proxy --mount ~/data:ro --copy ~/.netr
    - applies `DIR/.devbox.toml` if present (per-project setup — see
      [`examples/.devbox.toml`](examples/.devbox.toml)),
    - drops you into a shell in `DIR`,
-   - on exit, **deletes** the clone — unless `--keep`, or the box pre-existed.
+   - on exit, **deletes** the clone — unless that invocation uses `--keep`.
 
 Because the name is deterministic, re-running `devbox` in the same folder finds
 the same box. That's what makes "one box per folder" and re-entering `--keep`

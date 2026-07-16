@@ -9,7 +9,7 @@
 #   deterministically from the target directory — so a given folder always maps
 #   to the same box (one box per folder), and different folders get different
 #   boxes. The clone mounts the folder, drops you into a shell, and is deleted
-#   on exit (unless --keep, or it pre-existed).
+#   on exit unless that invocation uses --keep.
 #
 # Usage
 #   devbox [DIR] [FLAGS]        spin/attach a box for DIR (default: $PWD)
@@ -573,13 +573,12 @@ cmd_build() {
 
 # Teardown runs from an EXIT/INT/TERM trap, which fires after cmd_run has
 # returned — so its state must be global, not cmd_run locals (those are gone by
-# then, and would trip `set -u`).
+# then, and would trip `set -u`). A prior process may have left a box behind,
+# but the disposable default still applies when this invocation exits.
 run_cleanup() {
   local rc=$?
   trap - EXIT INT TERM
-  if [[ "${_DB_PRE:-0}" -eq 1 ]]; then
-    log "Left box running: ${_DB_NAME:-?}  (destroy: devbox destroy ${_DB_NAME:-?})"
-  elif [[ "${_DB_KEEP:-0}" -eq 1 ]]; then
+  if [[ "${_DB_KEEP:-0}" -eq 1 ]]; then
     log "--keep: retained ${_DB_NAME:-?}"
     log "  re-enter: devbox $(printf '%q' "${_DB_DIR:-.}")$([[ "${_DB_IMAGE:-}" != "$DEFAULT_IMAGE" ]] && printf ' --image %q' "${_DB_IMAGE:-}")"
     log "  destroy:  devbox destroy ${_DB_NAME:-?}"
@@ -684,9 +683,7 @@ cmd_run() {
   local golden; golden="$(golden_name "$image")"
   [[ -n "$name" ]] || name="$(instance_name "$image" "$dir")"
 
-  local preexisting=0
   if instance_exists "$name"; then
-    preexisting=1
     log "Attaching to existing box for this path: $name"
     [[ ${#extra_mounts[@]} -gt 0 ]] && warn "--mount only applies at box creation; destroy+recreate to change mounts (--copy still works)"
   else
@@ -702,7 +699,7 @@ cmd_run() {
   fi
   [[ $ssh_agent -eq 1 ]] && enable_ssh_agent "$name"
 
-  _DB_NAME="$name"; _DB_DIR="$dir"; _DB_IMAGE="$image"; _DB_KEEP="$keep"; _DB_PRE="$preexisting"
+  _DB_NAME="$name"; _DB_DIR="$dir"; _DB_IMAGE="$image"; _DB_KEEP="$keep"
   trap run_cleanup EXIT INT TERM
 
   if [[ "$(instance_status "$name")" != "Running" ]]; then
@@ -731,7 +728,7 @@ cmd_run() {
   fi
 
   local fate="destroy it"
-  { [[ $preexisting -eq 1 || $keep -eq 1 ]]; } && fate="leave it running"
+  [[ $keep -eq 1 ]] && fate="leave it running"
   log "Entering $name — exit the shell to $fate."
   limactl shell --workdir "$dir" "$name" || true
 }

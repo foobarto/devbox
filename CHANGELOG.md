@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.3 - 2026-07-16
+
+- Restore the disposable default for existing boxes: a normal invocation now
+  destroys its Devbox on shell exit; only `--keep` retains it.
+
 ## v1.0.2 - 2026-07-16
 
 - Configure signed Git commits through the host SSH agent whenever
