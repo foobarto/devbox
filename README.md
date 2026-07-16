@@ -67,7 +67,7 @@ devbox destroy NAME | --all | --goldens
 | `--image NAME` | base image for this box's golden (default `ubuntu-24.04`). See [Images](#images). |
 | `--keep` | don't auto-delete the box on exit. |
 | `--ssh-agent` | forward the host SSH agent into the box (git/GitHub). Host **private keys never enter the VM** — only the agent socket is forwarded. |
-| `--proxy[=URL]` | point the AI CLIs at a host-side proxy; credentials stay on the host. Default `http://host.lima.internal:4000`. |
+| `--proxy[=URL]` | point the AI CLIs at a host-side proxy; credentials stay on the host. Default `http://host.lima.internal:4141`. |
 | `--api-keys[=FILE]` | inject API keys into the box from an env file (default `~/.config/devbox/api-keys.env`). |
 | `--with-creds` | copy host AI-tool credential files into the box (OAuth logins for claude/codex without a proxy). Best-effort. |
 | `--mount PATH[:ro\|:rw]` | mount an extra host path into the box at the same path (default `ro`). Repeatable; applied at box creation. |
@@ -130,7 +130,9 @@ Installed ≠ authenticated. Three combinable strategies, pick per your setup:
 
 The proxy supports **both** API keys and OAuth logins (refreshed on the host,
 read fresh per request) — see [`proxy/README.md`](proxy/README.md) for the full
-explanation. `--proxy` is the recommended default for disposable boxes.
+explanation. `--proxy` is the recommended default for disposable boxes, and it
+**auto-starts the host proxy** (once, shared across boxes) — no separate launch
+step. Manage it with `devbox proxy [start|stop|status]`.
 
 Git/GitHub auth is separate: use **`--ssh-agent`**.
 

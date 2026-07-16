@@ -16,6 +16,7 @@
 #   devbox build [--image N] [--force]
 #   devbox ls
 #   devbox destroy NAME | --all | --goldens
+#   devbox proxy [start|stop|status]   manage the shared host-side AI proxy
 #
 # Run flags
 #   --image NAME     base image for this box's golden (default: ubuntu-24.04).
@@ -27,8 +28,9 @@
 #   --ssh-agent      forward the host SSH agent into the box (git/GitHub auth);
 #                    host private keys never enter the VM.
 #   --proxy[=URL]    point the AI CLIs at a host-side proxy (default
-#                    http://host.lima.internal:4000); real credentials stay on
-#                    the host. See proxy/README.md.
+#                    http://host.lima.internal:4141); real credentials stay on
+#                    the host. Auto-starts the proxy on this host if it isn't
+#                    already running (shared across boxes). See proxy/README.md.
 #   --api-keys[=F]   inject API keys into the box from env file F
 #                    (default ~/.config/devbox/api-keys.env).
 #   --with-creds     copy host AI-tool credential files into the box (OAuth
@@ -49,7 +51,7 @@ set -euo pipefail
 DEFAULT_IMAGE="ubuntu-24.04"
 CONFIG_DIR="${DEVBOX_CONFIG_DIR:-$HOME/.config/devbox}"
 DEFAULT_KEYS_FILE="$CONFIG_DIR/api-keys.env"
-PROXY_DEFAULT_URL="${DEVBOX_PROXY_URL:-http://host.lima.internal:4000}"
+PROXY_DEFAULT_URL="${DEVBOX_PROXY_URL:-http://host.lima.internal:4141}"
 
 # Host credential paths copied into the box under --with-creds (best-effort;
 # only those that exist are copied). Tune to taste. Deliberately excludes
@@ -196,6 +198,50 @@ verify_golden() {
 }
 
 # ------------------------------------------------------------- auth wiring ---
+# --- host-side AI proxy lifecycle (auto-started by --proxy) ----------------
+# port of a proxy URL (default 4141)
+proxy_port() {
+  local hp="${1#*://}"; hp="${hp%%/*}"
+  case "$hp" in *:*) printf '%s' "${hp##*:}";; *) printf '4141';; esac
+}
+# is *our* proxy answering on this port? (health endpoint, not just any listener)
+proxy_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -q 'devbox-ai-proxy'; }
+# is anything at all listening on the port?
+proxy_port_open() { timeout 1 bash -c ">/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
+# locate the proxy launcher across source (../proxy) and brew (../libexec/proxy)
+# layouts, falling back to a devbox-ai-proxy on PATH.
+proxy_launcher() {
+  local self dir c
+  self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+  dir="$(dirname "$self")"
+  for c in "$dir/../proxy/run.sh" "$dir/../libexec/proxy/run.sh"; do
+    [[ -f "$c" ]] && { printf '%s' "$c"; return 0; }
+  done
+  command -v devbox-ai-proxy 2>/dev/null && return 0
+  return 1
+}
+# start the host proxy if it isn't already up (idempotent). Shared across boxes.
+proxy_ensure() {
+  local url="$1" port launcher logf i
+  port="$(proxy_port "$url")"
+  if proxy_health "$port"; then log "AI proxy already running on 127.0.0.1:$port"; return 0; fi
+  if proxy_port_open "$port"; then
+    warn "port $port is held by another service (not devbox's proxy)."
+    warn "  pick a free port: export DEVBOX_PROXY_URL=http://host.lima.internal:<PORT>"
+    return 1
+  fi
+  launcher="$(proxy_launcher)" || { warn "proxy launcher not found — start it manually (devbox-ai-proxy)"; return 0; }
+  mkdir -p "$CONFIG_DIR"; logf="$CONFIG_DIR/proxy.log"
+  [[ -f "$CONFIG_DIR/api-keys.env" || -f "$CONFIG_DIR/proxy.config.json" ]] \
+    || warn "no ~/.config/devbox/{api-keys.env,proxy.config.json} — proxy runs with example config (see proxy/README.md)"
+  log "Starting AI proxy on :$port  ($launcher)"
+  setsid "$launcher" >"$logf" 2>&1 </dev/null &
+  echo $! > "$CONFIG_DIR/proxy.pid"
+  for i in $(seq 1 20); do proxy_health "$port" && break; sleep 0.2; done
+  if proxy_health "$port"; then log "AI proxy up (pid $(cat "$CONFIG_DIR/proxy.pid" 2>/dev/null), log: $logf)"
+  else warn "proxy did not come up — see $logf"; fi
+}
+
 apply_proxy() {
   local name="$1" url="$2" tmpl="$CONFIG_DIR/proxy-env"
   log "Wiring AI CLIs → proxy $url"
@@ -373,7 +419,7 @@ cmd_run() {
     log "Booting $name…"; limactl start "$name"
   fi
 
-  [[ -n "$proxy"     ]] && apply_proxy    "$name" "$proxy"
+  if [[ -n "$proxy" ]]; then proxy_ensure "$proxy"; apply_proxy "$name" "$proxy"; fi
   [[ -n "$api_keys"  ]] && apply_api_keys "$name" "$api_keys"
   [[ $with_creds -eq 1 ]] && apply_creds  "$name"
   if [[ ${#extra_copies[@]} -gt 0 ]]; then
@@ -392,6 +438,23 @@ cmd_run() {
 }
 
 cmd_ls() { limactl list 2>/dev/null | awk 'NR==1 || $1 ~ /^devbox-/'; }
+
+cmd_proxy() {
+  local sub="${1:-status}" url="${DEVBOX_PROXY_URL:-$PROXY_DEFAULT_URL}" port pid
+  port="$(proxy_port "$url")"
+  case "$sub" in
+    start)  proxy_ensure "$url";;
+    stop)   pid="$(cat "$CONFIG_DIR/proxy.pid" 2>/dev/null || true)"
+            if [[ -n "$pid" ]] && kill "$pid" 2>/dev/null; then
+              log "stopped AI proxy (pid $pid)"; rm -f "$CONFIG_DIR/proxy.pid"
+            elif pkill -f 'devbox-ai-proxy\.py' 2>/dev/null; then log "stopped AI proxy (matched by name)"
+            else warn "no running AI proxy found"; fi;;
+    status) if proxy_health "$port"; then log "AI proxy: RUNNING on 127.0.0.1:$port"
+            elif proxy_port_open "$port"; then warn "port $port held by another (non-devbox) service"
+            else log "AI proxy: not running (port $port)"; fi;;
+    *) die "usage: devbox proxy [start|stop|status]";;
+  esac
+}
 
 cmd_destroy() {
   local t="${1:-}"; [[ -n "$t" ]] || die "usage: devbox destroy NAME | --all | --goldens"
@@ -422,6 +485,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     build)          shift; cmd_build   "$@";;
     ls|list)        shift; cmd_ls      "$@";;
     destroy|rm)     shift; cmd_destroy "$@";;
+    proxy)          shift; cmd_proxy   "$@";;
     *)              cmd_run "$@";;
   esac
 fi

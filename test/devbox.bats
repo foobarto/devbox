@@ -150,6 +150,13 @@ setup() {
   run _copy_dest /host/dir:/guest/dest; [ "$output" = "/guest/dest" ]
 }
 
+# ------------------------------------------------------------------- proxy ----
+@test "proxy_port extracts port and defaults to 4141" {
+  run proxy_port http://host.lima.internal:4141; [ "$output" = "4141" ]
+  run proxy_port http://host.lima.internal:5001; [ "$output" = "5001" ]
+  run proxy_port http://host;                     [ "$output" = "4141" ]
+}
+
 # ---------------------------------------------------------------- dispatch ----
 @test "--help prints usage and exits 0" {
   # help case is dispatched before `need limactl`, so it works with no VM stack.

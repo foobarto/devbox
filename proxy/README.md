@@ -51,24 +51,37 @@ Anthropic updates it.
 
 ## Quick start
 
+Configure host-side keys/routes once:
+
 ```sh
 mkdir -p ~/.config/devbox
 cp proxy/api-keys.env.example       ~/.config/devbox/api-keys.env      # fill in
 cp proxy/proxy.config.example.json  ~/.config/devbox/proxy.config.json # edit routes
-proxy/run.sh                                                           # leave running
 ```
 
-Then in any project:
+Then just use `--proxy` — **devbox auto-starts the host proxy** (once, shared
+across boxes) if it isn't already running:
 
 ```sh
-devbox --proxy          # VM's ANTHROPIC_BASE_URL / OPENAI_BASE_URL → the proxy
+devbox --proxy          # starts the proxy on the host, wires the box's env to it
+```
+
+Manage the shared proxy directly if you want:
+
+```sh
+devbox proxy status     # RUNNING / not running / port held by another service
+devbox proxy start      # start it without a box
+devbox proxy stop       # stop it
 ```
 
 The guest reaches the host at `host.lima.internal`, so the default proxy URL is
-`http://host.lima.internal:4000`. Because the guest reaches the host over Lima's
-user-network gateway, the proxy binds `0.0.0.0` by default. It's your machine —
-restrict with a firewall if you want it tighter, or set `"listen"` to a specific
-interface.
+`http://host.lima.internal:4141` (a devbox-specific port chosen to avoid common
+collisions — `4000` is often taken). If the port is already held by a
+non-devbox service, devbox refuses to start rather than clobber it; set
+`DEVBOX_PROXY_URL` to a free port. Because the guest reaches the host over
+Lima's user-network gateway, the proxy binds `0.0.0.0` by default — restrict
+with a firewall if you want it tighter, or set `"listen"` to a specific
+interface. Logs go to `~/.config/devbox/proxy.log`.
 
 ## Heavier off-the-shelf alternatives
 

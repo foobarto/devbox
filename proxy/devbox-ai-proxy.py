@@ -84,6 +84,21 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("[devbox-ai-proxy] %s %s\n" % (self.command, self.path))
 
     def _proxy(self):
+        # Health/identity endpoint so callers can distinguish this proxy from
+        # any other service that happens to hold the port.
+        if self.path.startswith("/_devbox"):
+            body = b"devbox-ai-proxy ok\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Devbox-Proxy", "1")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.close_connection = True
+            return
         route = match_route(self.path)
         if route is None:
             self.send_error(404, "no matching route")

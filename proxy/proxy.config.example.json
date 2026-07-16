@@ -1,5 +1,5 @@
 {
-  "listen": "0.0.0.0:4000",
+  "listen": "0.0.0.0:4141",
 
   "_notes": [
     "Routes are matched top-to-bottom by URL-path prefix; list the most",
@@ -8,8 +8,8 @@
     "  token-file:/path#a.b.c       JSON field read FRESH on every request",
     "  token-cmd:some command       stdout of a command, per request",
     "Point the box's env at this proxy (devbox --proxy handles it):",
-    "  ANTHROPIC_BASE_URL=http://host.lima.internal:4000",
-    "  OPENAI_BASE_URL=http://host.lima.internal:4000/v1"
+    "  ANTHROPIC_BASE_URL=http://host.lima.internal:4141",
+    "  OPENAI_BASE_URL=http://host.lima.internal:4141/v1"
   ],
 
   "routes": [
