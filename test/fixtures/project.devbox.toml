@@ -1,0 +1,9 @@
+image = "debian-12"
+packages = ["node", "go"]
+start = "npm ci"
+ssh_agent = true
+keep = true
+proxy = "http://host.lima.internal:4141"
+with_creds = true
+mounts = ["/host/data:ro"]
+copies = ["/host/.netrc:~/.netrc"]

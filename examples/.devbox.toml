@@ -1,0 +1,26 @@
+# Per-project Devbox manifest. Copy this to a project's root as `.devbox.toml`.
+# CLI flags override image/proxy/API-key choices here. Host-affecting options
+# declared in this file are shown and require an explicit approval on startup.
+
+# Select the Lima image and therefore the matching Devbox golden. Omit to use
+# the default image (`ubuntu-24.04`).
+image = "ubuntu-24.04"
+
+# Homebrew formulae installed in the box before the startup command runs.
+packages = ["node", "python@3.12"]
+
+# Optional shell command, run in the project directory after boot. It is shown
+# in the approval prompt before it runs. Keep long-running development servers
+# out of this field unless you intentionally want the shell to wait for them.
+start = "npm install"
+
+# The remaining fields are opt-in host-affecting capabilities. Uncomment what
+# the project genuinely needs; each is listed in the approval prompt.
+# ssh_agent = true
+# keep = true
+# proxy = true                         # or "http://host.lima.internal:4141"
+# api_keys = true                      # or "/path/to/api-keys.env"
+# with_creds = true
+# mounts = ["/host/data:ro", "/host/cache:rw"]
+# copies = ["~/.netrc", "./tooling:~/tooling"]
+# no_auth = true                       # cannot be combined with proxy/api_keys/with_creds

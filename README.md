@@ -28,7 +28,7 @@ devbox                       # clone → mount CWD → shell in → delete on ex
 ## Requirements
 
 - [Lima](https://lima-vm.io) ≥ 2.0 (`limactl`) with a QEMU or VZ backend
-- `python3` (only if you use the [proxy](proxy/README.md); standard library only)
+- `python3` ≥ 3.11 (for the [proxy](proxy/README.md) and `.devbox.toml`; standard library only)
 
 ## Install
 
@@ -39,10 +39,15 @@ brew install --HEAD foobarto/tap/devbox
 ```
 
 Installs `devbox` and `devbox-ai-proxy` on your `PATH`. It's a `--HEAD` install
-(tracks the latest `main` — no tagged release yet). Config lives under
-`~/.config/devbox/` (or `$XDG_CONFIG_HOME/devbox`).
+(tracks the latest `main`). The current stable GitHub release is
+[`v1.0.0`](https://github.com/foobarto/devbox/releases/tag/v1.0.0); source
+archives are available from that release. Config lives under `~/.config/devbox/`
+(or `$XDG_CONFIG_HOME/devbox`).
 
 Upgrade with `brew upgrade --fetch-HEAD foobarto/tap/devbox`.
+
+Check the installed version with `devbox --version` or
+`devbox-ai-proxy --version`.
 
 ### From source
 
@@ -68,6 +73,7 @@ devbox destroy NAME | --all | --goldens
 | `--keep` | don't auto-delete the box on exit. |
 | `--ssh-agent` | forward the host SSH agent into the box (git/GitHub). Host **private keys never enter the VM** — only the agent socket is forwarded. |
 | `--proxy[=URL]` | point the AI CLIs at a host-side proxy; credentials stay on the host. Default `http://host.lima.internal:4141`. |
+| `--no-auth` | explicitly disable Devbox-managed proxy, API-key, and copied-credential auth; removes its proxy/key profiles from an existing box. |
 | `--api-keys[=FILE]` | inject API keys into the box from an env file (default `~/.config/devbox/api-keys.env`). |
 | `--with-creds` | copy host AI-tool credential files into the box (OAuth logins for claude/codex without a proxy). Best-effort. |
 | `--mount PATH[:ro\|:rw]` | mount an extra host path into the box at the same path (default `ro`). Repeatable; applied at box creation. |
@@ -88,8 +94,8 @@ Flags combine, e.g. `devbox --ssh-agent --proxy --mount ~/data:ro --copy ~/.netr
    - else **clones** the golden (`limactl clone`, fast — a copy of the
      already-provisioned disk, no re-install), mounts `DIR` writable at the same
      path, and boots.
-   - runs `DIR/.devbox` if present (per-project setup — see
-     [`examples/.devbox`](examples/.devbox)),
+   - applies `DIR/.devbox.toml` if present (per-project setup — see
+     [`examples/.devbox.toml`](examples/.devbox.toml)),
    - drops you into a shell in `DIR`,
    - on exit, **deletes** the clone — unless `--keep`, or the box pre-existed.
 
@@ -124,24 +130,48 @@ Installed ≠ authenticated. Three combinable strategies, pick per your setup:
 | you want | use | where secrets live |
 |---|---|---|
 | keys/tokens never enter the box | [`--proxy`](proxy/README.md) | host only |
+| explicitly opt out of Devbox auth | `--no-auth` | no new credentials injected |
 | API keys (opencode, stado, OpenAI/Codex platform keys) | `--api-keys` | copied into the box |
 | Claude/Codex **subscription OAuth** without a proxy | `--with-creds` | copied into the box |
 | nothing | *(default)* | you log in interactively inside the box |
 
-The proxy supports **both** API keys and OAuth logins (refreshed on the host,
-read fresh per request) — see [`proxy/README.md`](proxy/README.md) for the full
-explanation. `--proxy` is the recommended default for disposable boxes, and it
-**auto-starts the host proxy** (once, shared across boxes) — no separate launch
-step. Manage it with `devbox proxy [start|stop|status]`.
+The proxy supports API keys plus Claude and Codex OAuth logins. A host CLI login
+works with `--proxy` out of the box; its access token is read fresh, refreshed
+on the host in the background, and never enters the box. See
+[`proxy/README.md`](proxy/README.md) for the full explanation. `--proxy` is the
+recommended default for disposable boxes, and it auto-starts the host proxy
+(once, shared across boxes) — no separate launch step. Manage it with
+`devbox proxy [start|stop|status]`.
 
 Git/GitHub auth is separate: use **`--ssh-agent`**.
 
+`--no-auth` is the explicit opt-out for a kept box that was previously started
+with `--proxy` or `--api-keys`; it removes Devbox's profile snippets before the
+shell opens. It does not delete credentials created manually inside the VM, and
+cannot be combined with `--proxy`, `--api-keys`, or `--with-creds`.
+
 ## Per-project setup
 
-If the mounted directory contains a `.devbox` script, it runs inside the box
-after boot (as you, in the project dir). Declare project-specific tooling there
-on top of the minimal baseline. Template:
-[`examples/.devbox`](examples/.devbox).
+Use a `.devbox.toml` manifest in the project root to select an image, install
+Homebrew packages, and run a startup command inside the box. The image selects
+the matching Devbox golden; an explicit `--image` flag wins over the manifest.
+
+```toml
+image = "ubuntu-24.04"
+packages = ["node", "python@3.12"]
+start = "npm install"
+```
+
+The manifest can also declare `ssh_agent`, `keep`, `proxy`, `api_keys`,
+`with_creds`, `mounts`, `copies`, and `no_auth`. Because a project manifest is
+repository-controlled input, Devbox prints every requested host-affecting
+capability and startup command, then requires an explicit `y` before creating
+or attaching to a box. Command-line flags remain explicit user choices and are
+not included in that confirmation. See the complete annotated template:
+[`examples/.devbox.toml`](examples/.devbox.toml).
+
+The old executable `.devbox` hook is no longer run; Devbox emits a migration
+warning when it finds one.
 
 ## Config
 
@@ -163,6 +193,7 @@ generation, dispatch) and spin up no VM, so they're fast.
 
 ```sh
 brew install bats-core     # once
+make hooks                 # once per checkout; enables credential guard
 make test                  # or: bats test/
 ```
 

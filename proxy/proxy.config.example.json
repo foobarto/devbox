@@ -7,6 +7,8 @@
     "  env:NAME                     static API key from the proxy's environment",
     "  token-file:/path#a.b.c       JSON field read FRESH on every request",
     "  token-cmd:some command       stdout of a command, per request",
+    "  auto:anthropic                API key, then host Claude OAuth with refresh",
+    "  auto:openai                   API key, then host Codex OAuth with refresh",
     "Point the box's env at this proxy (devbox --proxy handles it):",
     "  ANTHROPIC_BASE_URL=http://host.lima.internal:4141",
     "  OPENAI_BASE_URL=http://host.lima.internal:4141/v1"
@@ -14,31 +16,28 @@
 
   "routes": [
     {
-      "_comment": "Anthropic / Claude — API-key mode (default). To use a Claude subscription OAuth login instead, swap 'auth' for the oauth block shown below in _oauth_variant.",
+      "_comment": "Anthropic / Claude — automatic mode. It prefers a host-side ANTHROPIC_API_KEY when configured, otherwise uses the host Claude Code OAuth login. The access token is read fresh on every request.",
       "match": "/v1/messages",
       "upstream": "https://api.anthropic.com",
-      "auth": { "header": "x-api-key", "source": "env:ANTHROPIC_API_KEY" },
+      "auth": { "source": "auto:anthropic" },
       "set_headers": { "anthropic-version": "2023-06-01" },
       "strip_headers": ["authorization"]
     },
 
     {
-      "_comment": "OpenAI / Codex — API-key mode.",
+      "_comment": "Codex logged in with ChatGPT uses this backend endpoint, rather than the public OpenAI API. The devbox profile selects it without storing host credentials in the guest.",
+      "match": "/backend-api/",
+      "upstream": "https://chatgpt.com",
+      "auth": { "source": "auto:codex" },
+      "strip_headers": ["x-api-key"]
+    },
+
+    {
+      "_comment": "OpenAI / Codex — automatic mode. It prefers OPENAI_API_KEY, otherwise uses and refreshes the host Codex OAuth login.",
       "match": "/v1/",
       "upstream": "https://api.openai.com",
-      "auth": { "header": "authorization", "prefix": "Bearer ", "source": "env:OPENAI_API_KEY" },
+      "auth": { "source": "auto:openai" },
       "strip_headers": ["x-api-key"]
     }
-  ],
-
-  "_oauth_variant": {
-    "_comment": "Replace the /v1/messages route's 'auth' + 'set_headers' with this to proxy a Claude subscription OAuth login. The token is read fresh from the host's credential file per request; the host keeps it refreshed. The anthropic-beta value may need updating if Anthropic changes it.",
-    "auth": {
-      "header": "authorization",
-      "prefix": "Bearer ",
-      "source": "token-file:~/.claude/.credentials.json#claudeAiOauth.accessToken"
-    },
-    "set_headers": { "anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20" },
-    "strip_headers": ["x-api-key"]
-  }
+  ]
 }

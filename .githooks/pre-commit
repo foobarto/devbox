@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Reject inline credentials in production scripts before they enter history.
+set -euo pipefail
+
+files=()
+while IFS= read -r -d '' file; do
+  case "$file" in
+    bin/*|proxy/*|.githooks/*) files+=("$file");;
+  esac
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+[[ ${#files[@]} -gt 0 ]] || exit 0
+
+added="$(git diff --cached --no-ext-diff --unified=0 -- "${files[@]}" | sed -n '/^+/ {/+++ /!p;}')"
+[[ -n "$added" ]] || exit 0
+
+# Token field assignments catch JSON and shell snippets. The other expressions
+# cover common opaque API token prefixes and JWTs even when the field name is
+# disguised. Do not print matching lines: they may contain a real secret.
+field_assignment="(access_token|refresh_token|id_token|accessToken|refreshToken|idToken)[[:space:]]*[\"']?[[:space:]]*[:=][[:space:]]*[\"'][^\"']+[\"']"
+shell_assignment='(export[[:space:]]+)?(ACCESS_TOKEN|REFRESH_TOKEN|ID_TOKEN|ACCESS__TOKEN|REFRESH__TOKEN|ID__TOKEN)[[:space:]]*=[[:space:]]*[^$[:space:]][^[:space:]]*'
+jwt='eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}'
+api_token='(sk-(proj-|ant-)?|rk-live-|sess-)[A-Za-z0-9_-]{16,}'
+
+if printf '%s\n' "$added" | LC_ALL=C grep -Eq "$field_assignment|$shell_assignment|$jwt|$api_token"; then
+  printf '%s\n' 'pre-commit: inline OAuth/API credential detected in a production script.' >&2
+  printf '%s\n' 'Keep credentials in the host credential store or environment, never in the repository.' >&2
+  exit 1
+fi

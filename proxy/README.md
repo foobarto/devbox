@@ -5,7 +5,7 @@ A tiny host-side reverse proxy that lets disposable devboxes use AI CLIs
 the proxy injects them and forwards to the provider.
 
 - `devbox-ai-proxy.py` — the proxy. Python **standard library only**, no pip.
-  Streams responses (SSE-safe), a few dozen lines.
+  Streams HTTP responses (SSE-safe) and tunnels Codex WebSockets.
 - `proxy.config.example.json` — route table (which path → which upstream →
   which auth source).
 - `api-keys.env.example` — host-side API keys.
@@ -24,39 +24,40 @@ The alternatives put secrets *inside* the throwaway VM:
 For a *disposable* box, keeping secrets on the host is the safer default: a
 leaky or compromised box can't exfiltrate what it never had.
 
-## The two auth modes (both supported)
+## Authentication (works out of the box)
 
-**1. API keys — static.** `auth.source: "env:OPENAI_API_KEY"`. The proxy reads
-the key from its own environment (via `api-keys.env`) and injects it. Best for
-opencode, stado, OpenAI/Codex-with-a-platform-key, and any provider you use with
-a plain API key.
+For Claude and Codex, `devbox --proxy` needs no proxy configuration file when
+the host CLI is already logged in. Each default route chooses, in order:
 
-**2. OAuth subscription logins — dynamic.** Claude Code / Codex logged in with a
-subscription don't use a static key; they use an OAuth **access token** that
-expires (~hourly) and is refreshed. The trick that makes the proxy work "out of
-the box":
+| provider | API-key preference | OAuth credential |
+|---|---|---|
+| Claude | `ANTHROPIC_API_KEY` | `~/.claude/.credentials.json` |
+| Codex | `OPENAI_API_KEY` | `~/.codex/auth.json` |
 
-> **Refresh happens on the host, not in the VM.** The proxy reads the *current*
-> access token from the host's credential file **on every request**
-> (`auth.source: "token-file:~/.claude/.credentials.json#claudeAiOauth.accessToken"`).
-> As long as the host keeps that file fresh — which it does whenever you use the
-> tool on the host — the VM always gets a valid token, and never sees the
-> refresh token at all.
+The proxy reads access tokens fresh on every request. Its background check runs
+every minute, refreshes a session shortly before expiry, and retries a request
+once after a 401 or 403. It uses OAuth refresh grants rather than sending empty
+model prompts, so it does not consume model usage just to keep a session alive.
+The VM never receives an access or refresh token; the repository also has a
+pre-commit guard against embedding one in production scripts.
 
-Caveat: if the host sits fully idle past token expiry, the file can hold a
-stale token until the next host-side use refreshes it. For always-on setups run
-the tool (or a small refresher) on the host periodically. The `anthropic-beta`
-OAuth header value can also change over time — tune it in the config if
-Anthropic updates it.
+For Codex subscriptions, `devbox --proxy` gives the guest an isolated,
+non-secret Codex profile that points its ChatGPT backend and WebSocket traffic
+to the host proxy. The guest only receives the literal routing marker
+`devbox-proxy`; the host replaces it with the refreshed OAuth header.
+
+For OpenAI/Codex platform keys and the other API-key providers, configure
+`api-keys.env` as before. An explicit `proxy.config.json` still takes full
+control of every route and auth source.
 
 ## Quick start
 
-Configure host-side keys/routes once:
+To use static API keys or custom routes, configure them once:
 
 ```sh
 mkdir -p ~/.config/devbox
 cp proxy/api-keys.env.example       ~/.config/devbox/api-keys.env      # fill in
-cp proxy/proxy.config.example.json  ~/.config/devbox/proxy.config.json # edit routes
+cp proxy/proxy.config.example.json  ~/.config/devbox/proxy.config.json # optional route overrides
 ```
 
 Then just use `--proxy` — **devbox auto-starts the host proxy** (once, shared

@@ -10,8 +10,19 @@
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+if [[ "${1:-}" == "-V" || "${1:-}" == "--version" || "${1:-}" == "version" ]]; then
+  version="$(tr -d '[:space:]' < "$here/../VERSION" 2>/dev/null || printf 'dev')"
+  printf 'devbox-ai-proxy %s\n' "$version"
+  exit 0
+fi
+
 envfile="${DEVBOX_PROXY_ENV:-$HOME/.config/devbox/api-keys.env}"
-if [[ -f "$envfile" ]]; then set -a; . "$envfile"; set +a; fi
+if [[ -f "$envfile" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$envfile"
+  set +a
+fi
 
 cfg="${DEVBOX_PROXY_CONFIG:-$HOME/.config/devbox/proxy.config.json}"
 [[ -f "$cfg" ]] || cfg="$here/proxy.config.example.json"

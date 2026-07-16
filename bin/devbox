@@ -17,6 +17,7 @@
 #   devbox ls
 #   devbox destroy NAME | --all | --goldens
 #   devbox proxy [start|stop|status]   manage the shared host-side AI proxy
+#   devbox --version
 #
 # Run flags
 #   --image NAME     base image for this box's golden (default: ubuntu-24.04).
@@ -31,6 +32,9 @@
 #                    http://host.lima.internal:4141); real credentials stay on
 #                    the host. Auto-starts the proxy on this host if it isn't
 #                    already running (shared across boxes). See proxy/README.md.
+#   --no-auth        do not inject proxy, API-key, or copied host credentials;
+#                    also removes devbox-managed proxy/key profiles from an
+#                    existing box. This is the default for a new box.
 #   --api-keys[=F]   inject API keys into the box from env file F
 #                    (default ~/.config/devbox/api-keys.env).
 #   --with-creds     copy host AI-tool credential files into the box (OAuth
@@ -48,10 +52,14 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------- constants --
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION_FILE="$SCRIPT_DIR/../VERSION"
+DEVBOX_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf 'dev')"
 DEFAULT_IMAGE="ubuntu-24.04"
 CONFIG_DIR="${DEVBOX_CONFIG_DIR:-$HOME/.config/devbox}"
 DEFAULT_KEYS_FILE="$CONFIG_DIR/api-keys.env"
 PROXY_DEFAULT_URL="${DEVBOX_PROXY_URL:-http://host.lima.internal:4141}"
+PROJECT_MANIFEST_NAME=".devbox.toml"
 
 # Host credential paths copied into the box under --with-creds (best-effort;
 # only those that exist are copied). Tune to taste. Deliberately excludes
@@ -186,6 +194,7 @@ YAML
 
 verify_golden() {
   local name="$1" out
+  # shellcheck disable=SC2016 # $t and $(...) expand in the guest shell.
   out="$(limactl shell "$name" -- bash -lc '
     for t in brew claude codex opencode stado; do
       if command -v "$t" >/dev/null 2>&1; then printf "  ok   %-9s %s\n" "$t" "$(command -v "$t")"
@@ -232,8 +241,8 @@ proxy_ensure() {
   fi
   launcher="$(proxy_launcher)" || { warn "proxy launcher not found — start it manually (devbox-ai-proxy)"; return 0; }
   mkdir -p "$CONFIG_DIR"; logf="$CONFIG_DIR/proxy.log"
-  [[ -f "$CONFIG_DIR/api-keys.env" || -f "$CONFIG_DIR/proxy.config.json" ]] \
-    || warn "no ~/.config/devbox/{api-keys.env,proxy.config.json} — proxy runs with example config (see proxy/README.md)"
+  [[ -f "$CONFIG_DIR/api-keys.env" || -f "$CONFIG_DIR/proxy.config.json" || -f "$HOME/.claude/.credentials.json" ]] \
+    || warn "no Anthropic key or host Claude login found — configure ~/.config/devbox/api-keys.env or run 'claude login'"
   log "Starting AI proxy on :$port  ($launcher)"
   setsid "$launcher" >"$logf" 2>&1 </dev/null &
   echo $! > "$CONFIG_DIR/proxy.pid"
@@ -257,6 +266,25 @@ export OPENAI_BASE_URL="$url/v1"
 export OPENAI_API_KEY="\${OPENAI_API_KEY:-devbox-proxy}"
 EOF
   fi
+  # Codex's ChatGPT subscription flow uses a different backend than the public
+  # OpenAI API. Give it an isolated, devbox-owned config pointing at the host
+  # proxy. The dummy API key above is only a routing marker; no OAuth material
+  # is written to the guest.
+  limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-11-codex-proxy.sh >/dev/null' <<'EOF'
+# devbox --proxy: keep Codex's isolated proxy profile separate from user config.
+export CODEX_HOME="$HOME/.devbox/codex-proxy"
+EOF
+  # shellcheck disable=SC2016 # $HOME expands in the guest shell.
+  limactl shell "$name" -- bash -c 'umask 077; install -d -m 700 "$HOME/.devbox/codex-proxy"'
+  # shellcheck disable=SC2016 # $HOME expands in the guest shell.
+  python3 - "$url/backend-api/codex" <<'PY' \
+    | limactl shell "$name" -- bash -c 'tee "$HOME/.devbox/codex-proxy/config.toml" >/dev/null; chmod 600 "$HOME/.devbox/codex-proxy/config.toml"'
+import json
+import sys
+print(f"openai_base_url = {json.dumps(sys.argv[1])}")
+PY
+  # shellcheck disable=SC2016 # $HOME expands in the guest shell.
+  limactl shell "$name" -- bash -c 'rm -f "$HOME/.devbox/codex-proxy/auth.json"'
 }
 
 apply_api_keys() {
@@ -264,6 +292,14 @@ apply_api_keys() {
   [[ -f "$file" ]] || { warn "api-keys file not found: $file (skipping)"; return 0; }
   log "Injecting API keys from $file"
   limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-20-keys.sh >/dev/null' < "$file"
+}
+
+clear_auth() {
+  local name="$1"
+  log "Disabling devbox-managed AI auth in $name"
+  # shellcheck disable=SC2016 # $HOME expands in the guest shell.
+  limactl shell "$name" -- bash -c \
+    'sudo rm -f /etc/profile.d/zz-devbox-10-proxy.sh /etc/profile.d/zz-devbox-11-codex-proxy.sh /etc/profile.d/zz-devbox-20-keys.sh; rm -rf "$HOME/.devbox/codex-proxy"'
 }
 
 # PATH[:ro|:rw] -> a Lima --mount value (bare = read-only, :w suffix = writable).
@@ -304,6 +340,116 @@ apply_creds() {
     if limactl copy -r "$p" "$name:$rel" 2>/dev/null; then copied=$((copied+1)); else warn "could not copy $p"; fi
   done
   log "Copied $copied credential path(s)."
+}
+
+# --------------------------------------------------------- project manifest --
+project_manifest() { # $1 .devbox.toml -> normalized JSON
+  python3 - "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:
+    raise SystemExit("Python 3.11+ is required to read .devbox.toml")
+
+path = Path(sys.argv[1])
+try:
+    data = tomllib.loads(path.read_text())
+except (OSError, tomllib.TOMLDecodeError) as exc:
+    raise SystemExit(f"could not read {path}: {exc}")
+
+allowed = {
+    "image", "packages", "start", "ssh_agent", "keep", "proxy", "api_keys",
+    "with_creds", "no_auth", "mounts", "copies",
+}
+unknown = sorted(set(data) - allowed)
+if unknown:
+    raise SystemExit(f"unknown .devbox.toml key(s): {', '.join(unknown)}")
+
+image = data.get("image")
+if image is not None and (not isinstance(image, str) or not image):
+    raise SystemExit("image must be a non-empty string")
+
+packages = data.get("packages", [])
+if not isinstance(packages, list) or any(not isinstance(p, str) or not p for p in packages):
+    raise SystemExit("packages must be an array of non-empty Homebrew formula names")
+
+start = data.get("start")
+if start is not None and (not isinstance(start, str) or not start):
+    raise SystemExit("start must be a non-empty shell command string")
+
+for key in ("ssh_agent", "keep", "with_creds", "no_auth"):
+    if key in data and not isinstance(data[key], bool):
+        raise SystemExit(f"{key} must be true or false")
+
+for key in ("proxy", "api_keys"):
+    value = data.get(key, False)
+    if not isinstance(value, (bool, str)) or isinstance(value, str) and not value:
+        raise SystemExit(f"{key} must be true, false, or a non-empty path/URL string")
+
+for key in ("mounts", "copies"):
+    value = data.get(key, [])
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+        raise SystemExit(f"{key} must be an array of non-empty strings")
+
+if data.get("no_auth") and (data.get("proxy") or data.get("api_keys") or data.get("with_creds")):
+    raise SystemExit("no_auth cannot be combined with proxy, api_keys, or with_creds")
+
+print(json.dumps({
+    "image": image or "", "packages": packages, "start": start or "",
+    "ssh_agent": data.get("ssh_agent", False), "keep": data.get("keep", False),
+    "proxy": data.get("proxy", False), "api_keys": data.get("api_keys", False),
+    "with_creds": data.get("with_creds", False), "no_auth": data.get("no_auth", False),
+    "mounts": data.get("mounts", []), "copies": data.get("copies", []),
+}))
+PY
+}
+
+manifest_value() { # $1 normalized manifest JSON $2 key
+  python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]])' "$2" <<< "$1"
+}
+
+manifest_json_value() { # $1 normalized manifest JSON $2 key
+  python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)[sys.argv[1]]))' "$2" <<< "$1"
+}
+
+apply_project_packages() { # $1 box name $2 normalized packages JSON
+  local name="$1" packages="$2"
+  [[ "$packages" != "[]" ]] || return 0
+  log "Installing project packages from $PROJECT_MANIFEST_NAME"
+  # shellcheck disable=SC2016 # the guest shell consumes this program.
+  printf '%s' "$packages" | limactl shell "$name" -- bash -lc '
+    python3 -c "import json, sys; print(*json.load(sys.stdin), sep=chr(0))" \
+      | while IFS= read -r -d "" package; do
+          brew list --versions "$package" >/dev/null 2>&1 || brew install "$package"
+        done
+  '
+}
+
+run_project_start() { # $1 box name $2 workdir $3 command
+  local name="$1" dir="$2" command="$3"
+  [[ -n "$command" ]] || return 0
+  log "Running $PROJECT_MANIFEST_NAME start command"
+  limactl shell --workdir "$dir" "$name" -- bash -lc "$command" </dev/null \
+    || warn "$PROJECT_MANIFEST_NAME start command exited non-zero"
+}
+
+confirm_manifest_permissions() { # each argument is one requested capability
+  local request answer
+  [[ $# -gt 0 ]] || return 0
+  printf '%s\n' "This devbox wants to:" >&2
+  for request in "$@"; do printf '%s\n' "- $request" >&2; done
+  printf '%s' 'Do you agree? [y/N] ' >&2
+  if [[ -t 0 ]]; then
+    read -r answer
+  elif [[ -r /dev/tty ]]; then
+    read -r answer </dev/tty
+  else
+    die "$PROJECT_MANIFEST_NAME requests host access, but no terminal is available to approve it"
+  fi
+  [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]] || die "declined $PROJECT_MANIFEST_NAME host-access request"
 }
 
 # --------------------------------------------------------------- subcommands --
@@ -360,15 +506,16 @@ run_cleanup() {
 }
 
 cmd_run() {
-  local dir="" image="$DEFAULT_IMAGE" keep=0 with_creds=0 api_keys="" proxy="" ssh_agent=0 name=""
-  local extra_mounts=() extra_copies=()
+  local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name=""
+  local extra_mounts=() extra_copies=() manifest_requests=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --image) shift; image="${1:?--image needs a value}";;
-      --image=*) image="${1#--image=}";;
+      --image) shift; image="${1:?--image needs a value}"; image_set=1;;
+      --image=*) image="${1#--image=}"; image_set=1;;
       --keep) keep=1;;
       --ssh-agent) ssh_agent=1;;
       --with-creds) with_creds=1;;
+      --no-auth) no_auth=1;;
       --api-keys) api_keys="$DEFAULT_KEYS_FILE";;
       --api-keys=*) api_keys="$(abspath "${1#--api-keys=}")";;
       --proxy) proxy="$PROXY_DEFAULT_URL";;
@@ -386,6 +533,66 @@ cmd_run() {
   done
   dir="$(abspath "${dir:-$PWD}")"
   [[ -d "$dir" ]] || die "not a directory: $dir"
+
+  local manifest_path="$dir/$PROJECT_MANIFEST_NAME" manifest="" manifest_start=""
+  if [[ -f "$manifest_path" ]]; then
+    manifest="$(project_manifest "$manifest_path")" || die "invalid $PROJECT_MANIFEST_NAME"
+    local manifest_image manifest_proxy manifest_api_keys manifest_mounts manifest_copies item
+    manifest_image="$(manifest_value "$manifest" image)"
+    [[ $image_set -eq 1 || -z "$manifest_image" ]] || image="$manifest_image"
+    manifest_start="$(manifest_value "$manifest" start)"
+    [[ -z "$manifest_start" ]] || manifest_requests+=("run startup command: $(printf '%q' "$manifest_start")")
+
+    if [[ "$(manifest_value "$manifest" ssh_agent)" == True && $ssh_agent -eq 0 ]]; then
+      ssh_agent=1
+      manifest_requests+=("enable SSH agent forwarding")
+    fi
+    if [[ "$(manifest_value "$manifest" keep)" == True ]]; then
+      keep=1
+      manifest_requests+=("keep the devbox after exit")
+    fi
+
+    if [[ $no_auth -eq 0 ]]; then
+      manifest_proxy="$(manifest_value "$manifest" proxy)"
+      if [[ -z "$proxy" && "$manifest_proxy" != False ]]; then
+        if [[ "$manifest_proxy" == True ]]; then proxy="$PROXY_DEFAULT_URL"; else proxy="$manifest_proxy"; fi
+        manifest_requests+=("enable the AI authentication proxy")
+      fi
+      manifest_api_keys="$(manifest_value "$manifest" api_keys)"
+      if [[ -z "$api_keys" && "$manifest_api_keys" != False ]]; then
+        if [[ "$manifest_api_keys" == True ]]; then api_keys="$DEFAULT_KEYS_FILE"; else api_keys="$(abspath "$manifest_api_keys")"; fi
+        manifest_requests+=("copy API keys into the devbox")
+      fi
+      if [[ "$(manifest_value "$manifest" with_creds)" == True && $with_creds -eq 0 ]]; then
+        with_creds=1
+        manifest_requests+=("copy AI credentials into the devbox")
+      fi
+    fi
+    if [[ "$(manifest_value "$manifest" no_auth)" == True && $no_auth -eq 0 ]]; then
+      no_auth=1
+    fi
+
+    manifest_mounts="$(manifest_json_value "$manifest" mounts)"
+    while IFS= read -r item; do
+      [[ -n "$item" ]] || continue
+      extra_mounts+=("$item")
+      case "$item" in
+        *:rw) manifest_requests+=("mount ${item%:rw} read-write at ${item%:rw}");;
+        *:ro) manifest_requests+=("mount ${item%:ro} read-only at ${item%:ro}");;
+        *)    manifest_requests+=("mount $item read-only at $item");;
+      esac
+    done < <(python3 -c 'import json, sys; print(*json.load(sys.stdin), sep="\n")' <<< "$manifest_mounts")
+    manifest_copies="$(manifest_json_value "$manifest" copies)"
+    while IFS= read -r item; do
+      [[ -n "$item" ]] || continue
+      extra_copies+=("$item")
+      manifest_requests+=("copy $(_copy_src "$item") to $(_copy_dest "$item")")
+    done < <(python3 -c 'import json, sys; print(*json.load(sys.stdin), sep="\n")' <<< "$manifest_copies")
+  fi
+  if [[ $no_auth -eq 1 && ( -n "$proxy" || -n "$api_keys" || $with_creds -eq 1 ) ]]; then
+    die "--no-auth cannot be combined with --proxy, --api-keys, or --with-creds"
+  fi
+  confirm_manifest_permissions "${manifest_requests[@]}"
 
   local golden; golden="$(golden_name "$image")"
   [[ -n "$name" ]] || name="$(instance_name "$image" "$dir")"
@@ -419,16 +626,24 @@ cmd_run() {
     log "Booting $name…"; limactl start "$name"
   fi
 
-  if [[ -n "$proxy" ]]; then proxy_ensure "$proxy"; apply_proxy "$name" "$proxy"; fi
-  [[ -n "$api_keys"  ]] && apply_api_keys "$name" "$api_keys"
-  [[ $with_creds -eq 1 ]] && apply_creds  "$name"
+  if [[ $no_auth -eq 1 ]]; then
+    clear_auth "$name"
+  else
+    [[ -n "$proxy" ]] && { proxy_ensure "$proxy"; apply_proxy "$name" "$proxy"; }
+    [[ -n "$api_keys"  ]] && apply_api_keys "$name" "$api_keys"
+    [[ $with_creds -eq 1 ]] && apply_creds  "$name"
+  fi
   if [[ ${#extra_copies[@]} -gt 0 ]]; then
     local c; for c in "${extra_copies[@]}"; do apply_copy "$name" "$c"; done
   fi
 
-  if [[ -f "$dir/.devbox" ]]; then
-    log "Running per-project hook: .devbox"
-    limactl shell --workdir "$dir" "$name" -- bash -lc 'bash ./.devbox' </dev/null || warn ".devbox exited non-zero"
+  if [[ -n "$manifest" ]]; then
+    local manifest_packages
+    manifest_packages="$(manifest_json_value "$manifest" packages)"
+    apply_project_packages "$name" "$manifest_packages"
+    run_project_start "$name" "$dir" "$manifest_start"
+  elif [[ -f "$dir/.devbox" ]]; then
+    warn ".devbox is no longer executed; migrate it to $PROJECT_MANIFEST_NAME"
   fi
 
   local fate="destroy it"
@@ -479,7 +694,10 @@ usage() { grep -E '^#( |$)' "$0" | sed -E 's/^# ?//'; }
 # Only when executed directly — sourcing (e.g. from the bats tests) loads the
 # functions without running anything.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  case "${1:-}" in -h|--help|help) usage; exit 0;; esac
+  case "${1:-}" in
+    -h|--help|help) usage; exit 0;;
+    -V|--version|version) printf 'devbox %s\n' "$DEVBOX_VERSION"; exit 0;;
+  esac
   need limactl
   case "${1:-}" in
     build)          shift; cmd_build   "$@";;

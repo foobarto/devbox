@@ -157,12 +157,34 @@ setup() {
   run proxy_port http://host;                     [ "$output" = "4141" ]
 }
 
+# ------------------------------------------------------- project manifest ----
+@test "project_manifest normalizes .devbox.toml settings" {
+  run project_manifest "$BATS_TEST_DIRNAME/fixtures/project.devbox.toml"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"image": "debian-12"'* ]]
+  [[ "$output" == *'"packages": ["node", "go"]'* ]]
+  [[ "$output" == *'"ssh_agent": true'* ]]
+  [[ "$output" == *'"proxy": "http://host.lima.internal:4141"'* ]]
+}
+
 # ---------------------------------------------------------------- dispatch ----
 @test "--help prints usage and exits 0" {
   # help case is dispatched before `need limactl`, so it works with no VM stack.
   run bash "$DEVBOX" --help
   [ "$status" -eq 0 ]
   [[ "$output" == *"disposable"* ]]
+}
+
+@test "--help documents --no-auth" {
+  run bash "$DEVBOX" --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--no-auth"* ]]
+}
+
+@test "--version reads the release version without Lima" {
+  run bash "$DEVBOX" --version
+  [ "$status" -eq 0 ]
+  [ "$output" = "devbox 1.0.0" ]
 }
 
 @test "unknown run flag is rejected" {
