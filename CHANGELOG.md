@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.0.5 - 2026-07-16
+
+- Golden images skip Lima's unused rootless-containerd bootstrap, avoiding an
+  unnecessary daemon and a provisioning hang on current Lima releases.
+- Golden provisioning now pins GitHub SSH host keys using the Meta API, with a
+  GitHub Docs fallback when the unauthenticated API quota is exhausted.
+- devbox build now rejects and removes a golden that lacks all three GitHub
+  host keys, rather than retaining an incomplete image.
+- New boxes that request SSH-agent forwarding receive it in their clone
+  configuration before first boot; existing boxes keep the safe repair path.
+- Fix one-item manifest package lists and file-based --with-creds copies.
+- Add an opt-in, destructive end-to-end suite covering manifests, consent,
+  mounts/copies/packages/start commands, SSH signing, proxy OAuth, API keys,
+  copied credentials, and --no-auth.
+- Resolve the CLI's real path before loading `VERSION`, so Homebrew's linked
+  executable reports the installed release version correctly.
+
 ## v1.0.4 - 2026-07-16
 
 - Make the Homebrew package install the release version metadata and document

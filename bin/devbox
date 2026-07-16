@@ -52,7 +52,8 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------- constants --
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 VERSION_FILE="$SCRIPT_DIR/../VERSION"
 DEVBOX_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf 'dev')"
 DEFAULT_IMAGE="ubuntu-24.04"
@@ -225,6 +226,12 @@ cpus: 4
 memory: "6GiB"
 disk: "50GiB"
 mountType: "virtiofs"
+# Devbox does not require a container runtime. Disabling Lima's optional
+# rootless-containerd bootstrap keeps golden provisioning deterministic and
+# avoids installing an otherwise unused daemon and image store.
+containerd:
+  system: false
+  user: false
 # No host mount on the golden — the per-run CWD mount is added at clone time and
 # would otherwise overlap the stock template's ~ mount.
 mounts: []
@@ -234,7 +241,7 @@ provision:
 - mode: system
   script: |
     #!/bin/bash
-    set -eu
+    set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
     apt="build-essential git curl wget jq ripgrep unzip ca-certificates procps file locales sudo python3 python3-venv python3-pip"
     dnf="@development-tools git curl wget jq ripgrep unzip ca-certificates procps-ng file glibc-langpack-en sudo python3 python3-pip"
@@ -246,7 +253,7 @@ provision:
 - mode: user
   script: |
     #!/bin/bash
-    set -eu
+    set -euo pipefail
     # PATH + brew shellenv for every login shell (bash/zsh/sh).
     for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc"; do
       touch "$rc"
@@ -255,6 +262,32 @@ provision:
       grep -q 'devbox PATH' "$rc" 2>/dev/null || \
         echo 'export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/.opencode/bin:$PATH" # devbox PATH' >> "$rc"
     done
+    # Trust GitHub's published SSH host keys before any clone/push. Prefer the
+    # Meta API; its unauthenticated quota can be exhausted behind a shared NAT,
+    # so fall back to GitHub's official fingerprint documentation over HTTPS.
+    # Never use ssh-keyscan here: it would make first contact vulnerable to MITM.
+    github_hosts="$(mktemp)"
+    if ! curl --fail --silent --show-error --retry 3 \
+      --header 'Accept: application/vnd.github+json' \
+      --header 'X-GitHub-Api-Version: 2022-11-28' \
+      --user-agent 'devbox-golden-hostkeys' \
+      https://api.github.com/meta \
+      | jq -er '.ssh_keys[] | "github.com \(.)"' > "$github_hosts"; then
+      printf '%s\n' 'GitHub Meta API unavailable; using GitHub Docs host-key fallback.' >&2
+      curl --fail --silent --show-error --retry 3 \
+        https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints \
+        | grep -oE 'ssh-(ed25519|rsa) [A-Za-z0-9+/=]+|ecdsa-sha2-nistp256 [A-Za-z0-9+/=]+' \
+        | sort -u \
+        | sed 's/^/github.com /' > "$github_hosts"
+    fi
+    test -s "$github_hosts"
+    install -d -m 700 "$HOME/.ssh"
+    touch "$HOME/.ssh/known_hosts"
+    chmod 600 "$HOME/.ssh/known_hosts"
+    while IFS= read -r host_key; do
+      grep -Fqx "$host_key" "$HOME/.ssh/known_hosts" || printf '%s\n' "$host_key" >> "$HOME/.ssh/known_hosts"
+    done < "$github_hosts"
+    rm -f "$github_hosts"
     # --- Homebrew (Linuxbrew): distro-agnostic base for the AI CLIs ---
     if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ] && ! command -v brew >/dev/null 2>&1; then
       NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
@@ -279,7 +312,7 @@ YAML
 }
 
 verify_golden() {
-  local name="$1" out
+  local name="$1" out host_keys
   # shellcheck disable=SC2016 # $t and $(...) expand in the guest shell.
   out="$(limactl shell "$name" -- bash -lc '
     for t in brew claude codex opencode stado; do
@@ -289,6 +322,15 @@ verify_golden() {
   printf '%s\n' "$out" >&2
   if printf '%s' "$out" | grep -q MISS; then
     warn "some tools missing in golden — inspect with: limactl shell $name"
+  fi
+  # shellcheck disable=SC2016 # $HOME expands in the guest shell.
+  host_keys="$(limactl shell "$name" -- bash -lc '
+    test -s "$HOME/.ssh/known_hosts"
+    ssh-keygen -F github.com -f "$HOME/.ssh/known_hosts"
+  ' </dev/null 2>/dev/null || true)"
+  if [[ "$(printf '%s\n' "$host_keys" | grep -c '^github.com ')" -lt 3 ]]; then
+    warn "golden is missing GitHub's published SSH host keys"
+    return 1
   fi
 }
 
@@ -417,13 +459,17 @@ apply_copy() {
 }
 
 apply_creds() {
-  local name="$1" p rel copied=0
+  local name="$1" p rel copied=0 rflag=()
   log "Copying host AI credentials into $name (best-effort)…"
   for p in "${CRED_PATHS[@]}"; do
     [[ -e "$p" ]] || continue
     case "$p" in "$HOME/"*) rel="${p#"$HOME"/}";; *) continue;; esac
     limactl shell "$name" -- bash -c "cd; mkdir -p '$(dirname "$rel")'" </dev/null 2>/dev/null || true
-    if limactl copy -r "$p" "$name:$rel" 2>/dev/null; then copied=$((copied+1)); else warn "could not copy $p"; fi
+    # Lima's recursive mode makes a file destination into a directory.  The
+    # credential list intentionally contains both files and directories.
+    rflag=()
+    [[ -d "$p" ]] && rflag=(-r)
+    if limactl copy "${rflag[@]}" "$p" "$name:$rel" 2>/dev/null; then copied=$((copied+1)); else warn "could not copy $p"; fi
   done
   log "Copied $copied credential path(s)."
 }
@@ -501,16 +547,19 @@ manifest_json_value() { # $1 normalized manifest JSON $2 key
   python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)[sys.argv[1]]))' "$2" <<< "$1"
 }
 
+manifest_package_lines() { # $1 normalized package JSON -> one package per line
+  python3 -c 'import json, sys; print(*json.load(sys.stdin), sep="\n")' <<< "$1"
+}
+
 apply_project_packages() { # $1 box name $2 normalized packages JSON
   local name="$1" packages="$2"
   [[ "$packages" != "[]" ]] || return 0
   log "Installing project packages from $PROJECT_MANIFEST_NAME"
-  # shellcheck disable=SC2016 # the guest shell consumes this program.
-  printf '%s' "$packages" | limactl shell "$name" -- bash -lc '
-    python3 -c "import json, sys; print(*json.load(sys.stdin), sep=chr(0))" \
-      | while IFS= read -r -d "" package; do
-          brew list --versions "$package" >/dev/null 2>&1 || brew install "$package"
-        done
+  # shellcheck disable=SC2016 # the guest shell consumes package names on stdin.
+  manifest_package_lines "$packages" | limactl shell "$name" -- bash -lc '
+    while IFS= read -r package; do
+      brew list --versions "$package" >/dev/null 2>&1 || brew install "$package"
+    done
   '
 }
 
@@ -565,7 +614,12 @@ cmd_build() {
   log "Building golden $golden from image '$image' — this takes several minutes…"
   limactl start --name="$golden" "$gy"
   log "Verifying toolchain in $golden:"
-  verify_golden "$golden"
+  if ! verify_golden "$golden"; then
+    warn "Golden verification failed; removing unusable $golden."
+    limactl stop -f "$golden" 2>/dev/null || true
+    limactl delete -f "$golden" 2>/dev/null || true
+    return 1
+  fi
   log "Stopping golden (retained as clone source)."
   limactl stop "$golden"
   log "Golden ready: $golden"
@@ -683,7 +737,9 @@ cmd_run() {
   local golden; golden="$(golden_name "$image")"
   [[ -n "$name" ]] || name="$(instance_name "$image" "$dir")"
 
+  local preexisting=0
   if instance_exists "$name"; then
+    preexisting=1
     log "Attaching to existing box for this path: $name"
     [[ ${#extra_mounts[@]} -gt 0 ]] && warn "--mount only applies at box creation; destroy+recreate to change mounts (--copy still works)"
   else
@@ -694,10 +750,14 @@ cmd_run() {
     ensure_golden_stopped "$golden"
     local clone_args=(--mount "${dir}:w") m
     for m in "${extra_mounts[@]}"; do clone_args+=(--mount "$(_lima_mount_arg "$m")"); done
+    # `limactl clone --set` applies this to the stopped destination config, so
+    # the very first boot already has the agent socket. Existing VMs still use
+    # enable_ssh_agent below and restart only if their persisted config changes.
+    [[ $ssh_agent -eq 1 ]] && clone_args+=(--set '.ssh.forwardAgent = true')
     log "Cloning $golden → $name (mount: $dir${extra_mounts:+, +${#extra_mounts[@]} extra mount(s)})"
-    limactl clone "$golden" "$name" "${clone_args[@]}"
+    limactl --tty=false clone "$golden" "$name" "${clone_args[@]}"
   fi
-  [[ $ssh_agent -eq 1 ]] && enable_ssh_agent "$name"
+  [[ $ssh_agent -eq 1 && $preexisting -eq 1 ]] && enable_ssh_agent "$name"
 
   _DB_NAME="$name"; _DB_DIR="$dir"; _DB_IMAGE="$image"; _DB_KEEP="$keep"
   trap run_cleanup EXIT INT TERM

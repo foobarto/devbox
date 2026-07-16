@@ -40,7 +40,7 @@ brew install foobarto/tap/devbox
 
 Installs `devbox` and `devbox-ai-proxy` on your `PATH`. The current stable
 GitHub release is
-[`v1.0.4`](https://github.com/foobarto/devbox/releases/tag/v1.0.4); source
+[`v1.0.5`](https://github.com/foobarto/devbox/releases/tag/v1.0.5); source
 archives are available from that release. Config lives under `~/.config/devbox/`
 (or `$XDG_CONFIG_HOME/devbox`).
 
@@ -150,7 +150,9 @@ SSH-format Git commit signatures through the forwarded agent. Devbox copies the
 first public key exposed by `ssh-add -L` and the host Git name/email, then sets
 Git's signing defaults inside the VM; the private key remains in the host
 agent. Override the guest Git settings normally if you prefer another signing
-method.
+method. Newly built golden images fetch GitHub's published SSH host keys from
+the GitHub Meta API and place them in `~/.ssh/known_hosts`, so GitHub SSH use
+does not stop for a first-connection prompt.
 
 `--no-auth` is the explicit opt-out for a kept box that was previously started
 with `--proxy` or `--api-keys`; it removes Devbox's profile snippets before the

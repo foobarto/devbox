@@ -113,10 +113,23 @@ setup() {
   ! grep -q 'forwardAgent: true' "$tmp"
 }
 
+@test "a golden disables Lima's unused containerd bootstrap" {
+  tmp="$BATS_TEST_TMPDIR/g.yaml"
+  emit_golden_yaml ubuntu-24.04 "$tmp"
+  grep -A2 '^containerd:' "$tmp" | grep -q 'system: false'
+  grep -A2 '^containerd:' "$tmp" | grep -q 'user: false'
+}
+
 @test "SSH signing is not baked into a golden image" {
   tmp="$BATS_TEST_TMPDIR/g.yaml"
   emit_golden_yaml ubuntu-24.04 "$tmp"
   ! grep -q 'git-signing-key' "$tmp"
+}
+
+@test "new SSH-agent boxes set forwarding in the clone config before boot" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *"clone_args+=(--set '.ssh.forwardAgent = true')"* ]]
+  [[ "$source_text" == *'limactl --tty=false clone'* ]]
 }
 
 @test "golden yaml installs the AI toolchain (stado via cask, claude installer)" {
@@ -126,6 +139,28 @@ setup() {
   grep -q 'brew install codex' "$tmp"
   grep -q 'sst/tap/opencode' "$tmp"
   grep -q 'claude.ai/install.sh' "$tmp"
+}
+
+@test "golden yaml fetches GitHub host keys through the Meta API" {
+  tmp="$BATS_TEST_TMPDIR/g.yaml"
+  emit_golden_yaml ubuntu-24.04 "$tmp"
+  grep -q 'https://api.github.com/meta' "$tmp"
+  grep -Fq 'github.com \(.)' "$tmp"
+  grep -Fq '$HOME/.ssh/known_hosts' "$tmp"
+}
+
+@test "golden yaml has a GitHub Docs host-key fallback for API rate limits" {
+  tmp="$BATS_TEST_TMPDIR/g.yaml"
+  emit_golden_yaml ubuntu-24.04 "$tmp"
+  grep -q 'githubs-ssh-key-fingerprints' "$tmp"
+  grep -q 'Never use ssh-keyscan here' "$tmp"
+}
+
+@test "golden verification requires all published GitHub host keys" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *'ssh-keygen -F github.com'* ]]
+  [[ "$source_text" == *"grep -c '^github.com '"* ]]
+  [[ "$source_text" == *'Golden verification failed; removing unusable'* ]]
 }
 
 @test "generated golden yaml validates with limactl" {
@@ -179,6 +214,18 @@ setup() {
   [[ "$output" == *'"proxy": "http://host.lima.internal:4141"'* ]]
 }
 
+@test "manifest package transport handles a single package" {
+  run manifest_package_lines '["hello"]'
+  [ "$status" -eq 0 ]
+  [ "$output" = "hello" ]
+}
+
+@test "manifest package transport emits every package on its own line" {
+  run manifest_package_lines '["node", "go"]'
+  [ "$status" -eq 0 ]
+  [ "$output" = $'node\ngo' ]
+}
+
 # ---------------------------------------------------------------- dispatch ----
 @test "--help prints usage and exits 0" {
   # help case is dispatched before `need limactl`, so it works with no VM stack.
@@ -202,7 +249,15 @@ setup() {
 @test "--version reads the release version without Lima" {
   run bash "$DEVBOX" --version
   [ "$status" -eq 0 ]
-  [ "$output" = "devbox 1.0.4" ]
+  [ "$output" = "devbox 1.0.5" ]
+}
+
+@test "--version resolves the real path when invoked through a symlink" {
+  link="$BATS_TEST_TMPDIR/devbox"
+  ln -s "$DEVBOX" "$link"
+  run "$link" --version
+  [ "$status" -eq 0 ]
+  [ "$output" = "devbox 1.0.5" ]
 }
 
 @test "unknown run flag is rejected" {
