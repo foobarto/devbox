@@ -26,8 +26,8 @@
 #                    *.yaml Lima config, or a path/URL to a *.qcow2/*.img image
 #                    (e.g. a Kali cloud image).
 #   --keep           do not auto-delete the box on shell exit.
-#   --ssh-agent      forward the host SSH agent into the box (git/GitHub auth);
-#                    host private keys never enter the VM.
+#   --ssh-agent      forward the host SSH agent into the box (git/GitHub auth)
+#                    and configure SSH-signed commits; private keys stay host-side.
 #   --proxy[=URL]    point the AI CLIs at a host-side proxy (default
 #                    http://host.lima.internal:4141); real credentials stay on
 #                    the host. Auto-starts the proxy on this host if it isn't
@@ -145,6 +145,62 @@ enable_ssh_agent() { # $1 instance; restart only when its persisted config chang
   log "Enabling host SSH-agent forwarding"
   limactl edit "$name" --set '.ssh.forwardAgent = true' >/dev/null
   [[ "$status" == "Running" ]] && limactl start "$name"
+}
+
+ssh_signing_public_key() {
+  local key
+  key="$(ssh-add -L 2>/dev/null | sed -n '1p')"
+  [[ -n "$key" ]] || die "--ssh-agent needs an identity loaded in the host SSH agent to sign Git commits"
+  printf '%s\n' "$key" | ssh-keygen -lf - >/dev/null 2>&1 \
+    || die "the first identity from the host SSH agent is not a valid SSH public key"
+  printf '%s' "$key"
+}
+
+apply_git_signing() { # $1 instance; SSH signatures use the forwarded agent
+  local name="$1" key git_name git_email
+  key="$(ssh_signing_public_key)"
+  git_name="$(git config --global --get user.name 2>/dev/null || true)"
+  git_email="$(git config --global --get user.email 2>/dev/null || true)"
+  [[ -n "$git_name" && -n "$git_email" ]] || \
+    die "configure host Git user.name and user.email before using --ssh-agent for signed commits"
+  log "Configuring Git SSH commit signing through the forwarded agent"
+  python3 - "$key" "$git_name" "$git_email" <<'PY' \
+    | limactl shell "$name" -- python3 -c '
+import json
+import pathlib
+import subprocess
+import sys
+
+config = json.load(sys.stdin)
+devbox_dir = pathlib.Path.home() / ".devbox"
+devbox_dir.mkdir(mode=0o700, exist_ok=True)
+public_key = devbox_dir / "git-signing-key.pub"
+allowed_signers = devbox_dir / "git-allowed-signers"
+public_key.write_text(config["key"] + "\n")
+public_key.chmod(0o644)
+allowed_signers.write_text("{} namespaces=\"git\" {}\n".format(config["email"], config["key"]))
+allowed_signers.chmod(0o644)
+
+def set_global(key, value):
+    subprocess.run(["git", "config", "--global", key, value], check=True)
+
+# Git 2.34+ can delegate SSH-format signatures to SSH_AUTH_SOCK. Only the
+# public key crosses into the guest; ssh-keygen asks the forwarded agent to sign.
+set_global("gpg.format", "ssh")
+set_global("user.signingkey", str(public_key))
+set_global("gpg.ssh.allowedSignersFile", str(allowed_signers))
+set_global("commit.gpgsign", "true")
+for key, value in (("user.name", config["name"]), ("user.email", config["email"])):
+    current = subprocess.run(
+        ["git", "config", "--global", "--get", key], text=True, capture_output=True
+    )
+    if current.returncode != 0 or not current.stdout.strip():
+        set_global(key, value)
+'
+import json
+import sys
+print(json.dumps({"key": sys.argv[1], "name": sys.argv[2], "email": sys.argv[3]}))
+PY
 }
 
 # ---------------------------------------------------------- golden yaml gen --
@@ -652,6 +708,7 @@ cmd_run() {
   if [[ "$(instance_status "$name")" != "Running" ]]; then
     log "Booting $name…"; limactl start "$name"
   fi
+  [[ $ssh_agent -eq 1 ]] && apply_git_signing "$name"
 
   if [[ $no_auth -eq 1 ]]; then
     clear_auth "$name"

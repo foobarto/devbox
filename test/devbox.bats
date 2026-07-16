@@ -113,6 +113,12 @@ setup() {
   ! grep -q 'forwardAgent: true' "$tmp"
 }
 
+@test "SSH signing is not baked into a golden image" {
+  tmp="$BATS_TEST_TMPDIR/g.yaml"
+  emit_golden_yaml ubuntu-24.04 "$tmp"
+  ! grep -q 'git-signing-key' "$tmp"
+}
+
 @test "golden yaml installs the AI toolchain (stado via cask, claude installer)" {
   tmp="$BATS_TEST_TMPDIR/g.yaml"
   emit_golden_yaml ubuntu-24.04 "$tmp"
@@ -190,7 +196,7 @@ setup() {
 @test "--version reads the release version without Lima" {
   run bash "$DEVBOX" --version
   [ "$status" -eq 0 ]
-  [ "$output" = "devbox 1.0.1" ]
+  [ "$output" = "devbox 1.0.2" ]
 }
 
 @test "unknown run flag is rejected" {

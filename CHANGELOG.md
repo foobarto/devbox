@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.2 - 2026-07-16
+
+- Configure signed Git commits through the host SSH agent whenever
+  `--ssh-agent` is enabled; the guest receives only the selected public key.
+
 ## v1.0.1 - 2026-07-16
 
 - Make `--ssh-agent` work for existing Devboxes: verify the host agent socket,

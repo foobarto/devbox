@@ -40,7 +40,7 @@ brew install --HEAD foobarto/tap/devbox
 
 Installs `devbox` and `devbox-ai-proxy` on your `PATH`. It's a `--HEAD` install
 (tracks the latest `main`). The current stable GitHub release is
-[`v1.0.1`](https://github.com/foobarto/devbox/releases/tag/v1.0.1); source
+[`v1.0.2`](https://github.com/foobarto/devbox/releases/tag/v1.0.2); source
 archives are available from that release. Config lives under `~/.config/devbox/`
 (or `$XDG_CONFIG_HOME/devbox`).
 
@@ -71,7 +71,7 @@ devbox destroy NAME | --all | --goldens
 |---|---|
 | `--image NAME` | base image for this box's golden (default `ubuntu-24.04`). See [Images](#images). |
 | `--keep` | don't auto-delete the box on exit. |
-| `--ssh-agent` | forward the host SSH agent into the box (git/GitHub). Host **private keys never enter the VM** — only the agent socket is forwarded. |
+| `--ssh-agent` | forward the host SSH agent into the box (git/GitHub) and configure signed Git commits. Host **private keys never enter the VM** — only the agent socket and selected public key are used. |
 | `--proxy[=URL]` | point the AI CLIs at a host-side proxy; credentials stay on the host. Default `http://host.lima.internal:4141`. |
 | `--no-auth` | explicitly disable Devbox-managed proxy, API-key, and copied-credential auth; removes its proxy/key profiles from an existing box. |
 | `--api-keys[=FILE]` | inject API keys into the box from an env file (default `~/.config/devbox/api-keys.env`). |
@@ -143,7 +143,12 @@ recommended default for disposable boxes, and it auto-starts the host proxy
 (once, shared across boxes) — no separate launch step. Manage it with
 `devbox proxy [start|stop|status]`.
 
-Git/GitHub auth is separate: use **`--ssh-agent`**.
+Git/GitHub auth is separate: use **`--ssh-agent`**. It also enables automatic
+SSH-format Git commit signatures through the forwarded agent. Devbox copies the
+first public key exposed by `ssh-add -L` and the host Git name/email, then sets
+Git's signing defaults inside the VM; the private key remains in the host
+agent. Override the guest Git settings normally if you prefer another signing
+method.
 
 `--no-auth` is the explicit opt-out for a kept box that was previously started
 with `--proxy` or `--api-keys`; it removes Devbox's profile snippets before the
