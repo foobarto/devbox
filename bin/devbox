@@ -117,6 +117,36 @@ ensure_golden_stopped() {
   log "Stopping golden $1 before clone"; limactl stop "$1"
 }
 
+require_ssh_agent() {
+  [[ -n "${SSH_AUTH_SOCK:-}" && -S "${SSH_AUTH_SOCK:-}" ]] || \
+    die "--ssh-agent needs a running host SSH agent (SSH_AUTH_SOCK is unset or not a socket)"
+}
+
+ssh_agent_forwarding_enabled() {
+  limactl list "$1" --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin)["config"]["ssh"]["forwardAgent"] is True)
+except (json.JSONDecodeError, KeyError, TypeError):
+    print(False)
+'
+}
+
+enable_ssh_agent() { # $1 instance; restart only when its persisted config changes
+  local name="$1" status
+  require_ssh_agent
+  [[ "$(ssh_agent_forwarding_enabled "$name")" == True ]] && return 0
+
+  status="$(instance_status "$name")"
+  if [[ "$status" == "Running" ]]; then
+    log "Restarting $name to enable host SSH-agent forwarding"
+    limactl stop "$name"
+  fi
+  log "Enabling host SSH-agent forwarding"
+  limactl edit "$name" --set '.ssh.forwardAgent = true' >/dev/null
+  [[ "$status" == "Running" ]] && limactl start "$name"
+}
+
 # ---------------------------------------------------------- golden yaml gen --
 emit_base_stanza() {
   local image="$1" t
@@ -593,6 +623,7 @@ cmd_run() {
     die "--no-auth cannot be combined with --proxy, --api-keys, or --with-creds"
   fi
   confirm_manifest_permissions "${manifest_requests[@]}"
+  [[ $ssh_agent -eq 1 ]] && require_ssh_agent
 
   local golden; golden="$(golden_name "$image")"
   [[ -n "$name" ]] || name="$(instance_name "$image" "$dir")"
@@ -601,7 +632,6 @@ cmd_run() {
   if instance_exists "$name"; then
     preexisting=1
     log "Attaching to existing box for this path: $name"
-    [[ $ssh_agent -eq 1 ]] && warn "--ssh-agent only applies at box creation; destroy+recreate to change it"
     [[ ${#extra_mounts[@]} -gt 0 ]] && warn "--mount only applies at box creation; destroy+recreate to change mounts (--copy still works)"
   else
     if ! instance_exists "$golden"; then
@@ -613,11 +643,8 @@ cmd_run() {
     for m in "${extra_mounts[@]}"; do clone_args+=(--mount "$(_lima_mount_arg "$m")"); done
     log "Cloning $golden → $name (mount: $dir${extra_mounts:+, +${#extra_mounts[@]} extra mount(s)})"
     limactl clone "$golden" "$name" "${clone_args[@]}"
-    if [[ $ssh_agent -eq 1 ]]; then
-      log "Enabling host ssh-agent forwarding"
-      limactl edit "$name" --set '.ssh.forwardAgent = true' >/dev/null
-    fi
   fi
+  [[ $ssh_agent -eq 1 ]] && enable_ssh_agent "$name"
 
   _DB_NAME="$name"; _DB_DIR="$dir"; _DB_IMAGE="$image"; _DB_KEEP="$keep"; _DB_PRE="$preexisting"
   trap run_cleanup EXIT INT TERM

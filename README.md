@@ -40,7 +40,7 @@ brew install --HEAD foobarto/tap/devbox
 
 Installs `devbox` and `devbox-ai-proxy` on your `PATH`. It's a `--HEAD` install
 (tracks the latest `main`). The current stable GitHub release is
-[`v1.0.0`](https://github.com/foobarto/devbox/releases/tag/v1.0.0); source
+[`v1.0.1`](https://github.com/foobarto/devbox/releases/tag/v1.0.1); source
 archives are available from that release. Config lives under `~/.config/devbox/`
 (or `$XDG_CONFIG_HOME/devbox`).
 
@@ -207,5 +207,7 @@ installed.
   than re-provisioning).
 - A box created before a `devbox build --force` keeps the *old* toolchain until
   you `destroy` and recreate it.
-- `--ssh-agent` applies at box creation; to toggle it on an existing box,
-  destroy and recreate.
+- `--ssh-agent` enables Lima's agent socket for a new or existing box. An
+  existing box is restarted once if needed, so run `devbox --ssh-agent` from
+  the project directory to enable it. Your host agent must already be running
+  and have a valid `SSH_AUTH_SOCK`.

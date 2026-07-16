@@ -107,6 +107,12 @@ setup() {
   grep -q 'loadDotSSHPubKeys: false' "$tmp"
 }
 
+@test "a golden leaves SSH-agent forwarding disabled until explicitly requested" {
+  tmp="$BATS_TEST_TMPDIR/g.yaml"
+  emit_golden_yaml ubuntu-24.04 "$tmp"
+  ! grep -q 'forwardAgent: true' "$tmp"
+}
+
 @test "golden yaml installs the AI toolchain (stado via cask, claude installer)" {
   tmp="$BATS_TEST_TMPDIR/g.yaml"
   emit_golden_yaml ubuntu-24.04 "$tmp"
@@ -184,7 +190,7 @@ setup() {
 @test "--version reads the release version without Lima" {
   run bash "$DEVBOX" --version
   [ "$status" -eq 0 ]
-  [ "$output" = "devbox 1.0.0" ]
+  [ "$output" = "devbox 1.0.1" ]
 }
 
 @test "unknown run flag is rejected" {

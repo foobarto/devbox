@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.1 - 2026-07-16
+
+- Make `--ssh-agent` work for existing Devboxes: verify the host agent socket,
+  update Lima's forwarding setting, and restart the box when necessary.
+
 ## v1.0.0 - 2026-07-16
 
 - First stable release of disposable Lima development boxes with golden images.
