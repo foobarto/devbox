@@ -1,0 +1,44 @@
+{
+  "listen": "0.0.0.0:4000",
+
+  "_notes": [
+    "Routes are matched top-to-bottom by URL-path prefix; list the most",
+    "specific first. 'auth.source' is one of:",
+    "  env:NAME                     static API key from the proxy's environment",
+    "  token-file:/path#a.b.c       JSON field read FRESH on every request",
+    "  token-cmd:some command       stdout of a command, per request",
+    "Point the box's env at this proxy (devbox --proxy handles it):",
+    "  ANTHROPIC_BASE_URL=http://host.lima.internal:4000",
+    "  OPENAI_BASE_URL=http://host.lima.internal:4000/v1"
+  ],
+
+  "routes": [
+    {
+      "_comment": "Anthropic / Claude — API-key mode (default). To use a Claude subscription OAuth login instead, swap 'auth' for the oauth block shown below in _oauth_variant.",
+      "match": "/v1/messages",
+      "upstream": "https://api.anthropic.com",
+      "auth": { "header": "x-api-key", "source": "env:ANTHROPIC_API_KEY" },
+      "set_headers": { "anthropic-version": "2023-06-01" },
+      "strip_headers": ["authorization"]
+    },
+
+    {
+      "_comment": "OpenAI / Codex — API-key mode.",
+      "match": "/v1/",
+      "upstream": "https://api.openai.com",
+      "auth": { "header": "authorization", "prefix": "Bearer ", "source": "env:OPENAI_API_KEY" },
+      "strip_headers": ["x-api-key"]
+    }
+  ],
+
+  "_oauth_variant": {
+    "_comment": "Replace the /v1/messages route's 'auth' + 'set_headers' with this to proxy a Claude subscription OAuth login. The token is read fresh from the host's credential file per request; the host keeps it refreshed. The anthropic-beta value may need updating if Anthropic changes it.",
+    "auth": {
+      "header": "authorization",
+      "prefix": "Bearer ",
+      "source": "token-file:~/.claude/.credentials.json#claudeAiOauth.accessToken"
+    },
+    "set_headers": { "anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20" },
+    "strip_headers": ["x-api-key"]
+  }
+}

@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+#
+# devbox — disposable, CWD-mounted dev VMs on Lima/QEMU, preloaded with an
+# AI-CLI toolchain (claude, codex, opencode, stado) + Homebrew.
+#
+# Model
+#   A one-time "golden" Lima instance per base image carries the toolchain.
+#   Each `devbox` run clones the golden into an instance whose name is derived
+#   deterministically from the target directory — so a given folder always maps
+#   to the same box (one box per folder), and different folders get different
+#   boxes. The clone mounts the folder, drops you into a shell, and is deleted
+#   on exit (unless --keep, or it pre-existed).
+#
+# Usage
+#   devbox [DIR] [FLAGS]        spin/attach a box for DIR (default: $PWD)
+#   devbox build [--image N] [--force]
+#   devbox ls
+#   devbox destroy NAME | --all | --goldens
+#
+# Run flags
+#   --image NAME     base image for this box's golden (default: ubuntu-24.04).
+#                    NAME may be a Lima template name (ubuntu-24.04, debian-12,
+#                    fedora, archlinux, …), a template:// URL, a path to a
+#                    *.yaml Lima config, or a path/URL to a *.qcow2/*.img image
+#                    (e.g. a Kali cloud image).
+#   --keep           do not auto-delete the box on shell exit.
+#   --ssh-agent      forward the host SSH agent into the box (git/GitHub auth);
+#                    host private keys never enter the VM.
+#   --proxy[=URL]    point the AI CLIs at a host-side proxy (default
+#                    http://host.lima.internal:4000); real credentials stay on
+#                    the host. See proxy/README.md.
+#   --api-keys[=F]   inject API keys into the box from env file F
+#                    (default ~/.config/devbox/api-keys.env).
+#   --with-creds     copy host AI-tool credential files into the box (OAuth
+#                    logins for claude/codex without a proxy). Best-effort.
+#   --name NAME      override the derived instance name.
+#
+# Env
+#   DEVBOX_CONFIG_DIR   config/golden dir (default ~/.config/devbox)
+#   DEVBOX_PROXY_URL    default --proxy URL
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------- constants --
+DEFAULT_IMAGE="ubuntu-24.04"
+CONFIG_DIR="${DEVBOX_CONFIG_DIR:-$HOME/.config/devbox}"
+DEFAULT_KEYS_FILE="$CONFIG_DIR/api-keys.env"
+PROXY_DEFAULT_URL="${DEVBOX_PROXY_URL:-http://host.lima.internal:4000}"
+
+# Host credential paths copied into the box under --with-creds (best-effort;
+# only those that exist are copied). Tune to taste. Deliberately excludes
+# ~/.ssh / ~/.gnupg — use --ssh-agent for git, and never ship private keys.
+CRED_PATHS=(
+  "$HOME/.claude.json"
+  "$HOME/.claude/.credentials.json"
+  "$HOME/.codex/auth.json"
+  "$HOME/.codex/config.toml"
+  "$HOME/.config/opencode"
+  "$HOME/.local/share/opencode/auth.json"
+  "$HOME/.config/stado"
+)
+
+# ------------------------------------------------------------------- output --
+_c() { [[ -t 2 ]] && printf '\033[%sm' "$1" >&2 || true; }
+log()  { _c '1;34'; printf '[devbox]'   >&2; _c 0; printf ' %s\n' "$*" >&2; }
+warn() { _c '1;33'; printf '[devbox] WARN:' >&2; _c 0; printf ' %s\n' "$*" >&2; }
+die()  { _c '1;31'; printf '[devbox] ERROR:' >&2; _c 0; printf ' %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+abspath() { readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"; }
+
+# -------------------------------------------------------------- name helpers --
+_slug() { # sanitize $1 -> lowercase [a-z0-9-], collapse, trim, cap length $2
+  local s; s="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+      | tr -c 'a-z0-9' '-' | sed -E 's/-+/-/g; s/^-|-$//g')"
+  [[ -z "$s" ]] && s="x"
+  printf '%s' "${s:0:${2:-30}}"
+}
+
+imgslug() { # stable short slug for an image spec (name or path/URL)
+  local img="$1" base; base="$(_slug "$(basename -- "$img")" 20)"
+  case "$img" in
+    */*|*.qcow2|*.img|*.raw)
+      printf '%s-%s' "$base" "$(printf '%s' "$img" | sha1sum | cut -c1-6)";;
+    *) printf '%s' "$(_slug "$img" 30)";;
+  esac
+}
+
+golden_name()   { printf 'devbox-golden-%s' "$(imgslug "$1")"; }
+
+instance_name() { # deterministic per (image, absolute dir)
+  local image="$1" dir="$2" slug hash
+  slug="$(_slug "$(basename -- "$dir")" 24)"
+  hash="$(printf '%s\0%s' "$image" "$dir" | sha1sum | cut -c1-8)"
+  printf 'devbox-%s-%s' "$slug" "$hash"
+}
+
+# ---------------------------------------------------------------- lima state --
+instance_exists() { limactl list -q 2>/dev/null | grep -qx "$1"; }
+instance_status() { limactl list "$1" --format '{{.Status}}' 2>/dev/null || echo Unknown; }
+ensure_golden_stopped() {
+  [[ "$(instance_status "$1")" == "Running" ]] || return 0
+  log "Stopping golden $1 before clone"; limactl stop "$1"
+}
+
+# ---------------------------------------------------------- golden yaml gen --
+emit_base_stanza() {
+  local image="$1" t
+  case "$image" in
+    http://*|https://*)   printf 'images:\n- location: "%s"\n  arch: "x86_64"\n' "$image";;
+    template:*)           t="${image#template:}"; t="${t#//}"; printf 'base: "template:%s"\n' "$t";;
+    *.yaml|*.yml)         printf 'base: "%s"\n' "$(abspath "$image")";;
+    *.qcow2|*.img|*.raw)  printf 'images:\n- location: "%s"\n  arch: "x86_64"\n' "$(abspath "$image")";;
+    *)                    printf 'base: "template:%s"\n' "$image";;
+  esac
+}
+
+emit_golden_yaml() { # $1 image  $2 outfile
+  local image="$1" out="$2"
+  {
+    printf '# devbox golden — regenerate with: devbox build --image %s --force\n' "$image"
+    emit_base_stanza "$image"
+    cat <<'YAML'
+cpus: 4
+memory: "6GiB"
+disk: "50GiB"
+mountType: "virtiofs"
+# No host mount on the golden — the per-run CWD mount is added at clone time and
+# would otherwise overlap the stock template's ~ mount.
+mounts: []
+ssh:
+  loadDotSSHPubKeys: false   # host pubkeys are not copied in; use --ssh-agent
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+    apt="build-essential git curl wget jq ripgrep unzip ca-certificates procps file locales sudo python3 python3-venv python3-pip"
+    dnf="@development-tools git curl wget jq ripgrep unzip ca-certificates procps-ng file glibc-langpack-en sudo python3 python3-pip"
+    pac="base-devel git curl wget jq ripgrep unzip ca-certificates procps-ng file sudo python python-pip"
+    if   command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y --no-install-recommends $apt
+    elif command -v dnf     >/dev/null 2>&1; then dnf install -y $dnf
+    elif command -v pacman  >/dev/null 2>&1; then pacman -Sy --noconfirm $pac
+    fi
+- mode: user
+  script: |
+    #!/bin/bash
+    set -eu
+    # PATH + brew shellenv for every login shell (bash/zsh/sh).
+    for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc"; do
+      touch "$rc"
+      grep -q 'linuxbrew/.linuxbrew/bin/brew shellenv' "$rc" 2>/dev/null || \
+        echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> "$rc"
+      grep -q 'devbox PATH' "$rc" 2>/dev/null || \
+        echo 'export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/.opencode/bin:$PATH" # devbox PATH' >> "$rc"
+    done
+    # --- Homebrew (Linuxbrew): distro-agnostic base for the AI CLIs ---
+    if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ] && ! command -v brew >/dev/null 2>&1; then
+      NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
+    fi
+    BREW="$(command -v brew || echo /home/linuxbrew/.linuxbrew/bin/brew)"
+    [ -x "$BREW" ] && eval "$("$BREW" shellenv)" || true
+    export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/.opencode/bin:$PATH"
+    # go — needed for the stado source install + generally useful
+    brew install go || true
+    # --- AI CLIs ---
+    brew install codex || true
+    brew install sst/tap/opencode || curl -fsSL https://opencode.ai/install | bash || true
+    # stado: the Homebrew tap ships a macOS cask (unsupported on Linux), so on
+    # Linux install from source with Go. On macOS `brew install foobarto/tap/stado`.
+    command -v stado >/dev/null 2>&1 || GOBIN="$HOME/.local/bin" go install github.com/foobarto/stado/cmd/stado@latest || true
+    # claude code — official native installer (-> ~/.local/bin)
+    command -v claude >/dev/null 2>&1 || { curl -fsSL https://claude.ai/install.sh | bash || true; }
+YAML
+  } > "$out"
+}
+
+verify_golden() {
+  local name="$1" out
+  out="$(limactl shell "$name" -- bash -lc '
+    for t in brew go claude codex opencode stado; do
+      if command -v "$t" >/dev/null 2>&1; then printf "  ok   %-9s %s\n" "$t" "$(command -v "$t")"
+      else printf "  MISS %-9s (not on PATH)\n" "$t"; fi
+    done' 2>/dev/null || true)"
+  printf '%s\n' "$out" >&2
+  if printf '%s' "$out" | grep -q MISS; then
+    warn "some tools missing in golden — inspect with: limactl shell $name"
+  fi
+}
+
+# ------------------------------------------------------------- auth wiring ---
+apply_proxy() {
+  local name="$1" url="$2" tmpl="$CONFIG_DIR/proxy-env"
+  log "Wiring AI CLIs → proxy $url"
+  if [[ -f "$tmpl" ]]; then
+    sed "s|__PROXY_URL__|$url|g" "$tmpl" \
+      | limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-10-proxy.sh >/dev/null'
+  else
+    limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-10-proxy.sh >/dev/null' <<EOF
+# devbox --proxy: keep real credentials on the host proxy.
+export ANTHROPIC_BASE_URL="$url"
+export ANTHROPIC_API_KEY="\${ANTHROPIC_API_KEY:-devbox-proxy}"
+export OPENAI_BASE_URL="$url/v1"
+export OPENAI_API_KEY="\${OPENAI_API_KEY:-devbox-proxy}"
+EOF
+  fi
+}
+
+apply_api_keys() {
+  local name="$1" file="$2"
+  [[ -f "$file" ]] || { warn "api-keys file not found: $file (skipping)"; return 0; }
+  log "Injecting API keys from $file"
+  limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-20-keys.sh >/dev/null' < "$file"
+}
+
+apply_creds() {
+  local name="$1" p rel copied=0
+  log "Copying host AI credentials into $name (best-effort)…"
+  for p in "${CRED_PATHS[@]}"; do
+    [[ -e "$p" ]] || continue
+    case "$p" in "$HOME/"*) rel="${p#"$HOME"/}";; *) continue;; esac
+    limactl shell "$name" -- bash -c "cd; mkdir -p '$(dirname "$rel")'" 2>/dev/null || true
+    if limactl copy -r "$p" "$name:$rel" 2>/dev/null; then copied=$((copied+1)); else warn "could not copy $p"; fi
+  done
+  log "Copied $copied credential path(s)."
+}
+
+# --------------------------------------------------------------- subcommands --
+cmd_build() {
+  local image="$DEFAULT_IMAGE" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --image) shift; image="${1:?--image needs a value}";;
+      --image=*) image="${1#--image=}";;
+      --force) force=1;;
+      -h|--help) grep -E '^#( |$)' "$0" | sed -E 's/^# ?//'; return 0;;
+      *) die "build: unknown arg: $1";;
+    esac; shift
+  done
+  local golden gy; golden="$(golden_name "$image")"; gy="$CONFIG_DIR/${golden}.yaml"
+  mkdir -p "$CONFIG_DIR"
+  emit_golden_yaml "$image" "$gy"
+  if instance_exists "$golden"; then
+    if [[ $force -eq 1 ]]; then
+      log "Rebuilding golden $golden…"
+      limactl stop -f "$golden" 2>/dev/null || true; limactl delete -f "$golden"
+    else
+      log "Golden $golden already exists (use 'devbox build --image $image --force' to rebuild)."
+      return 0
+    fi
+  fi
+  log "Building golden $golden from image '$image' — this takes several minutes…"
+  limactl start --name="$golden" "$gy"
+  log "Verifying toolchain in $golden:"
+  verify_golden "$golden"
+  log "Stopping golden (retained as clone source)."
+  limactl stop "$golden"
+  log "Golden ready: $golden"
+}
+
+cmd_run() {
+  local dir="" image="$DEFAULT_IMAGE" keep=0 with_creds=0 api_keys="" proxy="" ssh_agent=0 name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --image) shift; image="${1:?--image needs a value}";;
+      --image=*) image="${1#--image=}";;
+      --keep) keep=1;;
+      --ssh-agent) ssh_agent=1;;
+      --with-creds) with_creds=1;;
+      --api-keys) api_keys="$DEFAULT_KEYS_FILE";;
+      --api-keys=*) api_keys="$(abspath "${1#--api-keys=}")";;
+      --proxy) proxy="$PROXY_DEFAULT_URL";;
+      --proxy=*) proxy="${1#--proxy=}";;
+      --name) shift; name="${1:?--name needs a value}";;
+      --name=*) name="${1#--name=}";;
+      -h|--help) grep -E '^#( |$)' "$0" | sed -E 's/^# ?//'; return 0;;
+      -*) die "unknown flag: $1 (see: devbox --help)";;
+      *) dir="$1";;
+    esac; shift
+  done
+  dir="$(abspath "${dir:-$PWD}")"
+  [[ -d "$dir" ]] || die "not a directory: $dir"
+
+  local golden; golden="$(golden_name "$image")"
+  [[ -n "$name" ]] || name="$(instance_name "$image" "$dir")"
+
+  local preexisting=0
+  if instance_exists "$name"; then
+    preexisting=1
+    log "Attaching to existing box for this path: $name"
+    [[ $ssh_agent -eq 1 ]] && warn "--ssh-agent only applies at box creation; destroy+recreate to change it"
+  else
+    if ! instance_exists "$golden"; then
+      log "No golden for image '$image' yet — building it first."
+      cmd_build --image "$image"
+    fi
+    ensure_golden_stopped "$golden"
+    log "Cloning $golden → $name (mount: $dir)"
+    limactl clone "$golden" "$name" --mount "${dir}:w"
+    if [[ $ssh_agent -eq 1 ]]; then
+      log "Enabling host ssh-agent forwarding"
+      limactl edit "$name" --set '.ssh.forwardAgent = true' >/dev/null
+    fi
+  fi
+
+  cleanup() {
+    local rc=$?
+    trap - EXIT
+    if [[ $preexisting -eq 1 ]]; then
+      log "Left box running: $name  (destroy: devbox destroy $name)"
+    elif [[ $keep -eq 1 ]]; then
+      log "--keep: retained $name"
+      log "  re-enter: devbox $(printf '%q' "$dir")$([[ "$image" != "$DEFAULT_IMAGE" ]] && printf ' --image %q' "$image")"
+      log "  destroy:  devbox destroy $name"
+    else
+      log "Destroying $name…"
+      limactl stop -f "$name" 2>/dev/null || true
+      limactl delete -f "$name" 2>/dev/null || true
+    fi
+    exit $rc
+  }
+  trap cleanup EXIT INT TERM
+
+  if [[ "$(instance_status "$name")" != "Running" ]]; then
+    log "Booting $name…"; limactl start "$name"
+  fi
+
+  [[ -n "$proxy"     ]] && apply_proxy    "$name" "$proxy"
+  [[ -n "$api_keys"  ]] && apply_api_keys "$name" "$api_keys"
+  [[ $with_creds -eq 1 ]] && apply_creds  "$name"
+
+  if [[ -f "$dir/.devbox.sh" ]]; then
+    log "Running per-project hook: .devbox.sh"
+    limactl shell --workdir "$dir" "$name" -- bash -lc 'bash ./.devbox.sh' || warn ".devbox.sh exited non-zero"
+  fi
+
+  local fate="destroy it"
+  { [[ $preexisting -eq 1 || $keep -eq 1 ]]; } && fate="leave it running"
+  log "Entering $name — exit the shell to $fate."
+  limactl shell --workdir "$dir" "$name" || true
+}
+
+cmd_ls() { limactl list 2>/dev/null | awk 'NR==1 || $1 ~ /^devbox-/'; }
+
+cmd_destroy() {
+  local t="${1:-}"; [[ -n "$t" ]] || die "usage: devbox destroy NAME | --all | --goldens"
+  local list
+  case "$t" in
+    --all)     list="$(limactl list -q 2>/dev/null | grep '^devbox-' | grep -v '^devbox-golden' || true)";;
+    --goldens) list="$(limactl list -q 2>/dev/null | grep '^devbox-golden' || true)";;
+    *)         list="$t";;
+  esac
+  [[ -n "$list" ]] || { log "nothing to destroy."; return 0; }
+  while IFS= read -r i; do
+    [[ -n "$i" ]] || continue
+    log "destroying $i"
+    limactl stop -f "$i" 2>/dev/null || true
+    limactl delete -f "$i"
+  done <<< "$list"
+}
+
+usage() { grep -E '^#( |$)' "$0" | sed -E 's/^# ?//'; }
+
+# ----------------------------------------------------------------- dispatch --
+need limactl
+case "${1:-}" in
+  build)          shift; cmd_build   "$@";;
+  ls|list)        shift; cmd_ls      "$@";;
+  destroy|rm)     shift; cmd_destroy "$@";;
+  -h|--help|help) usage;;
+  *)              cmd_run "$@";;
+esac

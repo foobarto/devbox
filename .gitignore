@@ -1,0 +1,12 @@
+# host-local secrets & generated config — never commit
+api-keys.env
+proxy.config.json
+proxy-env
+*.env
+!*.env.example
+.env
+
+# scratch
+.tmp/
+__pycache__/
+*.pyc
