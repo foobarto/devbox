@@ -32,9 +32,23 @@ devbox                       # clone → mount CWD → shell in → delete on ex
 
 ## Install
 
+### Homebrew (recommended)
+
 ```sh
-git clone git@github.com:foobarto/devbox.git ~/devbox
-ln -s ~/devbox/bin/devbox ~/.local/bin/devbox   # or anywhere on PATH
+brew install --HEAD foobarto/tap/devbox
+```
+
+Installs `devbox` and `devbox-ai-proxy` on your `PATH` and pulls in `lima`. The
+source repo is private, so this is a `--HEAD` (git-over-SSH) install. Config
+lives under `~/.config/devbox/` (or `$XDG_CONFIG_HOME/devbox`).
+
+Upgrade with `brew upgrade --fetch-HEAD foobarto/tap/devbox`.
+
+### From source
+
+```sh
+git clone git@github.com:foobarto/devbox.git "${XDG_DATA_HOME:-$HOME/.local/share}/devbox"
+ln -s "${XDG_DATA_HOME:-$HOME/.local/share}/devbox/bin/devbox" ~/.local/bin/devbox
 ```
 
 ## Usage
@@ -56,9 +70,11 @@ devbox destroy NAME | --all | --goldens
 | `--proxy[=URL]` | point the AI CLIs at a host-side proxy; credentials stay on the host. Default `http://host.lima.internal:4000`. |
 | `--api-keys[=FILE]` | inject API keys into the box from an env file (default `~/.config/devbox/api-keys.env`). |
 | `--with-creds` | copy host AI-tool credential files into the box (OAuth logins for claude/codex without a proxy). Best-effort. |
+| `--mount PATH[:ro\|:rw]` | mount an extra host path into the box at the same path (default `ro`). Repeatable; applied at box creation. |
+| `--copy SRC[:DEST]` | copy an extra host file/dir into the box (`DEST` defaults to the basename in `$HOME`). Repeatable; works on new **and** existing boxes. |
 | `--name NAME` | override the derived instance name. |
 
-Flags combine, e.g. `devbox --ssh-agent --proxy`.
+Flags combine, e.g. `devbox --ssh-agent --proxy --mount ~/data:ro --copy ~/.netrc`.
 
 ## How it works
 

@@ -124,6 +124,32 @@ setup() {
   [ "$status" -eq 0 ]
 }
 
+# ----------------------------------------------------- --mount / --copy args ----
+@test "mount arg: bare path is read-only" {
+  run _lima_mount_arg /data
+  [ "$output" = "/data" ]
+}
+
+@test "mount arg: :rw becomes lima :w" {
+  run _lima_mount_arg /data:rw
+  [ "$output" = "/data:w" ]
+}
+
+@test "mount arg: :ro is read-only (suffix stripped)" {
+  run _lima_mount_arg /data:ro
+  [ "$output" = "/data" ]
+}
+
+@test "copy spec: no colon -> src as-is, dest is basename" {
+  run _copy_src /host/thing.txt;  [ "$output" = "/host/thing.txt" ]
+  run _copy_dest /host/thing.txt; [ "$output" = "thing.txt" ]
+}
+
+@test "copy spec: SRC:DEST splits on last colon" {
+  run _copy_src /host/dir:/guest/dest;  [ "$output" = "/host/dir" ]
+  run _copy_dest /host/dir:/guest/dest; [ "$output" = "/guest/dest" ]
+}
+
 # ---------------------------------------------------------------- dispatch ----
 @test "--help prints usage and exits 0" {
   # help case is dispatched before `need limactl`, so it works with no VM stack.

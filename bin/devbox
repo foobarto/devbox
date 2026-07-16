@@ -33,6 +33,10 @@
 #                    (default ~/.config/devbox/api-keys.env).
 #   --with-creds     copy host AI-tool credential files into the box (OAuth
 #                    logins for claude/codex without a proxy). Best-effort.
+#   --mount P[:ro|:rw]  mount an extra host path into the box at the same path
+#                    (default ro). Repeatable. Applied at box creation.
+#   --copy SRC[:DEST]   copy an extra host file/dir into the box (DEST defaults
+#                    to the basename in $HOME). Repeatable. Works on new+existing.
 #   --name NAME      override the derived instance name.
 #
 # Env
@@ -216,6 +220,34 @@ apply_api_keys() {
   limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-20-keys.sh >/dev/null' < "$file"
 }
 
+# PATH[:ro|:rw] -> a Lima --mount value (bare = read-only, :w suffix = writable).
+_lima_mount_arg() {
+  local spec="$1"
+  case "$spec" in
+    *:rw) printf '%s:w' "$(abspath "${spec%:rw}")";;
+    *:ro) printf '%s'   "$(abspath "${spec%:ro}")";;
+    *)    printf '%s'   "$(abspath "$spec")";;
+  esac
+}
+# SRC[:DEST] split for --copy. No colon -> DEST is the basename (lands in $HOME).
+_copy_src()  { local s="$1"; if [[ "$s" == *:* ]]; then printf '%s' "${s%:*}"; else printf '%s' "$s"; fi; }
+_copy_dest() { local s="$1"; if [[ "$s" == *:* ]]; then printf '%s' "${s##*:}"; else basename -- "$s"; fi; }
+
+apply_copy() {
+  local name="$1" spec="$2" src dest parent rflag=()
+  src="$(_copy_src "$spec")"; dest="$(_copy_dest "$spec")"
+  [[ -e "$src" ]] || { warn "--copy source not found: $src"; return 0; }
+  src="$(abspath "$src")"; parent="$(dirname "$dest")"
+  [[ -d "$src" ]] && rflag=(-r)   # -r only for dirs; on a file it makes dest a dir
+  log "Copying $src → $name:$dest"
+  if [[ "$dest" == /* ]]; then
+    limactl shell "$name" -- bash -c "sudo install -d -o \"\$(id -un)\" -g \"\$(id -gn)\" '$parent'" </dev/null 2>/dev/null || true
+  else
+    limactl shell "$name" -- bash -c "cd && mkdir -p '$parent'" </dev/null 2>/dev/null || true
+  fi
+  limactl copy "${rflag[@]}" "$src" "$name:$dest" 2>/dev/null || warn "copy failed: $src → $dest"
+}
+
 apply_creds() {
   local name="$1" p rel copied=0
   log "Copying host AI credentials into $name (best-effort)…"
@@ -283,6 +315,7 @@ run_cleanup() {
 
 cmd_run() {
   local dir="" image="$DEFAULT_IMAGE" keep=0 with_creds=0 api_keys="" proxy="" ssh_agent=0 name=""
+  local extra_mounts=() extra_copies=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --image) shift; image="${1:?--image needs a value}";;
@@ -294,6 +327,10 @@ cmd_run() {
       --api-keys=*) api_keys="$(abspath "${1#--api-keys=}")";;
       --proxy) proxy="$PROXY_DEFAULT_URL";;
       --proxy=*) proxy="${1#--proxy=}";;
+      --mount) shift; extra_mounts+=("${1:?--mount needs PATH[:ro|:rw]}");;
+      --mount=*) extra_mounts+=("${1#--mount=}");;
+      --copy) shift; extra_copies+=("${1:?--copy needs SRC[:DEST]}");;
+      --copy=*) extra_copies+=("${1#--copy=}");;
       --name) shift; name="${1:?--name needs a value}";;
       --name=*) name="${1#--name=}";;
       -h|--help) grep -E '^#( |$)' "$0" | sed -E 's/^# ?//'; return 0;;
@@ -312,14 +349,17 @@ cmd_run() {
     preexisting=1
     log "Attaching to existing box for this path: $name"
     [[ $ssh_agent -eq 1 ]] && warn "--ssh-agent only applies at box creation; destroy+recreate to change it"
+    [[ ${#extra_mounts[@]} -gt 0 ]] && warn "--mount only applies at box creation; destroy+recreate to change mounts (--copy still works)"
   else
     if ! instance_exists "$golden"; then
       log "No golden for image '$image' yet — building it first."
       cmd_build --image "$image"
     fi
     ensure_golden_stopped "$golden"
-    log "Cloning $golden → $name (mount: $dir)"
-    limactl clone "$golden" "$name" --mount "${dir}:w"
+    local clone_args=(--mount "${dir}:w") m
+    for m in "${extra_mounts[@]}"; do clone_args+=(--mount "$(_lima_mount_arg "$m")"); done
+    log "Cloning $golden → $name (mount: $dir${extra_mounts:+, +${#extra_mounts[@]} extra mount(s)})"
+    limactl clone "$golden" "$name" "${clone_args[@]}"
     if [[ $ssh_agent -eq 1 ]]; then
       log "Enabling host ssh-agent forwarding"
       limactl edit "$name" --set '.ssh.forwardAgent = true' >/dev/null
@@ -336,6 +376,9 @@ cmd_run() {
   [[ -n "$proxy"     ]] && apply_proxy    "$name" "$proxy"
   [[ -n "$api_keys"  ]] && apply_api_keys "$name" "$api_keys"
   [[ $with_creds -eq 1 ]] && apply_creds  "$name"
+  if [[ ${#extra_copies[@]} -gt 0 ]]; then
+    local c; for c in "${extra_copies[@]}"; do apply_copy "$name" "$c"; done
+  fi
 
   if [[ -f "$dir/.devbox" ]]; then
     log "Running per-project hook: .devbox"
