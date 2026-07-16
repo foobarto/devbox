@@ -35,16 +35,18 @@ devbox                       # clone → mount CWD → shell in → delete on ex
 ### Homebrew (recommended)
 
 ```sh
-brew install --HEAD foobarto/tap/devbox
+brew install foobarto/tap/devbox
 ```
 
-Installs `devbox` and `devbox-ai-proxy` on your `PATH`. It's a `--HEAD` install
-(tracks the latest `main`). The current stable GitHub release is
-[`v1.0.3`](https://github.com/foobarto/devbox/releases/tag/v1.0.3); source
+Installs `devbox` and `devbox-ai-proxy` on your `PATH`. The current stable
+GitHub release is
+[`v1.0.4`](https://github.com/foobarto/devbox/releases/tag/v1.0.4); source
 archives are available from that release. Config lives under `~/.config/devbox/`
 (or `$XDG_CONFIG_HOME/devbox`).
 
-Upgrade with `brew upgrade --fetch-HEAD foobarto/tap/devbox`.
+Upgrade with `brew upgrade foobarto/tap/devbox`. For a development checkout of
+the latest `main`, use `brew install --HEAD foobarto/tap/devbox` and upgrade it
+with `brew upgrade --fetch-HEAD foobarto/tap/devbox`.
 
 Check the installed version with `devbox --version` or
 `devbox-ai-proxy --version`.

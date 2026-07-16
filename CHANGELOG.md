@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.4 - 2026-07-16
+
+- Make the Homebrew package install the release version metadata and document
+  stable installs by default; `--HEAD` remains available for development.
+
 ## v1.0.3 - 2026-07-16
 
 - Restore the disposable default for existing boxes: a normal invocation now
