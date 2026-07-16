@@ -184,7 +184,7 @@ verify_golden() {
     for t in brew claude codex opencode stado; do
       if command -v "$t" >/dev/null 2>&1; then printf "  ok   %-9s %s\n" "$t" "$(command -v "$t")"
       else printf "  MISS %-9s (not on PATH)\n" "$t"; fi
-    done' 2>/dev/null || true)"
+    done' </dev/null 2>/dev/null || true)"
   printf '%s\n' "$out" >&2
   if printf '%s' "$out" | grep -q MISS; then
     warn "some tools missing in golden — inspect with: limactl shell $name"
@@ -222,7 +222,7 @@ apply_creds() {
   for p in "${CRED_PATHS[@]}"; do
     [[ -e "$p" ]] || continue
     case "$p" in "$HOME/"*) rel="${p#"$HOME"/}";; *) continue;; esac
-    limactl shell "$name" -- bash -c "cd; mkdir -p '$(dirname "$rel")'" 2>/dev/null || true
+    limactl shell "$name" -- bash -c "cd; mkdir -p '$(dirname "$rel")'" </dev/null 2>/dev/null || true
     if limactl copy -r "$p" "$name:$rel" 2>/dev/null; then copied=$((copied+1)); else warn "could not copy $p"; fi
   done
   log "Copied $copied credential path(s)."
@@ -259,6 +259,26 @@ cmd_build() {
   log "Stopping golden (retained as clone source)."
   limactl stop "$golden"
   log "Golden ready: $golden"
+}
+
+# Teardown runs from an EXIT/INT/TERM trap, which fires after cmd_run has
+# returned — so its state must be global, not cmd_run locals (those are gone by
+# then, and would trip `set -u`).
+run_cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM
+  if [[ "${_DB_PRE:-0}" -eq 1 ]]; then
+    log "Left box running: ${_DB_NAME:-?}  (destroy: devbox destroy ${_DB_NAME:-?})"
+  elif [[ "${_DB_KEEP:-0}" -eq 1 ]]; then
+    log "--keep: retained ${_DB_NAME:-?}"
+    log "  re-enter: devbox $(printf '%q' "${_DB_DIR:-.}")$([[ "${_DB_IMAGE:-}" != "$DEFAULT_IMAGE" ]] && printf ' --image %q' "${_DB_IMAGE:-}")"
+    log "  destroy:  devbox destroy ${_DB_NAME:-?}"
+  elif [[ -n "${_DB_NAME:-}" ]]; then
+    log "Destroying ${_DB_NAME}…"
+    limactl stop -f "$_DB_NAME" 2>/dev/null || true
+    limactl delete -f "$_DB_NAME" 2>/dev/null || true
+  fi
+  exit "$rc"
 }
 
 cmd_run() {
@@ -306,23 +326,8 @@ cmd_run() {
     fi
   fi
 
-  cleanup() {
-    local rc=$?
-    trap - EXIT
-    if [[ $preexisting -eq 1 ]]; then
-      log "Left box running: $name  (destroy: devbox destroy $name)"
-    elif [[ $keep -eq 1 ]]; then
-      log "--keep: retained $name"
-      log "  re-enter: devbox $(printf '%q' "$dir")$([[ "$image" != "$DEFAULT_IMAGE" ]] && printf ' --image %q' "$image")"
-      log "  destroy:  devbox destroy $name"
-    else
-      log "Destroying $name…"
-      limactl stop -f "$name" 2>/dev/null || true
-      limactl delete -f "$name" 2>/dev/null || true
-    fi
-    exit $rc
-  }
-  trap cleanup EXIT INT TERM
+  _DB_NAME="$name"; _DB_DIR="$dir"; _DB_IMAGE="$image"; _DB_KEEP="$keep"; _DB_PRE="$preexisting"
+  trap run_cleanup EXIT INT TERM
 
   if [[ "$(instance_status "$name")" != "Running" ]]; then
     log "Booting $name…"; limactl start "$name"
@@ -334,7 +339,7 @@ cmd_run() {
 
   if [[ -f "$dir/.devbox" ]]; then
     log "Running per-project hook: .devbox"
-    limactl shell --workdir "$dir" "$name" -- bash -lc 'bash ./.devbox' || warn ".devbox exited non-zero"
+    limactl shell --workdir "$dir" "$name" -- bash -lc 'bash ./.devbox' </dev/null || warn ".devbox exited non-zero"
   fi
 
   local fate="destroy it"
