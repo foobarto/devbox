@@ -33,8 +33,8 @@ devbox                       # clone → mount CWD → shell in → delete on ex
 ## Install
 
 ```sh
-git clone git@github.com:foobarto/devbox.git ~/Dokumenty/devbox
-ln -s ~/Dokumenty/devbox/bin/devbox ~/.local/bin/devbox   # or anywhere on PATH
+git clone git@github.com:foobarto/devbox.git ~/devbox
+ln -s ~/devbox/bin/devbox ~/.local/bin/devbox   # or anywhere on PATH
 ```
 
 ## Usage
