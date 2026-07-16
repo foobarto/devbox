@@ -162,14 +162,16 @@ provision:
     BREW="$(command -v brew || echo /home/linuxbrew/.linuxbrew/bin/brew)"
     [ -x "$BREW" ] && eval "$("$BREW" shellenv)" || true
     export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/.opencode/bin:$PATH"
-    # go — needed for the stado source install + generally useful
-    brew install go || true
     # --- AI CLIs ---
     brew install codex || true
     brew install sst/tap/opencode || curl -fsSL https://opencode.ai/install | bash || true
-    # stado: the Homebrew tap ships a macOS cask (unsupported on Linux), so on
-    # Linux install from source with Go. On macOS `brew install foobarto/tap/stado`.
-    command -v stado >/dev/null 2>&1 || GOBIN="$HOME/.local/bin" go install github.com/foobarto/stado/cmd/stado@latest || true
+    # stado — Homebrew cask (installs on Linux for this binary cask). Fallback to
+    # a Go source install only if the cask ever fails (installs go on demand).
+    if ! command -v stado >/dev/null 2>&1; then
+      brew install --cask foobarto/tap/stado \
+        || { brew install go && GOBIN="$HOME/.local/bin" go install github.com/foobarto/stado/cmd/stado@latest; } \
+        || true
+    fi
     # claude code — official native installer (-> ~/.local/bin)
     command -v claude >/dev/null 2>&1 || { curl -fsSL https://claude.ai/install.sh | bash || true; }
 YAML
@@ -179,7 +181,7 @@ YAML
 verify_golden() {
   local name="$1" out
   out="$(limactl shell "$name" -- bash -lc '
-    for t in brew go claude codex opencode stado; do
+    for t in brew claude codex opencode stado; do
       if command -v "$t" >/dev/null 2>&1; then printf "  ok   %-9s %s\n" "$t" "$(command -v "$t")"
       else printf "  MISS %-9s (not on PATH)\n" "$t"; fi
     done' 2>/dev/null || true)"
