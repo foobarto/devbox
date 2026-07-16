@@ -38,16 +38,16 @@ devbox                       # clone → mount CWD → shell in → delete on ex
 brew install --HEAD foobarto/tap/devbox
 ```
 
-Installs `devbox` and `devbox-ai-proxy` on your `PATH` and pulls in `lima`. The
-source repo is private, so this is a `--HEAD` (git-over-SSH) install. Config
-lives under `~/.config/devbox/` (or `$XDG_CONFIG_HOME/devbox`).
+Installs `devbox` and `devbox-ai-proxy` on your `PATH`. It's a `--HEAD` install
+(tracks the latest `main` — no tagged release yet). Config lives under
+`~/.config/devbox/` (or `$XDG_CONFIG_HOME/devbox`).
 
 Upgrade with `brew upgrade --fetch-HEAD foobarto/tap/devbox`.
 
 ### From source
 
 ```sh
-git clone git@github.com:foobarto/devbox.git "${XDG_DATA_HOME:-$HOME/.local/share}/devbox"
+git clone https://github.com/foobarto/devbox.git "${XDG_DATA_HOME:-$HOME/.local/share}/devbox"
 ln -s "${XDG_DATA_HOME:-$HOME/.local/share}/devbox/bin/devbox" ~/.local/bin/devbox
 ```
 
