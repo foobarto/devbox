@@ -13,37 +13,48 @@
 #
 # Usage
 #   devbox [DIR] [FLAGS]        spin/attach a box for DIR (default: $PWD)
-#   devbox build [--image N] [--force]
+#   devbox build [--image N|-i N] [--force|-f]
 #   devbox ls
 #   devbox destroy NAME | --all | --goldens
 #   devbox proxy [start|stop|status]   manage the shared host-side AI proxy
-#   devbox --version
+#   devbox --version|-V
 #
 # Run flags
-#   --image NAME     base image for this box's golden (default: ubuntu-24.04).
+#   --image NAME, -i NAME
+#                    base image for this box's golden (default: ubuntu-24.04).
 #                    NAME may be a Lima template name (ubuntu-24.04, debian-12,
 #                    fedora, archlinux, …), a template:// URL, a path to a
 #                    *.yaml Lima config, or a path/URL to a *.qcow2/*.img image
 #                    (e.g. a Kali cloud image).
-#   --keep           do not auto-delete the box on shell exit.
-#   --ssh-agent      forward the host SSH agent into the box (git/GitHub auth)
+#   --keep, -k       do not auto-delete the box on shell exit.
+#   --ssh-agent, -s  forward the host SSH agent into the box (git/GitHub auth)
 #                    and configure SSH-signed commits; private keys stay host-side.
-#   --proxy[=URL]    point the AI CLIs at a host-side proxy (default
+#   --proxy[=URL], -p[=URL]
+#                    point the AI CLIs at a host-side proxy (default
 #                    http://host.lima.internal:4141); real credentials stay on
 #                    the host. Auto-starts the proxy on this host if it isn't
 #                    already running (shared across boxes). See proxy/README.md.
-#   --no-auth        do not inject proxy, API-key, or copied host credentials;
+#   --no-auth, -n    do not inject proxy, API-key, or copied host credentials;
 #                    also removes devbox-managed proxy/key profiles from an
 #                    existing box. This is the default for a new box.
-#   --api-keys[=F]   inject API keys into the box from env file F
+#   --api-keys[=F], -K[=F]
+#                    inject API keys into the box from env file F
 #                    (default ~/.config/devbox/api-keys.env).
-#   --with-creds     copy host AI-tool credential files into the box (OAuth
+#   --with-creds, -c copy host AI-tool credential files into the box (OAuth
 #                    logins for claude/codex without a proxy). Best-effort.
-#   --mount P[:ro|:rw]  mount an extra host path into the box at the same path
+#   --with-agent-config, -g
+#                    copy selected non-secret Claude/Codex/OpenCode/Stado
+#                    configuration, prompts, rules, and custom agents. Any
+#                    file that looks like a credential is skipped.
+#   -a               shortcut for --with-agent-config --proxy --ssh-agent.
+#   --mount P[:ro|:rw], -m P[:ro|:rw]
+#                    mount an extra host path into the box at the same path
 #                    (default ro). Repeatable. Applied at box creation.
-#   --copy SRC[:DEST]   copy an extra host file/dir into the box (DEST defaults
+#   --copy SRC[:DEST], -C SRC[:DEST]
+#                    copy an extra host file/dir into the box (DEST defaults
 #                    to the basename in $HOME). Repeatable. Works on new+existing.
-#   --name NAME      override the derived instance name.
+#   --name NAME, -N NAME
+#                    override the derived instance name.
 #
 # Env
 #   DEVBOX_CONFIG_DIR   config/golden dir (default ~/.config/devbox)
@@ -73,6 +84,31 @@ CRED_PATHS=(
   "$HOME/.config/opencode"
   "$HOME/.local/share/opencode/auth.json"
   "$HOME/.config/stado"
+)
+
+# Non-secret agent configuration copied under --with-agent-config. This is
+# deliberately an allowlist: histories, sessions, caches, auth files, and
+# Stado's key directory never cross the VM boundary. Directories are expanded
+# to regular files one at a time, so a suspect file can be skipped safely.
+AGENT_CONFIG_PATHS=(
+  "$HOME/.claude/CLAUDE.md"
+  "$HOME/.claude/settings.json"
+  "$HOME/.claude/settings.local.json"
+  "$HOME/.claude/commands"
+  "$HOME/.claude/agents"
+  "$HOME/.claude/skills"
+  "$HOME/.claude/hooks"
+  "$HOME/.codex/AGENTS.md"
+  "$HOME/.codex/config.toml"
+  "$HOME/.codex/rules"
+  "$HOME/.codex/hooks.json"
+  "$HOME/.config/opencode/opencode.json"
+  "$HOME/.config/opencode/opencode.jsonc"
+  "$HOME/.config/opencode/commands"
+  "$HOME/.config/opencode/agents"
+  "$HOME/.config/opencode/plugins"
+  "$HOME/.config/stado/config.toml"
+  "$HOME/.config/stado/system-prompt.md"
 )
 
 # ------------------------------------------------------------------- output --
@@ -474,6 +510,49 @@ apply_creds() {
   log "Copied $copied credential path(s)."
 }
 
+agent_config_files() { # paths -> NUL-delimited regular files
+  local path
+  for path in "$@"; do
+    if [[ -f "$path" ]]; then
+      printf '%s\0' "$path"
+    elif [[ -d "$path" ]]; then
+      find "$path" -type f -print0
+    fi
+  done
+}
+
+agent_config_contains_credential() { # $1 config file; never prints its content
+  local file="$1"
+  local field_assignment="((access|refresh|id)[_-]?token|api[_-]?key|authorization|password|secret|credential)[[:space:]]*[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?[^\\\"'[:space:]]+"
+  # Config is text. Treat binary input as unsafe rather than copying it.
+  LC_ALL=C grep -Iq '' "$file" || return 0
+  # Require an assigned value to avoid rejecting harmless prose such as
+  # "do not commit API keys". Prefixes cover opaque keys whose field name is
+  # not recognisable. This is a defense in depth layer after the allowlist.
+  LC_ALL=C grep -IEq "$field_assignment|(sk-(proj-|ant-)?|rk-live-|sess-)[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{12,}\\.[A-Za-z0-9_-]{12,}\\.[A-Za-z0-9_-]{8,}" "$file"
+}
+
+apply_agent_config() {
+  local name="$1" file rel parent copied=0 skipped=0
+  log "Copying non-secret host AI agent configuration into $name…"
+  while IFS= read -r -d '' file; do
+    case "$file" in "$HOME/"*) rel="${file#"$HOME"/}";; *) continue;; esac
+    if agent_config_contains_credential "$file"; then
+      warn "skipping possible credential in agent config: $rel"
+      skipped=$((skipped+1))
+      continue
+    fi
+    parent="$(dirname "$rel")"
+    limactl shell "$name" -- bash -c "cd; mkdir -p '$parent'" </dev/null 2>/dev/null || true
+    if limactl copy "$file" "$name:$rel" 2>/dev/null; then
+      copied=$((copied+1))
+    else
+      warn "could not copy agent config: $rel"
+    fi
+  done < <(agent_config_files "${AGENT_CONFIG_PATHS[@]}")
+  log "Copied $copied non-secret agent config file(s); skipped $skipped possible credential(s)."
+}
+
 # --------------------------------------------------------- project manifest --
 project_manifest() { # $1 .devbox.toml -> normalized JSON
   python3 - "$1" <<'PY'
@@ -494,7 +573,7 @@ except (OSError, tomllib.TOMLDecodeError) as exc:
 
 allowed = {
     "image", "packages", "start", "ssh_agent", "keep", "proxy", "api_keys",
-    "with_creds", "no_auth", "mounts", "copies",
+    "with_creds", "with_agent_config", "no_auth", "mounts", "copies",
 }
 unknown = sorted(set(data) - allowed)
 if unknown:
@@ -512,7 +591,7 @@ start = data.get("start")
 if start is not None and (not isinstance(start, str) or not start):
     raise SystemExit("start must be a non-empty shell command string")
 
-for key in ("ssh_agent", "keep", "with_creds", "no_auth"):
+for key in ("ssh_agent", "keep", "with_creds", "with_agent_config", "no_auth"):
     if key in data and not isinstance(data[key], bool):
         raise SystemExit(f"{key} must be true or false")
 
@@ -533,7 +612,9 @@ print(json.dumps({
     "image": image or "", "packages": packages, "start": start or "",
     "ssh_agent": data.get("ssh_agent", False), "keep": data.get("keep", False),
     "proxy": data.get("proxy", False), "api_keys": data.get("api_keys", False),
-    "with_creds": data.get("with_creds", False), "no_auth": data.get("no_auth", False),
+    "with_creds": data.get("with_creds", False),
+    "with_agent_config": data.get("with_agent_config", False),
+    "no_auth": data.get("no_auth", False),
     "mounts": data.get("mounts", []), "copies": data.get("copies", []),
 }))
 PY
@@ -592,9 +673,9 @@ cmd_build() {
   local image="$DEFAULT_IMAGE" force=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --image) shift; image="${1:?--image needs a value}";;
-      --image=*) image="${1#--image=}";;
-      --force) force=1;;
+      --image|-i) shift; image="${1:?--image needs a value}";;
+      --image=*|-i=*) image="${1#*=}";;
+      --force|-f) force=1;;
       -h|--help) grep -E '^#( |$)' "$0" | sed -E 's/^# ?//'; return 0;;
       *) die "build: unknown arg: $1";;
     esac; shift
@@ -645,26 +726,28 @@ run_cleanup() {
 }
 
 cmd_run() {
-  local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name=""
+  local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 with_agent_config=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name=""
   local extra_mounts=() extra_copies=() manifest_requests=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --image) shift; image="${1:?--image needs a value}"; image_set=1;;
-      --image=*) image="${1#--image=}"; image_set=1;;
-      --keep) keep=1;;
-      --ssh-agent) ssh_agent=1;;
-      --with-creds) with_creds=1;;
-      --no-auth) no_auth=1;;
-      --api-keys) api_keys="$DEFAULT_KEYS_FILE";;
-      --api-keys=*) api_keys="$(abspath "${1#--api-keys=}")";;
-      --proxy) proxy="$PROXY_DEFAULT_URL";;
-      --proxy=*) proxy="${1#--proxy=}";;
-      --mount) shift; extra_mounts+=("${1:?--mount needs PATH[:ro|:rw]}");;
-      --mount=*) extra_mounts+=("${1#--mount=}");;
-      --copy) shift; extra_copies+=("${1:?--copy needs SRC[:DEST]}");;
-      --copy=*) extra_copies+=("${1#--copy=}");;
-      --name) shift; name="${1:?--name needs a value}";;
-      --name=*) name="${1#--name=}";;
+      --image|-i) shift; image="${1:?--image needs a value}"; image_set=1;;
+      --image=*|-i=*) image="${1#*=}"; image_set=1;;
+      --keep|-k) keep=1;;
+      --ssh-agent|-s) ssh_agent=1;;
+      --with-creds|-c) with_creds=1;;
+      --with-agent-config|-g) with_agent_config=1;;
+      -a) with_agent_config=1; proxy="$PROXY_DEFAULT_URL"; ssh_agent=1;;
+      --no-auth|-n) no_auth=1;;
+      --api-keys|-K) api_keys="$DEFAULT_KEYS_FILE";;
+      --api-keys=*|-K=*) api_keys="$(abspath "${1#*=}")";;
+      --proxy|-p) proxy="$PROXY_DEFAULT_URL";;
+      --proxy=*|-p=*) proxy="${1#*=}";;
+      --mount|-m) shift; extra_mounts+=("${1:?--mount needs PATH[:ro|:rw]}");;
+      --mount=*|-m=*) extra_mounts+=("${1#*=}");;
+      --copy|-C) shift; extra_copies+=("${1:?--copy needs SRC[:DEST]}");;
+      --copy=*|-C=*) extra_copies+=("${1#*=}");;
+      --name|-N) shift; name="${1:?--name needs a value}";;
+      --name=*|-N=*) name="${1#*=}";;
       -h|--help) grep -E '^#( |$)' "$0" | sed -E 's/^# ?//'; return 0;;
       -*) die "unknown flag: $1 (see: devbox --help)";;
       *) dir="$1";;
@@ -691,6 +774,10 @@ cmd_run() {
       manifest_requests+=("keep the devbox after exit")
     fi
 
+    if [[ "$(manifest_value "$manifest" with_agent_config)" == True && $with_agent_config -eq 0 ]]; then
+      with_agent_config=1
+      manifest_requests+=("copy non-secret AI agent configuration into the devbox")
+    fi
     if [[ $no_auth -eq 0 ]]; then
       manifest_proxy="$(manifest_value "$manifest" proxy)"
       if [[ -z "$proxy" && "$manifest_proxy" != False ]]; then
@@ -774,6 +861,7 @@ cmd_run() {
     [[ -n "$api_keys"  ]] && apply_api_keys "$name" "$api_keys"
     [[ $with_creds -eq 1 ]] && apply_creds  "$name"
   fi
+  [[ $with_agent_config -eq 1 ]] && apply_agent_config "$name"
   if [[ ${#extra_copies[@]} -gt 0 ]]; then
     local c; for c in "${extra_copies[@]}"; do apply_copy "$name" "$c"; done
   fi
@@ -816,8 +904,8 @@ cmd_destroy() {
   local t="${1:-}"; [[ -n "$t" ]] || die "usage: devbox destroy NAME | --all | --goldens"
   local list
   case "$t" in
-    --all)     list="$(limactl list -q 2>/dev/null | grep '^devbox-' | grep -v '^devbox-golden' || true)";;
-    --goldens) list="$(limactl list -q 2>/dev/null | grep '^devbox-golden' || true)";;
+    --all|-A)     list="$(limactl list -q 2>/dev/null | grep '^devbox-' | grep -v '^devbox-golden' || true)";;
+    --goldens|-G) list="$(limactl list -q 2>/dev/null | grep '^devbox-golden' || true)";;
     *)         list="$t";;
   esac
   [[ -n "$list" ]] || { log "nothing to destroy."; return 0; }

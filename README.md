@@ -40,7 +40,7 @@ brew install foobarto/tap/devbox
 
 Installs `devbox` and `devbox-ai-proxy` on your `PATH`. The current stable
 GitHub release is
-[`v1.0.5`](https://github.com/foobarto/devbox/releases/tag/v1.0.5); source
+[`v1.0.6`](https://github.com/foobarto/devbox/releases/tag/v1.0.6); source
 archives are available from that release. Config lives under `~/.config/devbox/`
 (or `$XDG_CONFIG_HOME/devbox`).
 
@@ -71,18 +71,23 @@ devbox destroy NAME | --all | --goldens
 
 | flag | effect |
 |---|---|
-| `--image NAME` | base image for this box's golden (default `ubuntu-24.04`). See [Images](#images). |
-| `--keep` | don't auto-delete the box on exit. |
-| `--ssh-agent` | forward the host SSH agent into the box (git/GitHub) and configure signed Git commits. Host **private keys never enter the VM** — only the agent socket and selected public key are used. |
-| `--proxy[=URL]` | point the AI CLIs at a host-side proxy; credentials stay on the host. Default `http://host.lima.internal:4141`. |
-| `--no-auth` | explicitly disable Devbox-managed proxy, API-key, and copied-credential auth; removes its proxy/key profiles from an existing box. |
-| `--api-keys[=FILE]` | inject API keys into the box from an env file (default `~/.config/devbox/api-keys.env`). |
-| `--with-creds` | copy host AI-tool credential files into the box (OAuth logins for claude/codex without a proxy). Best-effort. |
-| `--mount PATH[:ro\|:rw]` | mount an extra host path into the box at the same path (default `ro`). Repeatable; applied at box creation. |
-| `--copy SRC[:DEST]` | copy an extra host file/dir into the box (`DEST` defaults to the basename in `$HOME`). Repeatable; works on new **and** existing boxes. |
-| `--name NAME` | override the derived instance name. |
+| `--image NAME`, `-i NAME` | base image for this box's golden (default `ubuntu-24.04`). See [Images](#images). |
+| `--keep`, `-k` | don't auto-delete the box on exit. |
+| `--ssh-agent`, `-s` | forward the host SSH agent into the box (git/GitHub) and configure signed Git commits. Host **private keys never enter the VM** — only the agent socket and selected public key are used. |
+| `--proxy[=URL]`, `-p[=URL]` | point the AI CLIs at a host-side proxy; credentials stay on the host. Default `http://host.lima.internal:4141`. |
+| `--no-auth`, `-n` | explicitly disable Devbox-managed proxy, API-key, and copied-credential auth; removes its proxy/key profiles from an existing box. |
+| `--api-keys[=FILE]`, `-K[=FILE]` | inject API keys into the box from an env file (default `~/.config/devbox/api-keys.env`). |
+| `--with-creds`, `-c` | copy host AI-tool credential files into the box (OAuth logins for claude/codex without a proxy). Best-effort. |
+| `--with-agent-config`, `-g` | copy an allowlisted set of non-secret Claude, Codex, OpenCode, and Stado settings, prompts, rules, and custom agents. Auth, histories, caches, and key directories are excluded; suspected credentials are skipped. |
+| `-a` | shortcut for `--with-agent-config --proxy --ssh-agent`; it never enables `--with-creds`. |
+| `--mount PATH[:ro\|:rw]`, `-m PATH[:ro\|:rw]` | mount an extra host path into the box at the same path (default `ro`). Repeatable; applied at box creation. |
+| `--copy SRC[:DEST]`, `-C SRC[:DEST]` | copy an extra host file/dir into the box (`DEST` defaults to the basename in `$HOME`). Repeatable; works on new **and** existing boxes. |
+| `--name NAME`, `-N NAME` | override the derived instance name. |
 
-Flags combine, e.g. `devbox --ssh-agent --proxy --mount ~/data:ro --copy ~/.netrc`.
+Use `-a` for the usual agent-config + proxy + SSH-agent setup, or combine
+flags yourself, e.g. `devbox -s -p -m ~/data:ro -C ~/.netrc`. Build accepts
+`-i` and `-f` for `--image` and `--force`; destroy accepts `-A` and
+`-G` for `--all` and `--goldens`. Help and version are `-h` and `-V`.
 
 ## How it works
 
@@ -135,6 +140,7 @@ Installed ≠ authenticated. Three combinable strategies, pick per your setup:
 | explicitly opt out of Devbox auth | `--no-auth` | no new credentials injected |
 | API keys (opencode, stado, OpenAI/Codex platform keys) | `--api-keys` | copied into the box |
 | Claude/Codex **subscription OAuth** without a proxy | `--with-creds` | copied into the box |
+| AI CLI settings, prompts, rules, and custom agents without auth | `--with-agent-config` | allowlisted non-secret files copied into the box |
 | nothing | *(default)* | you log in interactively inside the box |
 
 The proxy supports API keys plus Claude and Codex OAuth logins. A host CLI login
@@ -157,7 +163,8 @@ does not stop for a first-connection prompt.
 `--no-auth` is the explicit opt-out for a kept box that was previously started
 with `--proxy` or `--api-keys`; it removes Devbox's profile snippets before the
 shell opens. It does not delete credentials created manually inside the VM, and
-cannot be combined with `--proxy`, `--api-keys`, or `--with-creds`.
+cannot be combined with `--proxy`, `--api-keys`, or `--with-creds`. It can be
+combined with `--with-agent-config`, which never intentionally copies auth.
 
 ## Per-project setup
 
@@ -172,7 +179,7 @@ start = "npm install"
 ```
 
 The manifest can also declare `ssh_agent`, `keep`, `proxy`, `api_keys`,
-`with_creds`, `mounts`, `copies`, and `no_auth`. Because a project manifest is
+`with_creds`, `with_agent_config`, `mounts`, `copies`, and `no_auth`. Because a project manifest is
 repository-controlled input, Devbox prints every requested host-affecting
 capability and startup command, then requires an explicit `y` before creating
 or attaching to a box. Command-line flags remain explicit user choices and are

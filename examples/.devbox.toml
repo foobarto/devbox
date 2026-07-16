@@ -21,6 +21,7 @@ start = "npm install"
 # proxy = true                         # or "http://host.lima.internal:4141"
 # api_keys = true                      # or "/path/to/api-keys.env"
 # with_creds = true
+# with_agent_config = true             # copies allowlisted settings, never auth files
 # mounts = ["/host/data:ro", "/host/cache:rw"]
 # copies = ["~/.netrc", "./tooling:~/tooling"]
 # no_auth = true                       # cannot be combined with proxy/api_keys/with_creds

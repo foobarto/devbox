@@ -197,6 +197,28 @@ setup() {
   run _copy_dest /host/dir:/guest/dest; [ "$output" = "/guest/dest" ]
 }
 
+# ----------------------------------------------------------- agent config ----
+@test "agent config allowlist excludes known credential paths" {
+  config_paths="$(printf '%s\n' "${AGENT_CONFIG_PATHS[@]}")"
+  [[ "$config_paths" == *"$HOME/.claude/settings.json"* ]]
+  [[ "$config_paths" == *"$HOME/.codex/config.toml"* ]]
+  [[ "$config_paths" != *"$HOME/.claude/.credentials.json"* ]]
+  [[ "$config_paths" != *"$HOME/.claude.json"* ]]
+  [[ "$config_paths" != *"$HOME/.codex/auth.json"* ]]
+  [[ "$config_paths" != *"$HOME/.config/stado/keys"* ]]
+}
+
+@test "agent config credential detector skips assignments but accepts ordinary settings" {
+  safe="$BATS_TEST_TMPDIR/safe.toml"
+  suspect="$BATS_TEST_TMPDIR/suspect.toml"
+  printf 'model = "gpt-5"\n' > "$safe"
+  printf 'api_key = "placeholder-value"\n' > "$suspect"
+  run agent_config_contains_credential "$safe"
+  [ "$status" -ne 0 ]
+  run agent_config_contains_credential "$suspect"
+  [ "$status" -eq 0 ]
+}
+
 # ------------------------------------------------------------------- proxy ----
 @test "proxy_port extracts port and defaults to 4141" {
   run proxy_port http://host.lima.internal:4141; [ "$output" = "4141" ]
@@ -212,6 +234,7 @@ setup() {
   [[ "$output" == *'"packages": ["node", "go"]'* ]]
   [[ "$output" == *'"ssh_agent": true'* ]]
   [[ "$output" == *'"proxy": "http://host.lima.internal:4141"'* ]]
+  [[ "$output" == *'"with_agent_config": true'* ]]
 }
 
 @test "manifest package transport handles a single package" {
@@ -240,6 +263,26 @@ setup() {
   [[ "$output" == *"--no-auth"* ]]
 }
 
+@test "shortcuts document the agent-config safe default" {
+  run bash "$DEVBOX" -h
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--with-agent-config, -g"* ]]
+  [[ "$output" == *"shortcut for --with-agent-config --proxy --ssh-agent"* ]]
+  run bash "$DEVBOX" -V
+  [ "$status" -eq 0 ]
+  [ "$output" = "devbox 1.0.6" ]
+}
+
+@test "every long run, build, and destroy flag has a single-letter alias" {
+  source_text="$(<"$DEVBOX")"
+  for alias in \
+    '--image|-i' '--keep|-k' '--ssh-agent|-s' '--proxy|-p' '--no-auth|-n' \
+    '--api-keys|-K' '--with-creds|-c' '--with-agent-config|-g' \
+    '--mount|-m' '--copy|-C' '--name|-N' '--force|-f' '--all|-A' '--goldens|-G'; do
+    [[ "$source_text" == *"$alias"* ]]
+  done
+}
+
 @test "help states that --keep is the only opt-out from cleanup" {
   run bash "$DEVBOX" --help
   [ "$status" -eq 0 ]
@@ -249,7 +292,7 @@ setup() {
 @test "--version reads the release version without Lima" {
   run bash "$DEVBOX" --version
   [ "$status" -eq 0 ]
-  [ "$output" = "devbox 1.0.5" ]
+  [ "$output" = "devbox 1.0.6" ]
 }
 
 @test "--version resolves the real path when invoked through a symlink" {
@@ -257,7 +300,7 @@ setup() {
   ln -s "$DEVBOX" "$link"
   run "$link" --version
   [ "$status" -eq 0 ]
-  [ "$output" = "devbox 1.0.5" ]
+  [ "$output" = "devbox 1.0.6" ]
 }
 
 @test "unknown run flag is rejected" {

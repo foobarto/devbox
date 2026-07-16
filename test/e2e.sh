@@ -187,6 +187,11 @@ test -s "$MANIFEST_PROJECT/.codex-e2e-output"
 git -C "$MANIFEST_PROJECT" cat-file -p HEAD | grep -q '^gpgsig -----BEGIN SSH SIGNATURE-----'
 curl -fsS http://127.0.0.1:4141/_devbox | grep -q devbox-ai-proxy
 
+echo "[e2e] -a copies non-secret agent config without copying OAuth credentials"
+run_session approve "$DEVBOX_BIN" "$MANIFEST_PROJECT" -a
+# shellcheck disable=SC2016 # $HOME expands inside the guest shell.
+assert_guest "$manifest_instance" 'test -f "$HOME/.codex/AGENTS.md"; test ! -e "$HOME/.codex/auth.json"'
+
 echo "[e2e] API keys and --with-creds on the same retained, disposable VM"
 run_session approve "$DEVBOX_BIN" "$MANIFEST_PROJECT" --api-keys="$KEY_FILE"
 assert_guest "$manifest_instance" 'test -f /etc/profile.d/zz-devbox-10-proxy.sh; test -f /etc/profile.d/zz-devbox-11-codex-proxy.sh; test -f /etc/profile.d/zz-devbox-20-keys.sh; grep -q DEVBOX_E2E_API_KEY /etc/profile.d/zz-devbox-20-keys.sh'

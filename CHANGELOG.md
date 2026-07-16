@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.0.6 - 2026-07-16
+
+- Add `--with-agent-config` to copy an allowlisted set of non-secret Claude,
+  Codex, OpenCode, and Stado configuration, prompts, rules, and custom agents.
+  Credential files, histories, caches, and Stado keys are excluded; files that
+  look like credentials are skipped.
+- Add `-a` as the safe developer-ready shortcut for `--with-agent-config`,
+  `--proxy`, and `--ssh-agent`. It never enables `--with-creds`.
+- Add single-letter forms for every long Devbox run/build/destroy flag.
+
 ## v1.0.5 - 2026-07-16
 
 - Golden images skip Lima's unused rootless-containerd bootstrap, avoiding an
