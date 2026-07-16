@@ -330,9 +330,9 @@ cmd_run() {
   [[ -n "$api_keys"  ]] && apply_api_keys "$name" "$api_keys"
   [[ $with_creds -eq 1 ]] && apply_creds  "$name"
 
-  if [[ -f "$dir/.devbox.sh" ]]; then
-    log "Running per-project hook: .devbox.sh"
-    limactl shell --workdir "$dir" "$name" -- bash -lc 'bash ./.devbox.sh' || warn ".devbox.sh exited non-zero"
+  if [[ -f "$dir/.devbox" ]]; then
+    log "Running per-project hook: .devbox"
+    limactl shell --workdir "$dir" "$name" -- bash -lc 'bash ./.devbox' || warn ".devbox exited non-zero"
   fi
 
   local fate="destroy it"

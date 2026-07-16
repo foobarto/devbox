@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Per-project devbox hook. Drop a copy of this in a project's root as
-# `.devbox.sh`. It runs INSIDE the disposable box after boot, as your user, in
+# `.devbox`. It runs INSIDE the disposable box after boot, as your user, in
 # the mounted project directory. Use it to install project-specific tooling on
 # top of the minimal golden baseline. Absent → skipped.
 #
@@ -15,4 +15,4 @@ set -euo pipefail
 # [ -f pyproject.toml ]      && pipx install . || pip install -e .
 # [ -f go.mod ]              && go mod download
 
-echo "devbox: .devbox.sh ran (edit me to install project tooling)"
+echo "devbox: .devbox ran (edit me to install project tooling)"

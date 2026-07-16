@@ -72,8 +72,8 @@ Flags combine, e.g. `devbox --ssh-agent --proxy`.
    - else **clones** the golden (`limactl clone`, fast — a copy of the
      already-provisioned disk, no re-install), mounts `DIR` writable at the same
      path, and boots.
-   - runs `DIR/.devbox.sh` if present (per-project setup — see
-     [`examples/.devbox.sh`](examples/.devbox.sh)),
+   - runs `DIR/.devbox` if present (per-project setup — see
+     [`examples/.devbox`](examples/.devbox)),
    - drops you into a shell in `DIR`,
    - on exit, **deletes** the clone — unless `--keep`, or the box pre-existed.
 
@@ -120,10 +120,10 @@ Git/GitHub auth is separate: use **`--ssh-agent`**.
 
 ## Per-project setup
 
-If the mounted directory contains an executable-ish `.devbox.sh`, it runs inside
-the box after boot (as you, in the project dir). Declare project-specific
-tooling there on top of the minimal baseline. Template:
-[`examples/.devbox.sh`](examples/.devbox.sh).
+If the mounted directory contains a `.devbox` script, it runs inside the box
+after boot (as you, in the project dir). Declare project-specific tooling there
+on top of the minimal baseline. Template:
+[`examples/.devbox`](examples/.devbox).
 
 ## Config
 
