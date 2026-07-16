@@ -138,6 +138,19 @@ Everything host-side lives under `~/.config/devbox/` (override with
 └── proxy-env                    # optional --proxy env template (uses __PROXY_URL__)
 ```
 
+## Tests
+
+Unit tests cover the pure logic (name derivation, image-stanza + golden-YAML
+generation, dispatch) and spin up no VM, so they're fast.
+
+```sh
+brew install bats-core     # once
+make test                  # or: bats test/
+```
+
+The one `limactl validate` test skips automatically if `limactl` isn't
+installed.
+
 ## Notes & limits
 
 - `limactl clone` copies the golden disk. On a reflink-capable filesystem

@@ -370,11 +370,15 @@ cmd_destroy() {
 usage() { grep -E '^#( |$)' "$0" | sed -E 's/^# ?//'; }
 
 # ----------------------------------------------------------------- dispatch --
-need limactl
-case "${1:-}" in
-  build)          shift; cmd_build   "$@";;
-  ls|list)        shift; cmd_ls      "$@";;
-  destroy|rm)     shift; cmd_destroy "$@";;
-  -h|--help|help) usage;;
-  *)              cmd_run "$@";;
-esac
+# Only when executed directly — sourcing (e.g. from the bats tests) loads the
+# functions without running anything.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  case "${1:-}" in -h|--help|help) usage; exit 0;; esac
+  need limactl
+  case "${1:-}" in
+    build)          shift; cmd_build   "$@";;
+    ls|list)        shift; cmd_ls      "$@";;
+    destroy|rm)     shift; cmd_destroy "$@";;
+    *)              cmd_run "$@";;
+  esac
+fi
