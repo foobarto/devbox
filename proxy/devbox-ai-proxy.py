@@ -29,7 +29,7 @@ CONFIG_PATH = os.environ.get(
 with open(CONFIG_PATH) as _f:
     CONFIG = json.load(_f)
 
-LISTEN = CONFIG.get("listen", "0.0.0.0:4000")
+LISTEN = CONFIG.get("listen", "0.0.0.0:4141")
 _HOST, _PORT = LISTEN.rsplit(":", 1)
 BIND_HOST = "" if _HOST in ("0.0.0.0", "*") else _HOST
 BIND_PORT = int(_PORT)
