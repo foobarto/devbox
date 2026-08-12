@@ -10,3 +10,5 @@ proxy-env
 .tmp/
 __pycache__/
 *.pyc
+
+.agent/journal/

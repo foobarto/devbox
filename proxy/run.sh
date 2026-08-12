@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
-# Launch the host-side AI proxy so disposable devboxes never hold credentials.
+# Launch the host-side credential proxy so disposable devboxes never hold credentials.
 # Reads API keys from ~/.config/devbox/api-keys.env (if present) and a route
 # config from ~/.config/devbox/proxy.config.json (falls back to the bundled
 # example). Bind address/port come from the config's "listen" field.
 #
-# Requires: python3 (standard library only).
+# Requires: python3 (standard library only). `gh` proxy support also uses
+# OpenSSL to make a local, per-host CA for GitHub API TLS interception.
 #
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,5 +28,6 @@ fi
 cfg="${DEVBOX_PROXY_CONFIG:-$HOME/.config/devbox/proxy.config.json}"
 [[ -f "$cfg" ]] || cfg="$here/proxy.config.example.json"
 export DEVBOX_PROXY_CONFIG="$cfg"
+export DEVBOX_PROXY_STATE_DIR="${DEVBOX_PROXY_STATE_DIR:-${DEVBOX_CONFIG_DIR:-$HOME/.config/devbox}}"
 
-exec python3 "$here/devbox-ai-proxy.py"
+exec python3 "$here/devbox-ai-proxy.py" "$@"

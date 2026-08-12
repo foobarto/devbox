@@ -1,12 +1,13 @@
 # Per-project Devbox manifest. Copy this to a project's root as `.devbox.toml`.
-# CLI flags override image/proxy/API-key choices here. Host-affecting options
-# declared in this file are shown and require an explicit approval on startup.
+# CLI flags override image/resource/proxy/API-key choices here. Host-affecting
+# options declared in this file are shown and require an explicit approval on
+# startup.
+#
+# TOML NOTE: every key after a `[table]` header belongs to that table, so all
+# top-level keys below must come BEFORE the [image] and [resources] sections.
 
-# Select the Lima image and therefore the matching Devbox golden. Omit to use
-# the default image (`ubuntu-24.04`).
-image = "ubuntu-24.04"
-
-# Homebrew formulae installed in the box before the startup command runs.
+# Homebrew formulae installed in the box before the startup command runs. These
+# run per-box, so anything heavy belongs in [image].provision instead.
 packages = ["node", "python@3.12"]
 
 # Optional shell command, run in the project directory after boot. It is shown
@@ -14,8 +15,8 @@ packages = ["node", "python@3.12"]
 # out of this field unless you intentionally want the shell to wait for them.
 start = "npm install"
 
-# The remaining fields are opt-in host-affecting capabilities. Uncomment what
-# the project genuinely needs; each is listed in the approval prompt.
+# The remaining top-level fields are opt-in host-affecting capabilities.
+# Uncomment what the project genuinely needs; each is listed in the prompt.
 # ssh_agent = true
 # keep = true
 # proxy = true                         # or "http://host.lima.internal:4141"
@@ -25,3 +26,45 @@ start = "npm install"
 # mounts = ["/host/data:ro", "/host/cache:rw"]
 # copies = ["~/.netrc", "./tooling:~/tooling"]
 # no_auth = true                       # cannot be combined with proxy/api_keys/with_creds
+
+# --- base image ------------------------------------------------------------
+# Shorthand form — use this when you only need to pick a base image:
+#   image = "ubuntu-24.04"
+#
+# Table form, when the project needs a digest or its own baked-in toolchain:
+[image]
+# A Lima template name, a template:// URL, a *.yaml Lima config, or a path/URL
+# to a *.qcow2 / *.img / *.raw image.
+location = "ubuntu-24.04"
+
+# Optional, for qcow2/URL images.
+# digest = "sha512:…"
+
+# Optional root script baked into the golden. It runs ONCE at golden build time,
+# after devbox's base packages and before Homebrew — not per box — so this is
+# where a heavy distro toolchain belongs. Use a single-quoted ''' string when the
+# script contains backslash escapes: a """ string would interpret them.
+# provision = '''
+# apt-get install -y --no-install-recommends build-essential
+# '''
+
+# Optional user-mode script, baked into the golden after Homebrew and the AI
+# CLIs are installed, so it can use them.
+# provision_user = '''
+# pipx install updog
+# '''
+
+# Custom provisioning changes the golden's identity, so one project can never
+# silently redefine the golden another project clones from. Editing either
+# script means the next run builds a new golden; clean up the old one with
+# `devbox destroy --goldens`.
+
+# --- resources -------------------------------------------------------------
+# Precedence: CLI flags > this file > ~/.config/devbox/config.toml > built-in
+# defaults (4 CPUs, 6GiB memory, 100GiB disk).
+[resources]
+cpus = 4
+memory = "6GiB"
+# Disk is a ceiling, not an allocation: Lima's qcow2 is sparse, so this costs
+# only what is actually written. It is also grow-only — qcow2 cannot shrink.
+disk = "100GiB"

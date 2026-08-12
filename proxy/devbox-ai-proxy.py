@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""devbox-ai-proxy — zero-dependency host-side AI proxy.
+"""devbox-ai-proxy — zero-dependency host-side credential proxy.
 
 Keeps real credentials on the *host* so disposable devboxes never hold them.
 For each route it injects auth from one of:
@@ -9,16 +9,23 @@ For each route it injects auth from one of:
     the host keeps refreshed) -> "token-file:~/.claude/.credentials.json#claudeAiOauth.accessToken"
   * the output of a command  -> "token-cmd:some-command"
   * automatic Anthropic auth -> prefer ANTHROPIC_API_KEY, then host Claude OAuth
+  * automatic GitHub auth    -> host `gh auth token` for GitHub CLI traffic
 
 Responses are streamed (SSE-friendly). Python standard library only — no pip.
+For `gh`, a GitHub-only CONNECT proxy terminates TLS with a per-host Devbox CA,
+replaces the guest's routing marker with the host `gh` token, and then connects
+to GitHub. The guest never receives the real token.
 
 Config: JSON at $DEVBOX_PROXY_CONFIG (defaults to proxy.config.example.json next
 to this file). See that file for the shape.
 """
+import base64
+import hmac
 import http.client
 import json
 import os
 import select
+import secrets
 import socket
 import ssl
 import subprocess
@@ -42,6 +49,9 @@ _HOST, _PORT = LISTEN.rsplit(":", 1)
 BIND_HOST = "" if _HOST in ("0.0.0.0", "*") else _HOST
 BIND_PORT = int(_PORT)
 ROUTES = CONFIG.get("routes", [])
+STATE_DIR = os.path.expanduser(
+    os.environ.get("DEVBOX_PROXY_STATE_DIR", os.path.join("~", ".config", "devbox"))
+)
 
 # OAuth credentials stay on the host. Access tokens are reread for every
 # request, refreshed before expiry, and retried once after an auth failure.
@@ -58,6 +68,10 @@ CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 REFRESH_SKEW_SECONDS = 300
 REFRESH_POLL_SECONDS = 60
 _REFRESH_LOCKS = {"anthropic": threading.Lock(), "openai": threading.Lock()}
+_GITHUB_CERT_LOCK = threading.Lock()
+_GITHUB_CAPABILITY_LOCK = threading.Lock()
+GITHUB_MITM_HOSTS = {"api.github.com", "uploads.github.com"}
+GITHUB_PROXY_TOKEN_TTL_SECONDS = 8 * 60 * 60
 
 # hop-by-hop + length/host headers we never forward verbatim
 DROP = {
@@ -227,6 +241,33 @@ def resolve_codex_oauth(force_refresh: bool = False) -> tuple[str, str, str]:
         return access, account if isinstance(account, str) else "", "openai"
 
 
+def resolve_github_token() -> str:
+    """Read the host GitHub CLI token without ever sending it to the guest."""
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        token = os.environ.get(name, "")
+        if token:
+            return token
+
+    # Ask the host CLI rather than reading its config/keyring directly. Remove
+    # the environment fallbacks so a non-empty marker inherited by the proxy
+    # cannot be mistaken for a real stored credential.
+    environment = dict(os.environ)
+    environment.pop("GH_TOKEN", None)
+    environment.pop("GITHUB_TOKEN", None)
+    try:
+        completed = subprocess.run(
+            ["gh", "auth", "token", "--hostname", "github.com"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return completed.stdout.strip() if completed.returncode == 0 else ""
+
+
 def resolve_auth(auth: dict, force_refresh: bool = False):
     """Return headers and provider for one route auth block.
 
@@ -258,6 +299,11 @@ def resolve_auth(auth: dict, force_refresh: bool = False):
         if oauth_token:
             extra = {"ChatGPT-Account-ID": account_id} if account_id else {}
             return "authorization", "Bearer ", oauth_token, extra, (), provider
+        return "", "", "", {}, (), ""
+    if source == "auto:github":
+        token = resolve_github_token()
+        if token:
+            return "authorization", "Bearer ", token, {}, ("x-api-key",), "github"
         return "", "", "", {}, (), ""
     return (
         auth.get("header", ""),
@@ -296,9 +342,171 @@ def match_route(path: str):
     return None
 
 
+def github_connect_target(authority: str) -> tuple[str, str] | None:
+    """Classify a CONNECT target as TLS-intercepted GitHub or a safe tunnel."""
+    host, separator, port = authority.rpartition(":")
+    if not separator or not host or port != "443":
+        return None
+    hostname = host.lower().rstrip(".")
+    if hostname in GITHUB_MITM_HOSTS:
+        return "mitm", hostname
+    if hostname == "github.com" or hostname.endswith(".github.com") or hostname.endswith(".githubusercontent.com"):
+        return "tunnel", hostname
+    return None
+
+
+def github_certificate_paths() -> tuple[str, str, str]:
+    return (
+        os.path.join(STATE_DIR, "gh-proxy-ca.pem"),
+        os.path.join(STATE_DIR, "gh-proxy-leaf.pem"),
+        os.path.join(STATE_DIR, "gh-proxy-leaf-key.pem"),
+    )
+
+
+def ensure_github_certificates() -> tuple[str, str, str]:
+    """Create a local CA and GitHub leaf certificate once, with strict modes."""
+    with _GITHUB_CERT_LOCK:
+        ca_path, cert_path, key_path = github_certificate_paths()
+        if all(os.path.isfile(path) for path in (ca_path, cert_path, key_path)):
+            return ca_path, cert_path, key_path
+
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".devbox-gh-ca-", dir=STATE_DIR) as directory:
+            ca_key = os.path.join(directory, "ca-key.pem")
+            ca_cert = os.path.join(directory, "ca.pem")
+            leaf_key = os.path.join(directory, "leaf-key.pem")
+            leaf_csr = os.path.join(directory, "leaf.csr")
+            leaf_cert = os.path.join(directory, "leaf.pem")
+            ca_config = os.path.join(directory, "ca.cnf")
+            leaf_config = os.path.join(directory, "leaf.cnf")
+            with open(ca_config, "w", encoding="utf-8") as config:
+                config.write("""[req]\ndistinguished_name = dn\nx509_extensions = v3_ca\nprompt = no\n[dn]\nCN = Devbox GitHub Proxy CA\n[v3_ca]\nbasicConstraints = critical, CA:true\nkeyUsage = critical, keyCertSign, cRLSign\nsubjectKeyIdentifier = hash\n""")
+            with open(leaf_config, "w", encoding="utf-8") as config:
+                config.write("""[req]\ndistinguished_name = dn\nreq_extensions = v3_req\nprompt = no\n[dn]\nCN = api.github.com\n[v3_req]\nbasicConstraints = critical, CA:false\nkeyUsage = critical, digitalSignature, keyEncipherment\nextendedKeyUsage = serverAuth\nsubjectAltName = @alt_names\n[alt_names]\nDNS.1 = api.github.com\nDNS.2 = uploads.github.com\n""")
+            commands = (
+                ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-keyout", ca_key, "-out", ca_cert, "-config", ca_config],
+                ["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", leaf_key, "-out", leaf_csr, "-config", leaf_config],
+                ["openssl", "x509", "-req", "-in", leaf_csr, "-CA", ca_cert, "-CAkey", ca_key, "-CAcreateserial", "-out", leaf_cert, "-days", "825", "-extfile", leaf_config, "-extensions", "v3_req"],
+            )
+            try:
+                for command in commands:
+                    subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            except FileNotFoundError as exc:
+                raise RuntimeError("GitHub CLI proxy needs openssl on the host") from exc
+            except subprocess.CalledProcessError as exc:
+                detail = exc.stderr.decode("utf-8", "replace").strip()
+                raise RuntimeError(f"could not create GitHub CLI proxy certificate: {detail}") from exc
+
+            for source, destination, mode in (
+                (ca_cert, ca_path, 0o644),
+                (leaf_cert, cert_path, 0o644),
+                (leaf_key, key_path, 0o600),
+            ):
+                os.chmod(source, mode)
+                os.replace(source, destination)
+        return ca_path, cert_path, key_path
+
+
+def github_proxy_key_path() -> str:
+    return os.path.join(STATE_DIR, "gh-proxy-capability-key")
+
+
+def github_proxy_key() -> bytes:
+    """Load or create the host-only key that signs short-lived guest grants."""
+    with _GITHUB_CAPABILITY_LOCK:
+        path = github_proxy_key_path()
+        try:
+            with open(path, "rb") as key_file:
+                key = key_file.read()
+            if len(key) >= 32:
+                return key
+        except OSError:
+            pass
+
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        key = secrets.token_bytes(32)
+        descriptor, temporary = tempfile.mkstemp(prefix=".devbox-gh-capability-", dir=STATE_DIR)
+        try:
+            with os.fdopen(descriptor, "wb") as key_file:
+                key_file.write(key)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+        return key
+
+
+def _base64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _base64url_decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def issue_github_proxy_token() -> str:
+    """Issue a VM-only, time-limited proxy capability; never a GitHub token."""
+    payload = json.dumps(
+        {"aud": "devbox-gh", "exp": int(time.time()) + GITHUB_PROXY_TOKEN_TTL_SECONDS},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded = _base64url(payload)
+    signature = hmac.new(github_proxy_key(), encoded.encode("ascii"), "sha256").digest()
+    return f"{encoded}.{_base64url(signature)}"
+
+
+def valid_github_proxy_token(token: str) -> bool:
+    try:
+        encoded, signature = token.split(".", 1)
+        expected = hmac.new(github_proxy_key(), encoded.encode("ascii"), "sha256").digest()
+        if not hmac.compare_digest(_base64url_decode(signature), expected):
+            return False
+        payload = json.loads(_base64url_decode(encoded))
+        return payload.get("aud") == "devbox-gh" and int(payload.get("exp", 0)) >= int(time.time())
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, OSError):
+        return False
+
+
+def github_proxy_authorized(headers) -> bool:
+    """Validate the short-lived Basic-proxy credential supplied by the wrapper."""
+    authorization = headers.get("Proxy-Authorization", "")
+    if not authorization.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(authorization[6:], validate=True).decode("utf-8")
+        username, separator, password = decoded.partition(":")
+    except (ValueError, UnicodeError):
+        return False
+    return bool(separator) and not password and valid_github_proxy_token(username)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "devbox-ai-proxy"
+
+    def handle(self):
+        # A CLI can close just after a successful CONNECT/TLS handshake. The
+        # stdlib request loop otherwise reports that ordinary disconnect as a
+        # server traceback, which is noisy and can leave the wrapped socket open.
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ssl.SSLError, OSError):
+            self.close_connection = True
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            connection = getattr(self, "connection", None)
+            if connection is not None and connection is not self.request:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
 
     def log_message(self, fmt, *args):  # to stderr, quiet-ish
         sys.stderr.write("[devbox-ai-proxy] %s %s\n" % (self.command, self.path))
@@ -339,7 +547,7 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
             raise
 
-    def _relay_websocket(self, upstream):
+    def _relay_socket(self, upstream):
         sockets = (self.connection, upstream)
         try:
             while True:
@@ -357,6 +565,53 @@ class Handler(BaseHTTPRequestHandler):
             upstream.close()
             self.close_connection = True
 
+    def _connect(self):
+        """Support only GitHub HTTPS CONNECT traffic from the guest `gh` wrapper."""
+        target = github_connect_target(self.path)
+        if target is None:
+            self.send_error(403, "CONNECT is limited to GitHub HTTPS hosts")
+            return
+        if not github_proxy_authorized(self.headers):
+            self.send_response(407, "Devbox GitHub proxy authentication required")
+            self.send_header("Proxy-Authenticate", 'Basic realm="devbox-gh"')
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            return
+        mode, hostname = target
+
+        if mode == "tunnel":
+            try:
+                upstream = socket.create_connection((hostname, 443), timeout=30)
+            except OSError as exc:
+                self.send_error(502, "GitHub tunnel error: %s" % exc)
+                return
+            self.send_response(200, "Connection Established")
+            self.end_headers()
+            self._relay_socket(upstream)
+            return
+
+        try:
+            _, certificate, private_key = ensure_github_certificates()
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certificate, private_key)
+            self.send_response(200, "Connection Established")
+            self.end_headers()
+            self.wfile.flush()
+            connection = context.wrap_socket(self.connection, server_side=True)
+        except Exception as exc:
+            self.send_error(502, "GitHub TLS proxy setup failed: %s" % exc)
+            return
+
+        # BaseHTTPRequestHandler keeps one instance for the full TCP connection.
+        # Replacing its streams here means the next request loop receives the
+        # decrypted API request and can send it through the normal auth path.
+        self.connection = connection
+        self.rfile = connection.makefile("rb", self.rbufsize)
+        self.wfile = connection.makefile("wb", self.wbufsize)
+        self._github_connect_host = hostname
+        self.close_connection = False
+
     def _proxy(self):
         # Health/identity endpoint so callers can distinguish this proxy from
         # any other service that happens to hold the port.
@@ -373,7 +628,12 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             self.close_connection = True
             return
-        route = match_route(self.path)
+        github_host = getattr(self, "_github_connect_host", "")
+        route = (
+            {"upstream": f"https://{github_host}", "auth": {"source": "auto:github"}}
+            if github_host
+            else match_route(self.path)
+        )
         if route is None:
             self.send_error(404, "no matching route")
             return
@@ -433,7 +693,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self.connection.sendall(response)
                 if status == 101:
-                    self._relay_websocket(conn)
+                    self._relay_socket(conn)
                     return
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
@@ -497,9 +757,17 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _proxy
+    do_CONNECT = _connect
 
 
 def main():
+    if sys.argv[1:] == ["--init-gh-ca"]:
+        ca_path, _, _ = ensure_github_certificates()
+        print(ca_path)
+        return
+    if sys.argv[1:] == ["--new-gh-proxy-token"]:
+        print(issue_github_proxy_token())
+        return
     srv = ThreadingHTTPServer((BIND_HOST, BIND_PORT), Handler)
     sys.stderr.write(
         "[devbox-ai-proxy] listening on %s:%d  (config: %s, %d route(s))\n"

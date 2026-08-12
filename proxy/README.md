@@ -1,11 +1,14 @@
-# devbox AI proxy
+# devbox credential proxy
 
-A tiny host-side reverse proxy that lets disposable devboxes use AI CLIs
+A tiny host-side reverse proxy that lets disposable devboxes use AI and GitHub CLIs
 **without ever holding a real credential**. Real keys/tokens stay on the host;
 the proxy injects them and forwards to the provider.
 
 - `devbox-ai-proxy.py` — the proxy. Python **standard library only**, no pip.
-  Streams HTTP responses (SSE-safe) and tunnels Codex WebSockets.
+  Streams HTTP responses (SSE-safe), tunnels Codex WebSockets, and provides a
+  GitHub-only TLS CONNECT proxy for `gh`.
+- `gh-wrapper.py` — guest-side `gh` launcher that points only GitHub CLI traffic
+  at that CONNECT proxy.
 - `proxy.config.example.json` — route table (which path → which upstream →
   which auth source).
 - `api-keys.env.example` — host-side API keys.
@@ -26,13 +29,15 @@ leaky or compromised box can't exfiltrate what it never had.
 
 ## Authentication (works out of the box)
 
-For Claude and Codex, `devbox --proxy` needs no proxy configuration file when
-the host CLI is already logged in. Each default route chooses, in order:
+For Claude, Codex, and GitHub CLI, `devbox --proxy` needs no proxy configuration
+file when the corresponding host CLI is already logged in. Each default route
+chooses, in order:
 
 | provider | API-key preference | OAuth credential |
 |---|---|---|
 | Claude | `ANTHROPIC_API_KEY` | `~/.claude/.credentials.json` |
 | Codex | `OPENAI_API_KEY` | `~/.codex/auth.json` |
+| GitHub CLI (`gh`) | `GH_TOKEN` / `GITHUB_TOKEN` | host `gh auth login` |
 
 The proxy reads access tokens fresh on every request. Its background check runs
 every minute, refreshes a session shortly before expiry, and retries a request
@@ -48,7 +53,31 @@ to the host proxy. The guest only receives the literal routing marker
 
 For OpenAI/Codex platform keys and the other API-key providers, configure
 `api-keys.env` as before. An explicit `proxy.config.json` still takes full
-control of every route and auth source.
+control of every AI route and auth source.
+
+## GitHub CLI
+
+`gh` has no public-API base-URL setting, so the guest runs the normal `gh`
+binary through a GitHub-only HTTPS CONNECT proxy. On the first use, Devbox
+creates a local CA under `~/.config/devbox/`, copies only its public certificate
+into the guest, and injects the host token after TLS termination for
+`api.github.com` and `uploads.github.com`. The guest holds only the literal
+`devbox-proxy` routing marker plus a short-lived Devbox proxy capability, never
+the real GitHub token. The capability authenticates only the local proxy and
+expires after eight hours. GitHub-owned download hosts are tunnelled without TLS
+interception.
+
+Log in on the host first:
+
+```sh
+gh auth login
+devbox --proxy
+```
+
+The guest wrapper refuses `gh auth login`, `logout`, and token-changing auth
+commands so a disposable box cannot alter the host account. `gh auth status`
+is safe and reports the dummy environment-token login. This automatic path is
+for GitHub.com; GitHub Enterprise hosts remain direct guest configuration.
 
 ## Quick start
 

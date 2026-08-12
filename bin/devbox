@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # devbox — disposable, CWD-mounted dev VMs on Lima/QEMU, preloaded with an
-# AI-CLI toolchain (claude, codex, opencode, stado) + Homebrew.
+# AI-CLI toolchain (claude, codex, opencode, stado) plus GitHub CLI (`gh`) and
+# Homebrew.
 #
 # Model
 #   A one-time "golden" Lima instance per base image carries the toolchain.
@@ -13,7 +14,8 @@
 #
 # Usage
 #   devbox [DIR] [FLAGS]        spin/attach a box for DIR (default: $PWD)
-#   devbox build [--image N|-i N] [--force|-f]
+#   devbox build [--image N|-i N] [--force|-f] [--yes|-y] [--manifest F]
+#                                 [--cpus N|-j N] [--memory S|-M S] [--disk S|-D S]
 #   devbox ls
 #   devbox destroy NAME | --all | --goldens
 #   devbox proxy [start|stop|status]   manage the shared host-side AI proxy
@@ -26,11 +28,17 @@
 #                    fedora, archlinux, …), a template:// URL, a path to a
 #                    *.yaml Lima config, or a path/URL to a *.qcow2/*.img image
 #                    (e.g. a Kali cloud image).
+#   --cpus N, -j N   CPUs for this box (default 4).
+#   --memory SIZE, -M SIZE
+#                    memory for this box, e.g. 12GiB (default 6GiB).
+#   --disk SIZE, -D SIZE
+#                    disk ceiling, e.g. 80GiB (default 100GiB). qcow2 is sparse,
+#                    so this costs only what is written; it is grow-only.
 #   --keep, -k       do not auto-delete the box on shell exit.
 #   --ssh-agent, -s  forward the host SSH agent into the box (git/GitHub auth)
 #                    and configure SSH-signed commits; private keys stay host-side.
 #   --proxy[=URL], -p[=URL]
-#                    point the AI CLIs at a host-side proxy (default
+#                    point AI CLIs and GitHub CLI at a host-side proxy (default
 #                    http://host.lima.internal:4141); real credentials stay on
 #                    the host. Auto-starts the proxy on this host if it isn't
 #                    already running (shared across boxes). See proxy/README.md.
@@ -56,9 +64,29 @@
 #   --name NAME, -N NAME
 #                    override the derived instance name.
 #
+# Project manifest (.devbox.toml)
+#   image  = "ubuntu-24.04"          shorthand, or the table form:
+#   [image]
+#   location = "/path/kali.qcow2"    template name, template://, *.yaml, *.qcow2, URL
+#   digest   = "sha512:…"            optional, for qcow2/URL images
+#   provision      = "…"             optional, root script baked into the golden
+#   provision_user = "…"             optional, user script baked into the golden
+#   [resources]
+#   cpus = 8 / memory = "12GiB" / disk = "80GiB"
+#   Custom provisioning changes the golden's identity, so a project cannot
+#   redefine the golden another project clones from.
+#
 # Env
 #   DEVBOX_CONFIG_DIR   config/golden dir (default ~/.config/devbox)
 #   DEVBOX_PROXY_URL    default --proxy URL
+#   DEVBOX_BUILD_TIMEOUT
+#                       how long a golden build may take (default 90m). Lima's
+#                       own default is 10m, which heavy [image].provision blows
+#                       through — leaving a VM provisioning behind a failed start.
+#
+# Global config (~/.config/devbox/config.toml)
+#   [resources] cpus/memory/disk — machine-wide defaults, overridden by a
+#   project manifest, which is overridden by the CLI flags above.
 #
 set -euo pipefail
 
@@ -68,7 +96,20 @@ SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 VERSION_FILE="$SCRIPT_DIR/../VERSION"
 DEVBOX_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf 'dev')"
 DEFAULT_IMAGE="ubuntu-24.04"
+# Resource defaults. `disk` is a ceiling, not an allocation: Lima's qcow2 is
+# sparse, so a 100GiB box that has written 3GiB occupies 3GiB on the host. It is
+# also grow-only — qcow2 cannot shrink — so the default is generous on purpose,
+# to avoid a mid-engagement resize.
+DEFAULT_CPUS=4
+DEFAULT_MEMORY="6GiB"
+DEFAULT_DISK="100GiB"
+# Lima gives boot scripts 10 minutes, then fails the start with "did not receive
+# an event with the running status" — while the VM keeps provisioning, orphaned.
+# Baking a distro toolchain into a golden (e.g. kali-linux-headless) routinely
+# exceeds that, so golden builds get a much longer ceiling.
+DEFAULT_BUILD_TIMEOUT="${DEVBOX_BUILD_TIMEOUT:-90m}"
 CONFIG_DIR="${DEVBOX_CONFIG_DIR:-$HOME/.config/devbox}"
+GLOBAL_CONFIG="$CONFIG_DIR/config.toml"
 DEFAULT_KEYS_FILE="$CONFIG_DIR/api-keys.env"
 PROXY_DEFAULT_URL="${DEVBOX_PROXY_URL:-http://host.lima.internal:4141}"
 PROJECT_MANIFEST_NAME=".devbox.toml"
@@ -120,6 +161,52 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; 
 
 abspath() { readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"; }
 
+# ------------------------------------------------------------------ sizes --
+# Lima's --cpus/--memory/--disk flags take GiB numbers, while its YAML and this
+# tool's config speak human sizes ("12GiB"). A bare number means GiB.
+size_to_gib() { # $1 size -> GiB as a number
+  python3 - "${1:-}" <<'PY'
+import re, sys
+s = sys.argv[1].strip()
+m = re.fullmatch(r'(\d+(?:\.\d+)?)\s*([KMGT]iB|[KMGT]B|B)?', s, re.I)
+if not m:
+    raise SystemExit(f"invalid size: {s!r} (use e.g. 8GiB, 512MiB, or a bare number of GiB)")
+n, unit = float(m.group(1)), (m.group(2) or "GiB").upper()
+mult = {"B": 1 / 1024 ** 3, "KIB": 1 / 1024 ** 2, "KB": 1 / 1024 ** 2,
+        "MIB": 1 / 1024, "MB": 1 / 1024, "GIB": 1, "GB": 1, "TIB": 1024, "TB": 1024}[unit]
+v = n * mult
+print(int(v) if v == int(v) else v)
+PY
+}
+
+# Precedence: CLI flag > project manifest > global config.toml > built-in.
+resolve_resources() { # $1 cli_cpus $2 cli_mem $3 cli_disk $4 manifest_json $5 global_json
+  python3 - "${1:-}" "${2:-}" "${3:-}" "${4:-{\}}" "${5:-{\}}" \
+           "$DEFAULT_CPUS" "$DEFAULT_MEMORY" "$DEFAULT_DISK" <<'PY'
+import json, sys
+cli = sys.argv[1:4]
+manifest = json.loads(sys.argv[4] or "{}")
+globalcfg = json.loads(sys.argv[5] or "{}")
+defaults = sys.argv[6:9]
+print("\t".join(
+    str(cli[i] or manifest.get(k) or globalcfg.get(k) or defaults[i])
+    for i, k in enumerate(("cpus", "memory", "disk"))
+))
+PY
+}
+
+# Machine-wide defaults, so a resource preference is set once rather than per
+# project. Absent or unreadable file is not an error — it is simply no opinion.
+global_config_json() {
+  [[ -r "$GLOBAL_CONFIG" ]] || { printf '{}'; return 0; }
+  python3 - "$GLOBAL_CONFIG" <<'PY' 2>/dev/null || printf '{}'
+import json, sys, tomllib
+from pathlib import Path
+data = tomllib.loads(Path(sys.argv[1]).read_text()).get("resources", {})
+print(json.dumps({k: v for k, v in data.items() if k in ("cpus", "memory", "disk")}))
+PY
+}
+
 # -------------------------------------------------------------- name helpers --
 _slug() { # sanitize $1 -> lowercase [a-z0-9-], collapse, trim, cap length $2
   local s; s="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
@@ -137,7 +224,22 @@ imgslug() { # stable short slug for an image spec (name or path/URL)
   esac
 }
 
-golden_name()   { printf 'devbox-golden-%s' "$(imgslug "$1")"; }
+# A golden is shared across every project using the same image, so anything that
+# changes what gets baked into it must change its identity. Otherwise a project
+# manifest could silently redefine — or poison — the golden another project
+# clones from. A stock image (no digest, no custom provisioning) hashes to
+# nothing and keeps its historical name, so existing goldens are not orphaned.
+golden_spec_hash() { # $1 location $2 digest $3 provision $4 provision_user
+  local digest="${2:-}" provision="${3:-}" provision_user="${4:-}"
+  [[ -n "$digest$provision$provision_user" ]] || return 0
+  printf '%s\0%s\0%s\0%s' "$1" "$digest" "$provision" "$provision_user" \
+    | sha1sum | cut -c1-6
+}
+
+golden_name() { # $1 image [$2 spec hash]
+  local hash="${2:-}"
+  printf 'devbox-golden-%s%s' "$(imgslug "$1")" "${hash:+-$hash}"
+}
 
 instance_name() { # deterministic per (image, absolute dir)
   local image="$1" dir="$2" slug hash
@@ -241,26 +343,41 @@ PY
 }
 
 # ---------------------------------------------------------- golden yaml gen --
-emit_base_stanza() {
-  local image="$1" t
+emit_base_stanza() { # $1 image [$2 digest]
+  local image="$1" digest="${2:-}" t
   case "$image" in
-    http://*|https://*)   printf 'images:\n- location: "%s"\n  arch: "x86_64"\n' "$image";;
+    http://*|https://*)   printf 'images:\n- location: "%s"\n  arch: "x86_64"\n' "$image"
+                          [[ -n "$digest" ]] && printf '  digest: "%s"\n' "$digest";;
     template:*)           t="${image#template:}"; t="${t#//}"; printf 'base: "template:%s"\n' "$t";;
     *.yaml|*.yml)         printf 'base: "%s"\n' "$(abspath "$image")";;
-    *.qcow2|*.img|*.raw)  printf 'images:\n- location: "%s"\n  arch: "x86_64"\n' "$(abspath "$image")";;
+    *.qcow2|*.img|*.raw)  printf 'images:\n- location: "%s"\n  arch: "x86_64"\n' "$(abspath "$image")"
+                          [[ -n "$digest" ]] && printf '  digest: "%s"\n' "$digest";;
     *)                    printf 'base: "template:%s"\n' "$image";;
   esac
+  return 0
 }
 
-emit_golden_yaml() { # $1 image  $2 outfile
+# Render one Lima provision entry, indenting the script into the block scalar.
+# A shebang is supplied when the author did not write one, so a bare command
+# list behaves the way people expect rather than running under /bin/sh.
+emit_provision_entry() { # $1 mode $2 script
+  printf -- '- mode: %s\n  script: |\n' "$1"
+  { [[ "$2" == '#!'* ]] || printf '#!/bin/bash\n'; printf '%s\n' "$2"; } | sed 's/^/    /'
+}
+
+# Project provisioning is deliberately NOT rendered here — see
+# apply_golden_provisioning for why it runs after boot instead. Trailing
+# provisioning arguments are accepted and ignored so callers can pass the whole
+# golden spec in one place.
+emit_golden_yaml() { # $1 image $2 outfile [$3 cpus $4 memory $5 disk $6 digest]
   local image="$1" out="$2"
+  local cpus="${3:-$DEFAULT_CPUS}" memory="${4:-$DEFAULT_MEMORY}" disk="${5:-$DEFAULT_DISK}"
+  local digest="${6:-}"
   {
     printf '# devbox golden — regenerate with: devbox build --image %s --force\n' "$image"
-    emit_base_stanza "$image"
+    emit_base_stanza "$image" "$digest"
+    printf 'cpus: %s\nmemory: "%s"\ndisk: "%s"\n' "$cpus" "$memory" "$disk"
     cat <<'YAML'
-cpus: 4
-memory: "6GiB"
-disk: "50GiB"
 mountType: "virtiofs"
 # Devbox does not require a container runtime. Disabling Lima's optional
 # rootless-containerd bootstrap keeps golden provisioning deterministic and
@@ -279,6 +396,21 @@ provision:
     #!/bin/bash
     set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
+    # Lima's default user network exposes its host-aware DNS resolver at
+    # 192.168.5.3. Kali's cloud image accepts the DHCP route but, via
+    # ifupdown, can drop its DHCP DNS option, leaving systemd-resolved with no
+    # upstream server at all. Configure the documented Lima resolver as the
+    # global fallback before any package setup. It preserves host VPN and
+    # split-DNS resolution instead of hard-coding a public resolver.
+    if command -v resolvectl >/dev/null 2>&1 \
+       && systemctl is-active --quiet systemd-resolved; then
+      install -d -m 755 /etc/systemd/resolved.conf.d
+      cat > /etc/systemd/resolved.conf.d/99-devbox-host-dns.conf <<'RESOLVER'
+    [Resolve]
+    DNS=192.168.5.3
+    RESOLVER
+      systemctl restart systemd-resolved
+    fi
     apt="build-essential git curl wget jq ripgrep unzip ca-certificates procps file locales sudo python3 python3-venv python3-pip"
     dnf="@development-tools git curl wget jq ripgrep unzip ca-certificates procps-ng file glibc-langpack-en sudo python3 python3-pip"
     pac="base-devel git curl wget jq ripgrep unzip ca-certificates procps-ng file sudo python python-pip"
@@ -331,8 +463,9 @@ provision:
     BREW="$(command -v brew || echo /home/linuxbrew/.linuxbrew/bin/brew)"
     [ -x "$BREW" ] && eval "$("$BREW" shellenv)" || true
     export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/.opencode/bin:$PATH"
-    # --- AI CLIs ---
+    # --- AI CLIs + GitHub CLI ---
     brew install codex || true
+    brew install gh || true
     brew install sst/tap/opencode || curl -fsSL https://opencode.ai/install | bash || true
     # stado — Homebrew cask (installs on Linux for this binary cask). Fallback to
     # a Go source install only if the cask ever fails (installs go on demand).
@@ -347,11 +480,37 @@ YAML
   } > "$out"
 }
 
+# Project-supplied provisioning runs AFTER the golden has booted, not as a Lima
+# `provision` entry. Lima fails a start whose boot scripts outrun its readiness
+# wait — reporting "did not receive an event with the running status", or marking
+# the instance degraded — and `limactl start --timeout` does not extend that
+# wait. Baking a distro toolchain (kali-linux-headless and friends) reliably
+# exceeds it, so devbox owns this phase: it can take as long as it needs and its
+# output is visible instead of buried in cloud-init's log.
+#
+# Scripts are piped to `bash -s` rather than passed as arguments so that quoting
+# and newlines survive intact.
+apply_golden_provisioning() { # $1 golden $2 system script $3 user script
+  local golden="$1" system="${2:-}" user="${3:-}"
+  if [[ -n "$system" ]]; then
+    log "Applying project system provisioning to $golden (this can take a while)…"
+    printf '%s\n' "$system" \
+      | limactl shell "$golden" -- sudo DEBIAN_FRONTEND=noninteractive bash -s \
+      || die "project system provisioning failed"
+  fi
+  if [[ -n "$user" ]]; then
+    log "Applying project user provisioning to $golden…"
+    printf '%s\n' "$user" \
+      | limactl shell "$golden" -- bash -l -s \
+      || die "project user provisioning failed"
+  fi
+}
+
 verify_golden() {
   local name="$1" out host_keys
   # shellcheck disable=SC2016 # $t and $(...) expand in the guest shell.
   out="$(limactl shell "$name" -- bash -lc '
-    for t in brew claude codex opencode stado; do
+    for t in brew gh claude codex opencode stado; do
       if command -v "$t" >/dev/null 2>&1; then printf "  ok   %-9s %s\n" "$t" "$(command -v "$t")"
       else printf "  MISS %-9s (not on PATH)\n" "$t"; fi
     done' </dev/null 2>/dev/null || true)"
@@ -377,10 +536,37 @@ proxy_port() {
   local hp="${1#*://}"; hp="${hp%%/*}"
   case "$hp" in *:*) printf '%s' "${hp##*:}";; *) printf '4141';; esac
 }
+# $1 bare http proxy URL; capability token arrives on stdin so it never appears
+# in the host process list. HTTP proxy URLs encode userinfo as Basic auth.
+github_proxy_url() {
+  python3 -c '
+import sys
+from urllib.parse import quote, urlsplit, urlunsplit
+
+source = urlsplit(sys.argv[1])
+token = sys.stdin.read().strip()
+if source.scheme != "http" or not source.netloc or source.username or source.password or source.path or source.query or source.fragment:
+    raise SystemExit("GitHub CLI proxy URL must be a bare http://host:port URL")
+if not token:
+    raise SystemExit("GitHub CLI proxy capability is empty")
+print(urlunsplit((source.scheme, f"{quote(token)}@{source.netloc}", "", "", "")))
+' "$1"
+}
 # is *our* proxy answering on this port? (health endpoint, not just any listener)
 proxy_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -q 'devbox-ai-proxy'; }
 # is anything at all listening on the port?
 proxy_port_open() { timeout 1 bash -c ">/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
+# locate a proxy asset across source (../proxy) and brew (../libexec/proxy)
+# layouts. This keeps the guest-side gh wrapper versioned with the host proxy.
+proxy_asset() {
+  local asset="$1" self dir c
+  self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+  dir="$(dirname "$self")"
+  for c in "$dir/../proxy/$asset" "$dir/../libexec/proxy/$asset"; do
+    [[ -f "$c" ]] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
 # locate the proxy launcher across source (../proxy) and brew (../libexec/proxy)
 # layouts, falling back to a devbox-ai-proxy on PATH.
 proxy_launcher() {
@@ -397,7 +583,7 @@ proxy_launcher() {
 proxy_ensure() {
   local url="$1" port launcher logf i
   port="$(proxy_port "$url")"
-  if proxy_health "$port"; then log "AI proxy already running on 127.0.0.1:$port"; return 0; fi
+  if proxy_health "$port"; then log "credential proxy already running on 127.0.0.1:$port"; return 0; fi
   if proxy_port_open "$port"; then
     warn "port $port is held by another service (not devbox's proxy)."
     warn "  pick a free port: export DEVBOX_PROXY_URL=http://host.lima.internal:<PORT>"
@@ -407,17 +593,17 @@ proxy_ensure() {
   mkdir -p "$CONFIG_DIR"; logf="$CONFIG_DIR/proxy.log"
   [[ -f "$CONFIG_DIR/api-keys.env" || -f "$CONFIG_DIR/proxy.config.json" || -f "$HOME/.claude/.credentials.json" ]] \
     || warn "no Anthropic key or host Claude login found — configure ~/.config/devbox/api-keys.env or run 'claude login'"
-  log "Starting AI proxy on :$port  ($launcher)"
+  log "Starting credential proxy on :$port  ($launcher)"
   setsid "$launcher" >"$logf" 2>&1 </dev/null &
   echo $! > "$CONFIG_DIR/proxy.pid"
   for i in $(seq 1 20); do proxy_health "$port" && break; sleep 0.2; done
-  if proxy_health "$port"; then log "AI proxy up (pid $(cat "$CONFIG_DIR/proxy.pid" 2>/dev/null), log: $logf)"
+  if proxy_health "$port"; then log "credential proxy up (pid $(cat "$CONFIG_DIR/proxy.pid" 2>/dev/null), log: $logf)"
   else warn "proxy did not come up — see $logf"; fi
 }
 
 apply_proxy() {
-  local name="$1" url="$2" tmpl="$CONFIG_DIR/proxy-env"
-  log "Wiring AI CLIs → proxy $url"
+  local name="$1" url="$2" tmpl="$CONFIG_DIR/proxy-env" launcher gh_wrapper ca_path gh_proxy_token gh_proxy_url
+  log "Wiring AI and GitHub CLIs → proxy $url"
   if [[ -f "$tmpl" ]]; then
     sed "s|__PROXY_URL__|$url|g" "$tmpl" \
       | limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-10-proxy.sh >/dev/null'
@@ -449,6 +635,30 @@ print(f"openai_base_url = {json.dumps(sys.argv[1])}")
 PY
   # shellcheck disable=SC2016 # $HOME expands in the guest shell.
   limactl shell "$name" -- bash -c 'rm -f "$HOME/.devbox/codex-proxy/auth.json"'
+
+  # gh cannot choose a custom API base URL, so its wrapper uses an HTTPS CONNECT
+  # proxy. It receives a dummy token only; the host proxy replaces that marker
+  # after TLS termination with the token from the host's `gh auth login`.
+  launcher="$(proxy_launcher)" || die "GitHub CLI proxy launcher not found"
+  "$launcher" --init-gh-ca >/dev/null || die "could not initialise GitHub CLI proxy certificate"
+  ca_path="$CONFIG_DIR/gh-proxy-ca.pem"
+  [[ -r "$ca_path" ]] || die "GitHub CLI proxy CA was not created: $ca_path"
+  gh_proxy_token="$("$launcher" --new-gh-proxy-token)" || die "could not issue GitHub CLI proxy capability"
+  [[ "$gh_proxy_token" == *.* ]] || die "GitHub CLI proxy returned an invalid capability"
+  gh_proxy_url="$(printf '%s' "$gh_proxy_token" | github_proxy_url "$url")" || die "could not configure GitHub CLI proxy URL"
+  gh_wrapper="$(proxy_asset gh-wrapper.py)" || die "GitHub CLI proxy wrapper not found"
+  # shellcheck disable=SC2016 # $HOME expands inside the guest shell.
+  limactl shell "$name" -- bash -c 'umask 077; install -d -m 700 "$HOME/.devbox/gh-proxy/bin" "$HOME/.devbox/gh-proxy/certs"'
+  limactl copy "$gh_wrapper" "$name:.devbox/gh-proxy/bin/gh"
+  limactl copy "$ca_path" "$name:.devbox/gh-proxy/certs/devbox-gh-proxy-ca.pem"
+  # shellcheck disable=SC2016 # $HOME expands inside the guest shell.
+  limactl shell "$name" -- bash -c 'chmod 755 "$HOME/.devbox/gh-proxy/bin/gh"; chmod 644 "$HOME/.devbox/gh-proxy/certs/devbox-gh-proxy-ca.pem"'
+  limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-12-gh-proxy.sh >/dev/null' <<EOF
+# devbox --proxy: GitHub CLI uses a host-authenticated, GitHub-only TLS proxy.
+export PATH="\$HOME/.devbox/gh-proxy/bin:\$PATH"
+export DEVBOX_GH_PROXY_URL="$gh_proxy_url"
+export DEVBOX_GH_PROXY_CERT_DIR="\$HOME/.devbox/gh-proxy/certs"
+EOF
 }
 
 apply_api_keys() {
@@ -460,10 +670,10 @@ apply_api_keys() {
 
 clear_auth() {
   local name="$1"
-  log "Disabling devbox-managed AI auth in $name"
+  log "Disabling devbox-managed auth in $name"
   # shellcheck disable=SC2016 # $HOME expands in the guest shell.
   limactl shell "$name" -- bash -c \
-    'sudo rm -f /etc/profile.d/zz-devbox-10-proxy.sh /etc/profile.d/zz-devbox-11-codex-proxy.sh /etc/profile.d/zz-devbox-20-keys.sh; rm -rf "$HOME/.devbox/codex-proxy"'
+    'sudo rm -f /etc/profile.d/zz-devbox-10-proxy.sh /etc/profile.d/zz-devbox-11-codex-proxy.sh /etc/profile.d/zz-devbox-12-gh-proxy.sh /etc/profile.d/zz-devbox-20-keys.sh; rm -rf "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"'
 }
 
 # PATH[:ro|:rw] -> a Lima --mount value (bare = read-only, :w suffix = writable).
@@ -516,7 +726,11 @@ agent_config_files() { # paths -> NUL-delimited regular files
     if [[ -f "$path" ]]; then
       printf '%s\0' "$path"
     elif [[ -d "$path" ]]; then
-      find "$path" -type f -print0
+      # A user may keep an allowlisted config directory (notably
+      # ~/.claude/hooks) in a separate, versioned vault.  Follow only the
+      # path supplied by the allowlist; links encountered beneath it remain
+      # untouched, so a config tree cannot pull arbitrary host files in.
+      find -H "$path" -type f -print0
     fi
   done
 }
@@ -524,6 +738,9 @@ agent_config_files() { # paths -> NUL-delimited regular files
 agent_config_contains_credential() { # $1 config file; never prints its content
   local file="$1"
   local field_assignment="((access|refresh|id)[_-]?token|api[_-]?key|authorization|password|secret|credential)[[:space:]]*[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?[^\\\"'[:space:]]+"
+  # An empty instruction/config file is harmless. `grep -q ''` reports no
+  # match for it, so avoid mistaking it for binary input.
+  [[ -s "$file" ]] || return 1
   # Config is text. Treat binary input as unsafe rather than copying it.
   LC_ALL=C grep -Iq '' "$file" || return 0
   # Require an assigned value to avoid rejecting harmless prose such as
@@ -557,6 +774,7 @@ apply_agent_config() {
 project_manifest() { # $1 .devbox.toml -> normalized JSON
   python3 - "$1" <<'PY'
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -573,15 +791,53 @@ except (OSError, tomllib.TOMLDecodeError) as exc:
 
 allowed = {
     "image", "packages", "start", "ssh_agent", "keep", "proxy", "api_keys",
-    "with_creds", "with_agent_config", "no_auth", "mounts", "copies",
+    "with_creds", "with_agent_config", "no_auth", "mounts", "copies", "resources",
 }
 unknown = sorted(set(data) - allowed)
 if unknown:
     raise SystemExit(f"unknown .devbox.toml key(s): {', '.join(unknown)}")
 
+# `image` is either the shorthand string form (image = "ubuntu-24.04") or the
+# table form, which additionally carries the digest and the provisioning baked
+# into this project's golden. TOML forbids both spellings in one file, so the
+# value's type tells us which was used.
+image_digest = image_provision = image_provision_user = ""
 image = data.get("image")
-if image is not None and (not isinstance(image, str) or not image):
-    raise SystemExit("image must be a non-empty string")
+if isinstance(image, dict):
+    image_allowed = {"location", "digest", "provision", "provision_user"}
+    unknown = sorted(set(image) - image_allowed)
+    if unknown:
+        raise SystemExit(f"unknown key(s) in [image]: {', '.join(unknown)}")
+    for key in image_allowed:
+        value = image.get(key)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise SystemExit(f"image.{key} must be a non-empty string")
+    location = image.get("location")
+    if location is None:
+        raise SystemExit("[image] requires a location")
+    image_digest = image.get("digest") or ""
+    image_provision = image.get("provision") or ""
+    image_provision_user = image.get("provision_user") or ""
+    image = location
+elif image is not None and (not isinstance(image, str) or not image):
+    raise SystemExit("image must be a non-empty string or an [image] table")
+
+resources = data.get("resources", {})
+if not isinstance(resources, dict):
+    raise SystemExit("resources must be a table")
+unknown = sorted(set(resources) - {"cpus", "memory", "disk"})
+if unknown:
+    raise SystemExit(f"unknown key(s) in [resources]: {', '.join(unknown)}")
+cpus = resources.get("cpus")
+if cpus is not None and (not isinstance(cpus, int) or isinstance(cpus, bool) or cpus < 1):
+    raise SystemExit("resources.cpus must be a positive integer")
+for key in ("memory", "disk"):
+    value = resources.get(key)
+    if value is None:
+        continue
+    if not isinstance(value, str) or not re.fullmatch(
+            r"\d+(?:\.\d+)?\s*(?:[KMGT]iB|[KMGT]B|B)?", value, re.I):
+        raise SystemExit(f"resources.{key} must be a size like \"8GiB\", \"512MiB\", or \"80\"")
 
 packages = data.get("packages", [])
 if not isinstance(packages, list) or any(not isinstance(p, str) or not p for p in packages):
@@ -610,6 +866,11 @@ if data.get("no_auth") and (data.get("proxy") or data.get("api_keys") or data.ge
 
 print(json.dumps({
     "image": image or "", "packages": packages, "start": start or "",
+    "image_digest": image_digest,
+    "image_provision": image_provision,
+    "image_provision_user": image_provision_user,
+    "cpus": cpus or "", "memory": resources.get("memory", ""),
+    "disk": resources.get("disk", ""),
     "ssh_agent": data.get("ssh_agent", False), "keep": data.get("keep", False),
     "proxy": data.get("proxy", False), "api_keys": data.get("api_keys", False),
     "with_creds": data.get("with_creds", False),
@@ -670,19 +931,59 @@ confirm_manifest_permissions() { # each argument is one requested capability
 
 # --------------------------------------------------------------- subcommands --
 cmd_build() {
-  local image="$DEFAULT_IMAGE" force=0
+  local image="" force=0 assume_yes=0 manifest_path="" cli_cpus="" cli_memory="" cli_disk=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --image|-i) shift; image="${1:?--image needs a value}";;
       --image=*|-i=*) image="${1#*=}";;
+      --manifest) shift; manifest_path="${1:?--manifest needs a path}";;
+      --manifest=*) manifest_path="${1#*=}";;
+      --cpus|-j) shift; cli_cpus="${1:?--cpus needs a value}";;
+      --cpus=*|-j=*) cli_cpus="${1#*=}";;
+      --memory|-M) shift; cli_memory="${1:?--memory needs a value}";;
+      --memory=*|-M=*) cli_memory="${1#*=}";;
+      --disk|-D) shift; cli_disk="${1:?--disk needs a value}";;
+      --disk=*|-D=*) cli_disk="${1#*=}";;
       --force|-f) force=1;;
+      --yes|-y) assume_yes=1;;
       -h|--help) grep -E '^#( |$)' "$0" | sed -E 's/^# ?//'; return 0;;
       *) die "build: unknown arg: $1";;
     esac; shift
   done
-  local golden gy; golden="$(golden_name "$image")"; gy="$CONFIG_DIR/${golden}.yaml"
+
+  # A golden's contents are defined by the project manifest, so `devbox build`
+  # in a project directory builds that project's golden. An explicit --image
+  # still wins, but the manifest's provisioning continues to apply.
+  [[ -n "$manifest_path" || ! -f "$PWD/$PROJECT_MANIFEST_NAME" ]] \
+    || manifest_path="$PWD/$PROJECT_MANIFEST_NAME"
+  local manifest='{}' digest="" provision="" provision_user=""
+  if [[ -n "$manifest_path" && -f "$manifest_path" ]]; then
+    manifest="$(project_manifest "$manifest_path")" || die "invalid $manifest_path"
+    [[ -n "$image" ]] || image="$(manifest_value "$manifest" image)"
+    digest="$(manifest_value "$manifest" image_digest)"
+    provision="$(manifest_value "$manifest" image_provision)"
+    provision_user="$(manifest_value "$manifest" image_provision_user)"
+    # Baking a repo-controlled script into a persistent golden needs the same
+    # consent as running one. cmd_run has already asked by the time it delegates
+    # here, so only a direct `devbox build` prompts.
+    if [[ -n "$provision$provision_user" && $assume_yes -eq 0 && "${_DB_MANIFEST_CONFIRMED:-0}" -ne 1 ]]; then
+      confirm_manifest_permissions "build a custom golden image with provisioning from $manifest_path"
+    fi
+  fi
+  [[ -n "$image" ]] || image="$DEFAULT_IMAGE"
+
+  local cpus memory disk
+  IFS=$'\t' read -r cpus memory disk < <(resolve_resources \
+    "$cli_cpus" "$cli_memory" "$cli_disk" "$manifest" "$(global_config_json)")
+  size_to_gib "$memory" >/dev/null || die "invalid memory size: $memory"
+  size_to_gib "$disk"   >/dev/null || die "invalid disk size: $disk"
+
+  local hash golden gy
+  hash="$(golden_spec_hash "$image" "$digest" "$provision" "$provision_user")"
+  golden="$(golden_name "$image" "$hash")"; gy="$CONFIG_DIR/${golden}.yaml"
   mkdir -p "$CONFIG_DIR"
-  emit_golden_yaml "$image" "$gy"
+  emit_golden_yaml "$image" "$gy" "$cpus" "$memory" "$disk" \
+    "$digest" "$provision" "$provision_user"
   if instance_exists "$golden"; then
     if [[ $force -eq 1 ]]; then
       log "Rebuilding golden $golden…"
@@ -693,7 +994,8 @@ cmd_build() {
     fi
   fi
   log "Building golden $golden from image '$image' — this takes several minutes…"
-  limactl start --name="$golden" "$gy"
+  limactl start --timeout "$DEFAULT_BUILD_TIMEOUT" --name="$golden" "$gy"
+  apply_golden_provisioning "$golden" "$provision" "$provision_user"
   log "Verifying toolchain in $golden:"
   if ! verify_golden "$golden"; then
     warn "Golden verification failed; removing unusable $golden."
@@ -728,10 +1030,18 @@ run_cleanup() {
 cmd_run() {
   local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 with_agent_config=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name=""
   local extra_mounts=() extra_copies=() manifest_requests=()
+  local cli_cpus="" cli_memory="" cli_disk=""
+  local golden_digest="" golden_provision="" golden_provision_user=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --image|-i) shift; image="${1:?--image needs a value}"; image_set=1;;
       --image=*|-i=*) image="${1#*=}"; image_set=1;;
+      --cpus|-j) shift; cli_cpus="${1:?--cpus needs a value}";;
+      --cpus=*|-j=*) cli_cpus="${1#*=}";;
+      --memory|-M) shift; cli_memory="${1:?--memory needs a value}";;
+      --memory=*|-M=*) cli_memory="${1#*=}";;
+      --disk|-D) shift; cli_disk="${1:?--disk needs a value}";;
+      --disk=*|-D=*) cli_disk="${1#*=}";;
       --keep|-k) keep=1;;
       --ssh-agent|-s) ssh_agent=1;;
       --with-creds|-c) with_creds=1;;
@@ -762,6 +1072,19 @@ cmd_run() {
     local manifest_image manifest_proxy manifest_api_keys manifest_mounts manifest_copies item
     manifest_image="$(manifest_value "$manifest" image)"
     [[ $image_set -eq 1 || -z "$manifest_image" ]] || image="$manifest_image"
+    golden_digest="$(manifest_value "$manifest" image_digest)"
+    golden_provision="$(manifest_value "$manifest" image_provision)"
+    golden_provision_user="$(manifest_value "$manifest" image_provision_user)"
+    # Provisioning from a repo-controlled file is arbitrary root code inside the
+    # VM, and it is baked into a golden that outlives this run — so it is its own
+    # approval line, not folded into the `start` command's.
+    if [[ -n "$golden_provision$golden_provision_user" ]]; then
+      manifest_requests+=("build a custom golden image with project-supplied provisioning")
+    fi
+    # Resources are host-affecting: a manifest can ask for the host's RAM.
+    if [[ -n "$(manifest_value "$manifest" cpus)$(manifest_value "$manifest" memory)$(manifest_value "$manifest" disk)" ]]; then
+      manifest_requests+=("size the box using the manifest's [resources]")
+    fi
     manifest_start="$(manifest_value "$manifest" start)"
     [[ -z "$manifest_start" ]] || manifest_requests+=("run startup command: $(printf '%q' "$manifest_start")")
 
@@ -819,9 +1142,18 @@ cmd_run() {
     die "--no-auth cannot be combined with --proxy, --api-keys, or --with-creds"
   fi
   confirm_manifest_permissions "${manifest_requests[@]}"
+  _DB_MANIFEST_CONFIRMED=1   # do not re-prompt when cmd_build is delegated to below
   [[ $ssh_agent -eq 1 ]] && require_ssh_agent
 
-  local golden; golden="$(golden_name "$image")"
+  local cpus memory disk
+  IFS=$'\t' read -r cpus memory disk < <(resolve_resources \
+    "$cli_cpus" "$cli_memory" "$cli_disk" "${manifest:-{\}}" "$(global_config_json)")
+  size_to_gib "$memory" >/dev/null || die "invalid memory size: $memory"
+  size_to_gib "$disk"   >/dev/null || die "invalid disk size: $disk"
+
+  local golden golden_hash
+  golden_hash="$(golden_spec_hash "$image" "$golden_digest" "$golden_provision" "$golden_provision_user")"
+  golden="$(golden_name "$image" "$golden_hash")"
   [[ -n "$name" ]] || name="$(instance_name "$image" "$dir")"
 
   local preexisting=0
@@ -832,11 +1164,29 @@ cmd_run() {
   else
     if ! instance_exists "$golden"; then
       log "No golden for image '$image' yet — building it first."
-      cmd_build --image "$image"
+      local build_args=(--image "$image" --cpus "$cpus" --memory "$memory" --disk "$disk")
+      [[ -f "$manifest_path" ]] && build_args+=(--manifest "$manifest_path")
+      cmd_build "${build_args[@]}"
     fi
     ensure_golden_stopped "$golden"
     local clone_args=(--mount "${dir}:w") m
     for m in "${extra_mounts[@]}"; do clone_args+=(--mount "$(_lima_mount_arg "$m")"); done
+    # CPU/memory are per-box: applied to the clone so a project can be sized
+    # without rebuilding the shared golden.
+    clone_args+=(--cpus "$cpus" --memory "$(size_to_gib "$memory")")
+    # Disk is grow-only — qcow2 cannot shrink — so a smaller request is refused
+    # loudly here rather than failing deep inside Lima.
+    local want_disk golden_disk
+    want_disk="$(size_to_gib "$disk")"
+    golden_disk="$(limactl list "$golden" --format '{{.Disk}}' 2>/dev/null || echo 0)"
+    golden_disk="$(python3 -c 'import sys; print(int(sys.argv[1])/1024**3)' "${golden_disk:-0}")"
+    if python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > float(sys.argv[2]) else 1)' \
+         "$want_disk" "$golden_disk"; then
+      clone_args+=(--disk "$want_disk")
+    elif python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)' \
+         "$want_disk" "$golden_disk"; then
+      warn "requested disk ${disk} is smaller than the golden's ${golden_disk}GiB; qcow2 cannot shrink — keeping ${golden_disk}GiB"
+    fi
     # `limactl clone --set` applies this to the stopped destination config, so
     # the very first boot already has the agent socket. Existing VMs still use
     # enable_ssh_agent below and restart only if their persisted config changes.

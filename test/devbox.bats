@@ -10,7 +10,10 @@ setup() {
   DEVBOX="${BATS_TEST_DIRNAME}/../bin/devbox"
   # sourceable: dispatch is guarded, so this loads functions only.
   source "$DEVBOX"
-  set +eu   # relax the script's `set -euo pipefail` for the test body
+  # Relax only nounset: test bodies reference optional vars. errexit MUST stay
+  # on — bats detects a failing assertion via errexit, so `set +e` here silently
+  # turns the whole suite green regardless of what it asserts.
+  set +u
 }
 
 # ------------------------------------------------------------------ _slug ----
@@ -120,6 +123,14 @@ setup() {
   grep -A2 '^containerd:' "$tmp" | grep -q 'user: false'
 }
 
+@test "a golden configures systemd-resolved to use Lima's host-aware DNS" {
+  tmp="$BATS_TEST_TMPDIR/g.yaml"
+  emit_golden_yaml ubuntu-24.04 "$tmp"
+  grep -q '99-devbox-host-dns.conf' "$tmp"
+  grep -q 'DNS=192.168.5.3' "$tmp"
+  grep -q 'systemctl restart systemd-resolved' "$tmp"
+}
+
 @test "SSH signing is not baked into a golden image" {
   tmp="$BATS_TEST_TMPDIR/g.yaml"
   emit_golden_yaml ubuntu-24.04 "$tmp"
@@ -132,11 +143,12 @@ setup() {
   [[ "$source_text" == *'limactl --tty=false clone'* ]]
 }
 
-@test "golden yaml installs the AI toolchain (stado via cask, claude installer)" {
+@test "golden yaml installs the AI and GitHub CLI toolchain" {
   tmp="$BATS_TEST_TMPDIR/g.yaml"
   emit_golden_yaml ubuntu-24.04 "$tmp"
   grep -q 'brew install --cask foobarto/tap/stado' "$tmp"
   grep -q 'brew install codex' "$tmp"
+  grep -q 'brew install gh' "$tmp"
   grep -q 'sst/tap/opencode' "$tmp"
   grep -q 'claude.ai/install.sh' "$tmp"
 }
@@ -211,12 +223,29 @@ setup() {
 @test "agent config credential detector skips assignments but accepts ordinary settings" {
   safe="$BATS_TEST_TMPDIR/safe.toml"
   suspect="$BATS_TEST_TMPDIR/suspect.toml"
+  empty="$BATS_TEST_TMPDIR/empty.md"
   printf 'model = "gpt-5"\n' > "$safe"
   printf 'api_key = "placeholder-value"\n' > "$suspect"
+  : > "$empty"
   run agent_config_contains_credential "$safe"
+  [ "$status" -ne 0 ]
+  run agent_config_contains_credential "$empty"
   [ "$status" -ne 0 ]
   run agent_config_contains_credential "$suspect"
   [ "$status" -eq 0 ]
+}
+
+@test "agent config follows an allowlisted directory symlink but not nested links" {
+  root="$BATS_TEST_TMPDIR/agent-config"
+  mkdir -p "$root/real-hooks"
+  printf '#!/bin/sh\n' > "$root/real-hooks/guard.sh"
+  printf 'not agent config\n' > "$root/outside"
+  ln -s real-hooks "$root/hooks"
+  ln -s "$root/outside" "$root/real-hooks/escape"
+
+  run bash -c 'source "$1"; agent_config_files "$2" | tr "\\0" "\\n"' _ "$DEVBOX" "$root/hooks"
+  [ "$status" -eq 0 ]
+  [ "$output" = "$root/hooks/guard.sh" ]
 }
 
 # ------------------------------------------------------------------- proxy ----
@@ -224,6 +253,28 @@ setup() {
   run proxy_port http://host.lima.internal:4141; [ "$output" = "4141" ]
   run proxy_port http://host.lima.internal:5001; [ "$output" = "5001" ]
   run proxy_port http://host;                     [ "$output" = "4141" ]
+}
+
+@test "GitHub proxy URL carries its capability as HTTP proxy userinfo" {
+  run bash -c 'printf %s "$2" | { source "$1"; github_proxy_url "$3"; }' _ "$DEVBOX" "part.one" "http://host.lima.internal:4141"
+  [ "$status" -eq 0 ]
+  [ "$output" = "http://part.one@host.lima.internal:4141" ]
+}
+
+@test "GitHub proxy URL rejects a proxy URL with existing credentials or a path" {
+  run bash -c 'printf %s "$2" | { source "$1"; github_proxy_url "$3"; }' _ "$DEVBOX" "part.one" "http://user@host.lima.internal:4141"
+  [ "$status" -ne 0 ]
+  run bash -c 'printf %s "$2" | { source "$1"; github_proxy_url "$3"; }' _ "$DEVBOX" "part.one" "http://host.lima.internal:4141/path"
+  [ "$status" -ne 0 ]
+}
+
+@test "proxy setup keeps gh credentials on the host behind a guest wrapper" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *'gh-wrapper.py'* ]]
+  [[ "$source_text" == *'zz-devbox-12-gh-proxy.sh'* ]]
+  [[ "$source_text" == *'gh-proxy-ca.pem'* ]]
+  [[ "$source_text" == *'gh auth login'* ]]
+  [[ "$source_text" == *'rm -rf "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"'* ]]
 }
 
 # ------------------------------------------------------- project manifest ----
@@ -249,6 +300,167 @@ setup() {
   [ "$output" = $'node\ngo' ]
 }
 
+# --------------------------------------------------------------- resources ----
+@test "size_to_gib accepts GiB, MiB and bare numbers" {
+  [ "$(size_to_gib 12GiB)" = "12" ]
+  [ "$(size_to_gib 100)" = "100" ]
+  [ "$(size_to_gib 512MiB)" = "0.5" ]
+  [ "$(size_to_gib 1TiB)" = "1024" ]
+}
+
+@test "size_to_gib rejects nonsense" {
+  run size_to_gib "lots"
+  [ "$status" -ne 0 ]
+}
+
+@test "resource precedence: CLI beats manifest beats global beats default" {
+  # cli cpus, manifest memory, global disk
+  run resolve_resources 16 "" "" '{"cpus":8,"memory":"12GiB","disk":""}' '{"cpus":2,"memory":"2GiB","disk":"70GiB"}'
+  [ "$status" -eq 0 ]
+  [ "$output" = $'16\t12GiB\t70GiB' ]
+}
+
+@test "resource precedence falls back to built-in defaults" {
+  run resolve_resources "" "" "" '{}' '{}'
+  [ "$status" -eq 0 ]
+  [ "$output" = "$DEFAULT_CPUS"$'\t'"$DEFAULT_MEMORY"$'\t'"$DEFAULT_DISK" ]
+}
+
+@test "default disk ceiling is generous (sparse qcow2 costs only what is used)" {
+  [ "$(size_to_gib "$DEFAULT_DISK")" -ge 100 ]
+}
+
+# ------------------------------------------------------- golden_spec_hash ----
+@test "a stock image has no spec hash, so its golden name is unchanged" {
+  run golden_spec_hash ubuntu-24.04 "" "" ""
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  run golden_name ubuntu-24.04 ""
+  [ "$output" = "devbox-golden-ubuntu-24-04" ]
+}
+
+@test "custom provisioning produces a distinct, deterministic golden name" {
+  h1="$(golden_spec_hash /images/kali.qcow2 "" "apt-get install -y nmap" "")"
+  h2="$(golden_spec_hash /images/kali.qcow2 "" "apt-get install -y nmap" "")"
+  [ -n "$h1" ]
+  [ "$h1" = "$h2" ]
+  [[ "$(golden_name /images/kali.qcow2 "$h1")" =~ ^devbox-golden-kali-qcow2-[0-9a-f]{6}-[0-9a-f]{6}$ ]]
+}
+
+@test "changing provisioning changes the golden identity" {
+  a="$(golden_spec_hash /images/kali.qcow2 "" "apt-get install -y nmap" "")"
+  b="$(golden_spec_hash /images/kali.qcow2 "" "apt-get install -y ffuf" "")"
+  [ "$a" != "$b" ]
+}
+
+@test "digest and user provisioning are part of the golden identity" {
+  base="$(golden_spec_hash /images/kali.qcow2 "" "x" "")"
+  [ "$base" != "$(golden_spec_hash /images/kali.qcow2 "sha512:abc" "x" "")" ]
+  [ "$base" != "$(golden_spec_hash /images/kali.qcow2 "" "x" "pipx install updog")" ]
+}
+
+# --------------------------------------------------- manifest [image] table ----
+@test "manifest accepts the [image] table with location, digest and provisioning" {
+  run project_manifest "$BATS_TEST_DIRNAME/fixtures/image-table.devbox.toml"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"image": "/images/kali.qcow2"'* ]]
+  [[ "$output" == *'"image_digest": "sha512:deadbeef"'* ]]
+  [[ "$output" == *'kali-linux-headless'* ]]
+  [[ "$output" == *'updog'* ]]
+  [[ "$output" == *'"cpus": 8'* ]]
+  [[ "$output" == *'"memory": "12GiB"'* ]]
+  [[ "$output" == *'"disk": "80GiB"'* ]]
+}
+
+@test "manifest still accepts the bare top-level image string" {
+  run project_manifest "$BATS_TEST_DIRNAME/fixtures/project.devbox.toml"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"image": "debian-12"'* ]]
+  [[ "$output" == *'"image_digest": ""'* ]]
+}
+
+@test "manifest rejects an unknown key inside [image]" {
+  f="$BATS_TEST_TMPDIR/bad.toml"
+  printf '[image]\nlocation = "x"\nnope = 1\n' > "$f"
+  run project_manifest "$f"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"image"* ]]
+}
+
+@test "manifest rejects a non-positive cpu count and a malformed size" {
+  f="$BATS_TEST_TMPDIR/bad2.toml"
+  printf '[resources]\ncpus = 0\n' > "$f"
+  run project_manifest "$f"
+  [ "$status" -ne 0 ]
+  printf '[resources]\nmemory = "loads"\n' > "$f"
+  run project_manifest "$f"
+  [ "$status" -ne 0 ]
+}
+
+# ------------------------------------------- golden yaml with customisation ----
+@test "golden yaml carries resolved resources" {
+  out="$BATS_TEST_TMPDIR/g.yaml"
+  emit_golden_yaml ubuntu-24.04 "$out" 8 "12GiB" "80GiB"
+  grep -q '^cpus: 8$' "$out"
+  grep -q '^memory: "12GiB"$' "$out"
+  grep -q '^disk: "80GiB"$' "$out"
+}
+
+@test "golden yaml embeds a digest when one is supplied" {
+  out="$BATS_TEST_TMPDIR/g.yaml"
+  emit_golden_yaml /images/kali.qcow2 "$out" 4 "6GiB" "50GiB" "sha512:deadbeef"
+  grep -q 'digest: "sha512:deadbeef"' "$out"
+}
+
+@test "project provisioning is NOT embedded in the golden yaml" {
+  # Lima fails a start whose boot scripts outrun its readiness wait — and
+  # `--timeout` does not extend that wait. Long project provisioning therefore
+  # runs after boot, under devbox's control, never as a Lima provision entry.
+  out="$BATS_TEST_TMPDIR/g.yaml"
+  emit_golden_yaml ubuntu-24.04 "$out" 4 "6GiB" "50GiB" "" "apt-get install -y kali-linux-headless" "pipx install updog"
+  ! grep -q 'kali-linux-headless' "$out"
+  ! grep -q 'pipx install updog' "$out"
+}
+
+@test "a golden yaml still validates when the project supplies provisioning" {
+  command -v limactl >/dev/null || skip "limactl not installed"
+  out="$BATS_TEST_TMPDIR/g.yaml"
+  emit_golden_yaml ubuntu-24.04 "$out" 8 "12GiB" "80GiB" "" $'echo one\necho two' "pipx install updog"
+  run limactl validate "$out"
+  [ "$status" -eq 0 ]
+}
+
+@test "post-boot provisioning runs system as root and user unprivileged" {
+  src="$(<"$DEVBOX")"
+  [[ "$src" == *"apply_golden_provisioning"* ]]
+  # the system stage must elevate; the user stage must not
+  run declare -f apply_golden_provisioning
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"sudo"* ]]
+}
+
+@test "provisioning scripts reach the guest over stdin, not the argv" {
+  # Multi-line scripts with quotes must not be word-split or re-quoted through a
+  # command line; they are piped to `bash -s`.
+  run declare -f apply_golden_provisioning
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"bash -s"* ]]
+}
+
+# ------------------------------------------------------------ build timeout ----
+@test "golden builds wait far longer than Lima's default boot timeout" {
+  # Lima gives boot scripts 10 minutes and then fails with "did not receive an
+  # event with the running status". Baking a distro toolchain into a golden
+  # legitimately takes longer, so the build must raise the limit.
+  [[ "$(<"$DEVBOX")" == *'--timeout'* ]]
+  [[ "$DEFAULT_BUILD_TIMEOUT" =~ ^([0-9]+)m$ ]]
+  [ "${BASH_REMATCH[1]}" -ge 30 ]
+}
+
+@test "build timeout is overridable from the environment" {
+  [[ "$(<"$DEVBOX")" == *'DEVBOX_BUILD_TIMEOUT'* ]]
+}
+
 # ---------------------------------------------------------------- dispatch ----
 @test "--help prints usage and exits 0" {
   # help case is dispatched before `need limactl`, so it works with no VM stack.
@@ -270,7 +482,7 @@ setup() {
   [[ "$output" == *"shortcut for --with-agent-config --proxy --ssh-agent"* ]]
   run bash "$DEVBOX" -V
   [ "$status" -eq 0 ]
-  [ "$output" = "devbox 1.0.6" ]
+  [ "$output" = "devbox $(tr -d "[:space:]" < "$BATS_TEST_DIRNAME/../VERSION")" ]
 }
 
 @test "every long run, build, and destroy flag has a single-letter alias" {
@@ -278,7 +490,8 @@ setup() {
   for alias in \
     '--image|-i' '--keep|-k' '--ssh-agent|-s' '--proxy|-p' '--no-auth|-n' \
     '--api-keys|-K' '--with-creds|-c' '--with-agent-config|-g' \
-    '--mount|-m' '--copy|-C' '--name|-N' '--force|-f' '--all|-A' '--goldens|-G'; do
+    '--mount|-m' '--copy|-C' '--name|-N' '--force|-f' '--all|-A' '--goldens|-G' \
+    '--cpus|-j' '--memory|-M' '--disk|-D' '--yes|-y'; do
     [[ "$source_text" == *"$alias"* ]]
   done
 }
@@ -292,7 +505,7 @@ setup() {
 @test "--version reads the release version without Lima" {
   run bash "$DEVBOX" --version
   [ "$status" -eq 0 ]
-  [ "$output" = "devbox 1.0.6" ]
+  [ "$output" = "devbox $(tr -d "[:space:]" < "$BATS_TEST_DIRNAME/../VERSION")" ]
 }
 
 @test "--version resolves the real path when invoked through a symlink" {
@@ -300,7 +513,7 @@ setup() {
   ln -s "$DEVBOX" "$link"
   run "$link" --version
   [ "$status" -eq 0 ]
-  [ "$output" = "devbox 1.0.6" ]
+  [ "$output" = "devbox $(tr -d "[:space:]" < "$BATS_TEST_DIRNAME/../VERSION")" ]
 }
 
 @test "unknown run flag is rejected" {

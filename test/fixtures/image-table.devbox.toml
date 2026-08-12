@@ -1,0 +1,11 @@
+# Exercises the [image] table form plus [resources].
+[image]
+location = "/images/kali.qcow2"
+digest = "sha512:deadbeef"
+provision = "apt-get install -y kali-linux-headless\n"
+provision_user = "pipx install updog\n"
+
+[resources]
+cpus = 8
+memory = "12GiB"
+disk = "80GiB"

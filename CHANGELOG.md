@@ -1,5 +1,45 @@
 # Changelog
 
+## v1.1.0 - 2026-08-07
+
+- `gh` is now included in golden images. With `--proxy`, the real guest CLI uses
+  a GitHub-only TLS proxy and the host's existing `gh auth login`; the VM keeps
+  only a dummy routing marker and short-lived proxy capability, never the
+  GitHub token.
+- `.devbox.toml` gains an `[image]` table (`location`, `digest`, `provision`,
+  `provision_user`) so a project can define its golden — base image and baked-in
+  toolchain — without a separate Lima YAML. `image = "name"` remains valid
+  shorthand.
+- `.devbox.toml` gains `[resources]` (`cpus`, `memory`, `disk`), with matching
+  `--cpus/-j`, `--memory/-M`, `--disk/-D` flags and machine-wide defaults in
+  `~/.config/devbox/config.toml`. Precedence: CLI > manifest > global > built-in
+  (4 CPUs, 6GiB, 100GiB).
+- `cpus`/`memory` are applied per box at clone time, so changing them no longer
+  requires rebuilding the golden. `disk` is grow-only — a smaller request is
+  refused with a warning rather than failing inside Lima — and is a sparse
+  ceiling, so it costs only what is written. The default rose from 50GiB.
+- A golden's name now includes a hash of its image spec whenever the project
+  customises it, so one project can never silently redefine the golden another
+  project clones from. Stock images keep their existing names.
+- Project provisioning runs after the golden boots rather than as a Lima
+  `provision` entry: Lima fails any start whose boot scripts outrun its
+  readiness wait, which `limactl start --timeout` does not extend. Provisioning
+  output is now visible live instead of buried in the guest's cloud-init log.
+- Fix DNS in `systemd-resolved` guests whose cloud-image networking drops the
+  DHCP DNS option (including Kali): golden images use Lima's host-aware virtual
+  resolver, preserving host VPN and split-DNS behavior.
+- `devbox build` reads the project manifest from the working directory, and
+  gains `--manifest F` and `--yes/-y` for non-interactive builds. Baking a
+  repo-controlled script into a golden requires the same approval as running one.
+- Fix: the bats suite disabled `errexit` in `setup`, which is the mechanism bats
+  uses to detect a failed assertion — every test reported success regardless of
+  what it asserted. The suite now fails when it should.
+- Fix: `--with-agent-config` now copies an allowlisted config directory when
+  that directory itself is a symlink (for example a versioned Claude hook
+  vault), while still refusing to follow links found inside it.
+- Fix: `--with-agent-config` no longer labels an empty allowlisted instruction
+  file as a possible credential.
+
 ## v1.0.6 - 2026-07-16
 
 - Add `--with-agent-config` to copy an allowlisted set of non-secret Claude,

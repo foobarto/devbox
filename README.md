@@ -1,8 +1,8 @@
 # devbox
 
 Disposable, CWD-mounted dev VMs on [Lima](https://lima-vm.io)/QEMU, preloaded
-with an AI-CLI toolchain — **claude**, **codex**, **opencode**, **stado** — plus
-**Homebrew**.
+with an AI-CLI toolchain — **claude**, **codex**, **opencode**, **stado** — and
+the **GitHub CLI** (`gh`), plus **Homebrew**.
 
 `cd` into a project, type `devbox`, and you're in a throwaway Linux VM with the
 project mounted and the tools ready. Exit the shell and the VM is gone.
@@ -72,9 +72,12 @@ devbox destroy NAME | --all | --goldens
 | flag | effect |
 |---|---|
 | `--image NAME`, `-i NAME` | base image for this box's golden (default `ubuntu-24.04`). See [Images](#images). |
+| `--cpus N`, `-j N` | CPUs for this box (default 4). |
+| `--memory SIZE`, `-M SIZE` | memory for this box, e.g. `12GiB` (default `6GiB`). |
+| `--disk SIZE`, `-D SIZE` | disk ceiling, e.g. `80GiB` (default `100GiB`). Sparse, so it costs only what is written; grow-only. |
 | `--keep`, `-k` | don't auto-delete the box on exit. |
 | `--ssh-agent`, `-s` | forward the host SSH agent into the box (git/GitHub) and configure signed Git commits. Host **private keys never enter the VM** — only the agent socket and selected public key are used. |
-| `--proxy[=URL]`, `-p[=URL]` | point the AI CLIs at a host-side proxy; credentials stay on the host. Default `http://host.lima.internal:4141`. |
+| `--proxy[=URL]`, `-p[=URL]` | point the AI CLIs and `gh` at a host-side credential proxy; credentials stay on the host. Default `http://host.lima.internal:4141`. |
 | `--no-auth`, `-n` | explicitly disable Devbox-managed proxy, API-key, and copied-credential auth; removes its proxy/key profiles from an existing box. |
 | `--api-keys[=FILE]`, `-K[=FILE]` | inject API keys into the box from an env file (default `~/.config/devbox/api-keys.env`). |
 | `--with-creds`, `-c` | copy host AI-tool credential files into the box (OAuth logins for claude/codex without a proxy). Best-effort. |
@@ -93,7 +96,7 @@ flags yourself, e.g. `devbox -s -p -m ~/data:ro -C ~/.netrc`. Build accepts
 
 1. **`devbox build`** creates a persistent golden Lima instance
    (`devbox-golden-<image>`) from a base image, provisions the toolchain
-   (Homebrew + the four AI CLIs + build basics), verifies it, and stops it.
+   (Homebrew + the AI and GitHub CLIs + build basics), verifies it, and stops it.
    One golden per base image.
 2. **`devbox [DIR]`** derives a deterministic instance name from `(image, DIR)`,
    then:
@@ -143,15 +146,19 @@ Installed ≠ authenticated. Three combinable strategies, pick per your setup:
 | AI CLI settings, prompts, rules, and custom agents without auth | `--with-agent-config` | allowlisted non-secret files copied into the box |
 | nothing | *(default)* | you log in interactively inside the box |
 
-The proxy supports API keys plus Claude and Codex OAuth logins. A host CLI login
+The proxy supports API keys plus Claude, Codex, and GitHub CLI logins. A host CLI login
 works with `--proxy` out of the box; its access token is read fresh, refreshed
-on the host in the background, and never enters the box. See
+on the host when applicable, and never enters the box. See
 [`proxy/README.md`](proxy/README.md) for the full explanation. `--proxy` is the
 recommended default for disposable boxes, and it auto-starts the host proxy
 (once, shared across boxes) — no separate launch step. Manage it with
 `devbox proxy [start|stop|status]`.
 
-Git/GitHub auth is separate: use **`--ssh-agent`**. It also enables automatic
+For `gh`, log in once on the host with `gh auth login`; `devbox --proxy` gives
+the guest CLI a dummy routing marker plus a short-lived Devbox proxy capability,
+then injects the host token only inside a GitHub-only TLS proxy. The capability
+is not a GitHub token and expires after eight hours. GitHub Enterprise hosts are
+not proxied. Git/GitHub SSH auth is separate: use **`--ssh-agent`**. It also enables automatic
 SSH-format Git commit signatures through the forwarded agent. Devbox copies the
 first public key exposed by `ssh-add -L` and the host Git name/email, then sets
 Git's signing defaults inside the VM; the private key remains in the host
@@ -168,15 +175,42 @@ combined with `--with-agent-config`, which never intentionally copies auth.
 
 ## Per-project setup
 
-Use a `.devbox.toml` manifest in the project root to select an image, install
-Homebrew packages, and run a startup command inside the box. The image selects
-the matching Devbox golden; an explicit `--image` flag wins over the manifest.
+Use a `.devbox.toml` manifest in the project root to select an image, size the
+box, bake a toolchain into its golden, install Homebrew packages, and run a
+startup command. An explicit CLI flag always wins over the manifest.
 
 ```toml
-image = "ubuntu-24.04"
 packages = ["node", "python@3.12"]
 start = "npm install"
+
+[image]
+location = "ubuntu-24.04"
+provision = '''
+apt-get install -y --no-install-recommends postgresql-client
+'''
+
+[resources]
+cpus = 8
+memory = "12GiB"
+disk = "120GiB"
 ```
+
+`image = "ubuntu-24.04"` remains valid shorthand when you only need to pick a
+base image. **In TOML, every key after a `[table]` header belongs to that
+table** — so keep top-level keys above `[image]` and `[resources]`.
+
+`[image].provision` and `.provision_user` are baked into the **golden** at build
+time (root and user mode respectively), not re-run per box — that's where a
+heavy distro toolchain belongs, so each new box is a cheap clone rather than a
+re-install. Custom provisioning is part of the golden's identity, so one project
+can never silently redefine the golden another project clones from; editing it
+builds a new golden, and `devbox destroy --goldens` cleans up the old one.
+
+`[resources].disk` is a **ceiling, not an allocation** — Lima's qcow2 is sparse,
+so a 120GiB box that has written 4GiB occupies 4GiB on the host. It is grow-only;
+a request smaller than the golden's is refused with a warning rather than
+silently applied. `cpus` and `memory` are applied per-box at clone time, so
+changing them never requires rebuilding the golden.
 
 The manifest can also declare `ssh_agent`, `keep`, `proxy`, `api_keys`,
 `with_creds`, `with_agent_config`, `mounts`, `copies`, and `no_auth`. Because a project manifest is
@@ -196,11 +230,24 @@ Everything host-side lives under `~/.config/devbox/` (override with
 
 ```
 ~/.config/devbox/
+├── config.toml                  # machine-wide [resources] defaults
 ├── devbox-golden-<image>.yaml   # generated golden configs
 ├── api-keys.env                 # for --api-keys / the proxy   (gitignored)
 ├── proxy.config.json            # proxy routes                 (gitignored)
 └── proxy-env                    # optional --proxy env template (uses __PROXY_URL__)
 ```
+
+`config.toml` sets the defaults for every project on this machine:
+
+```toml
+[resources]
+cpus = 8
+memory = "12GiB"
+disk = "150GiB"
+```
+
+Resource precedence is **CLI flags > `.devbox.toml` > `config.toml` > built-in
+defaults** (4 CPUs, 6GiB, 100GiB).
 
 ## Tests
 
@@ -221,6 +268,10 @@ installed.
 - `limactl clone` copies the golden disk. On a reflink-capable filesystem
   (btrfs/xfs) that's near-instant; elsewhere it's a full copy (still far cheaper
   than re-provisioning).
+- Golden images configure `systemd-resolved` to use Lima's virtual host
+  resolver. This keeps DNS working on cloud images such as Kali that accept a
+  DHCP route but omit its DNS option, and it preserves host VPN/split-DNS
+  resolution rather than substituting public resolvers.
 - A box created before a `devbox build --force` keeps the *old* toolchain until
   you `destroy` and recreate it.
 - `--ssh-agent` enables Lima's agent socket for a new or existing box. An
