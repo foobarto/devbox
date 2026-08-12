@@ -655,7 +655,12 @@ PY
   limactl shell "$name" -- bash -c 'chmod 755 "$HOME/.devbox/gh-proxy/bin/gh"; chmod 644 "$HOME/.devbox/gh-proxy/certs/devbox-gh-proxy-ca.pem"'
   limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-12-gh-proxy.sh >/dev/null' <<EOF
 # devbox --proxy: GitHub CLI uses a host-authenticated, GitHub-only TLS proxy.
-export PATH="\$HOME/.devbox/gh-proxy/bin:\$PATH"
+# A function remains ahead of PATH even when a later user profile prepends
+# Homebrew.  That happens in the stock golden, and otherwise leaves the real
+# guest gh ahead of its Devbox proxy wrapper.
+gh() {
+  "\$HOME/.devbox/gh-proxy/bin/gh" "\$@"
+}
 export DEVBOX_GH_PROXY_URL="$gh_proxy_url"
 export DEVBOX_GH_PROXY_CERT_DIR="\$HOME/.devbox/gh-proxy/certs"
 EOF

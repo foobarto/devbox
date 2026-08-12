@@ -274,6 +274,7 @@ setup() {
   [[ "$source_text" == *'zz-devbox-12-gh-proxy.sh'* ]]
   [[ "$source_text" == *'gh-proxy-ca.pem'* ]]
   [[ "$source_text" == *'gh auth login'* ]]
+  [[ "$source_text" == *'gh() {'* ]]
   [[ "$source_text" == *'rm -rf "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"'* ]]
 }
 

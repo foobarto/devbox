@@ -79,6 +79,31 @@ commands so a disposable box cannot alter the host account. `gh auth status`
 is safe and reports the dummy environment-token login. This automatic path is
 for GitHub.com; GitHub Enterprise hosts remain direct guest configuration.
 
+### Repairing an existing box
+
+For a kept box where `gh` is installed but reports that it needs `gh auth
+login`, refresh the Devbox-managed proxy setup without deleting the box:
+
+```sh
+cd /path/to/project
+devbox --keep --proxy
+```
+
+The command refreshes the guest wrapper and proxy profile, then opens the box.
+Use `gh api /rate_limit --jq .rate.remaining` there as a credential-safe smoke
+check. Do not run `gh auth login` in the guest; log in on the host instead.
+
+If the box says `gh` is missing, it predates the golden-image installation.
+First check that its project work is committed or otherwise safe, then rebuild
+the golden and recreate only that box:
+
+```sh
+devbox build --force
+devbox ls                         # identify the kept box name
+devbox destroy <box-name>
+devbox --keep --proxy
+```
+
 ## Quick start
 
 To use static API keys or custom routes, configure them once:
