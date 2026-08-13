@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Update the version marker in the static website without touching other text."""
+"""Update the version marker in the static Pages site without touching other text."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PAGE = ROOT / "website" / "index.html"
+DEFAULT_PAGE = ROOT / "docs" / "index.html"
 VERSION = r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?"
 MARKER = re.compile(
     rf'(<span data-current-version>)(?P<version>{VERSION})(</span>)'
@@ -18,14 +18,14 @@ MARKER = re.compile(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Update the marked Devbox version in website/index.html."
+        description="Update the marked Devbox version in docs/index.html."
     )
     parser.add_argument("version", help="Version to display, for example v1.2.3")
     parser.add_argument(
         "--path",
         type=Path,
         default=DEFAULT_PAGE,
-        help="HTML file to update (default: website/index.html)",
+        help="HTML file to update (default: docs/index.html)",
     )
     args = parser.parse_args()
     if not re.fullmatch(VERSION, args.version):

@@ -6,11 +6,11 @@ on:
     - cron: "17 5 * * 1"
   workflow_dispatch:
 
-# The workflow commits a one-line website change, then dispatches the Pages
-# deployment. A commit made with GITHUB_TOKEN does not trigger push workflows.
+# The workflow commits a one-line website change, then explicitly requests a
+# Pages build. GITHUB_TOKEN commits do not trigger a GitHub Pages build.
 permissions:
-  actions: write
   contents: write
+  pages: write
 
 concurrency:
   group: sync-site-version
@@ -39,7 +39,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           python3 scripts/update-site-version.py "$VERSION"
-          if git diff --quiet -- website/index.html; then
+          if git diff --quiet -- docs/index.html; then
             printf 'changed=false\n' >> "$GITHUB_OUTPUT"
           else
             printf 'changed=true\n' >> "$GITHUB_OUTPUT"
@@ -52,12 +52,12 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add website/index.html
+          git add docs/index.html
           git commit -m "docs(site): sync version to ${VERSION}"
           git push
 
-      - name: Deploy the updated site
+      - name: Request a GitHub Pages build
         if: steps.update.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run deploy-pages.yml --ref main
+        run: gh api --method POST "repos/${GITHUB_REPOSITORY}/pages/builds"

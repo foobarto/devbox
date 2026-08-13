@@ -9,7 +9,7 @@ from unittest import TestCase, main
 
 
 ROOT = Path(__file__).parents[1]
-SITE = ROOT / "website"
+SITE = ROOT / "docs"
 SITE_VERSION_UPDATER = ROOT / "scripts" / "update-site-version.py"
 
 
@@ -74,14 +74,9 @@ class WebsiteTests(TestCase):
             )
             self.assertEqual("unchanged: v9.8.7\n", unchanged.stdout)
 
-    def test_pages_workflow_publishes_only_the_website_directory(self):
-        workflow = (ROOT / ".github/workflows/deploy-pages.yml").read_text(encoding="utf-8")
-        self.assertIn("actions/configure-pages@v5", workflow)
-        self.assertIn("actions/upload-pages-artifact@v4", workflow)
-        self.assertIn("actions/deploy-pages@v4", workflow)
-        self.assertIn("path: website", workflow)
-        self.assertIn("pages: write", workflow)
-        self.assertIn("id-token: write", workflow)
+    def test_pages_source_contains_the_static_site_and_disables_jekyll(self):
+        self.assertTrue((SITE / ".nojekyll").is_file())
+        self.assertTrue((SITE / "index.html").is_file())
 
     def test_version_sync_workflow_updates_and_deploys_only_when_needed(self):
         workflow = (ROOT / ".github/workflows/sync-site-version.yml").read_text(encoding="utf-8")
@@ -89,9 +84,9 @@ class WebsiteTests(TestCase):
         self.assertIn("tr -d '[:space:]' < VERSION", workflow)
         self.assertIn("scripts/update-site-version.py", workflow)
         self.assertIn("contents: write", workflow)
-        self.assertIn("actions: write", workflow)
-        self.assertIn("git diff --quiet -- website/index.html", workflow)
-        self.assertIn("gh workflow run deploy-pages.yml --ref main", workflow)
+        self.assertIn("pages: write", workflow)
+        self.assertIn("git diff --quiet -- docs/index.html", workflow)
+        self.assertIn('gh api --method POST "repos/${GITHUB_REPOSITORY}/pages/builds"', workflow)
 
 
 if __name__ == "__main__":
