@@ -37,20 +37,17 @@ def main() -> None:
     args = parse_args()
     page = args.path
     content = page.read_text(encoding="utf-8")
-    match = MARKER.search(content)
-    if not match:
-        raise SystemExit(f"no version marker found in {page}")
+    matches = list(MARKER.finditer(content))
+    if len(matches) != 1:
+        raise SystemExit(f"expected one version marker in {page}, found {len(matches)}")
 
+    match = matches[0]
     old_version = match.group("version")
     if old_version == args.version:
         print(f"unchanged: {args.version}")
         return
 
-    updated, replacements = MARKER.subn(
-        rf"\g<1>{args.version}\g<3>", content, count=1
-    )
-    if replacements != 1:
-        raise SystemExit(f"expected one version marker in {page}, found {replacements}")
+    updated = MARKER.sub(rf"\g<1>{args.version}\g<3>", content)
     page.write_text(updated, encoding="utf-8")
     print(f"updated: {old_version} -> {args.version}")
 

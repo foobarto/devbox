@@ -64,7 +64,9 @@ class WebsiteTests(TestCase):
                 text=True,
             )
             self.assertIn("updated:", result.stdout)
-            self.assertIn("<span data-current-version>v9.8.7</span>", page.read_text())
+            self.assertIn(
+                "<span data-current-version>v9.8.7</span>", page.read_text(encoding="utf-8")
+            )
 
             unchanged = subprocess.run(
                 [sys.executable, SITE_VERSION_UPDATER, "v9.8.7", "--path", page],
@@ -73,6 +75,23 @@ class WebsiteTests(TestCase):
                 text=True,
             )
             self.assertEqual("unchanged: v9.8.7\n", unchanged.stdout)
+
+    def test_site_version_updater_rejects_duplicate_markers(self):
+        with TemporaryDirectory() as temporary_directory:
+            page = Path(temporary_directory) / "index.html"
+            page.write_text(
+                "<span data-current-version>v1.0.0</span>"
+                "<span data-current-version>v1.0.0</span>",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [sys.executable, SITE_VERSION_UPDATER, "v9.8.7", "--path", page],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("expected one version marker", result.stderr)
 
     def test_pages_source_contains_the_static_site_and_disables_jekyll(self):
         self.assertTrue((SITE / ".nojekyll").is_file())
@@ -85,7 +104,9 @@ class WebsiteTests(TestCase):
         self.assertIn("scripts/update-site-version.py", workflow)
         self.assertIn("contents: write", workflow)
         self.assertIn("pages: write", workflow)
+        self.assertIn("ref: main", workflow)
         self.assertIn("git diff --quiet -- docs/index.html", workflow)
+        self.assertIn("git push origin HEAD:main", workflow)
         self.assertIn('gh api --method POST "repos/${GITHUB_REPOSITORY}/pages/builds"', workflow)
 
 
