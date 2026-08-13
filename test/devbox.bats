@@ -268,6 +268,12 @@ setup() {
   [ "$output" = "http://part.one@host.lima.internal:4141" ]
 }
 
+@test "traffic proxy URL uses the same capability-safe bare endpoint format" {
+  run bash -c 'printf %s "$2" | { source "$1"; traffic_proxy_url "$3"; }' _ "$DEVBOX" "part.one" "http://host.lima.internal:4141"
+  [ "$status" -eq 0 ]
+  [ "$output" = "http://part.one@host.lima.internal:4141" ]
+}
+
 @test "GitHub proxy URL rejects a proxy URL with existing credentials or a path" {
   run bash -c 'printf %s "$2" | { source "$1"; github_proxy_url "$3"; }' _ "$DEVBOX" "part.one" "http://user@host.lima.internal:4141"
   [ "$status" -ne 0 ]
@@ -287,6 +293,17 @@ setup() {
   CONFIG_DIR="$original_config_dir"
 }
 
+@test "traffic proxy remembers only a bare host-side endpoint with owner-only permissions" {
+  original_config_dir="$CONFIG_DIR"
+  CONFIG_DIR="$BATS_TEST_TMPDIR/config"
+  endpoint="http://host.lima.internal:4141"
+  record_traffic_proxy_endpoint devbox-test "$endpoint"
+  [ "$(stored_traffic_proxy_endpoint devbox-test)" = "$endpoint" ]
+  [ "$(stat -c %a "$(traffic_proxy_state_path devbox-test)")" = "600" ]
+  ! valid_gh_proxy_endpoint "http://capability@host.lima.internal:4141"
+  CONFIG_DIR="$original_config_dir"
+}
+
 @test "proxy setup keeps gh credentials on the host behind a guest wrapper" {
   source_text="$(<"$DEVBOX")"
   [[ "$source_text" == *'gh-wrapper.py'* ]]
@@ -299,6 +316,27 @@ setup() {
   [[ "$source_text" == *'start_gh_proxy_capability_renewal'* ]]
   [[ "$source_text" == *'stored_gh_proxy_endpoint'* ]]
   [[ "$source_text" == *'rm -rf "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"'* ]]
+}
+
+@test "proxy command exposes host-owned audit viewing and HTML export" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *'proxy audit [status|show [LIMIT]|export [FILE]]'* ]]
+  [[ "$source_text" == *'--audit-status'* ]]
+  [[ "$source_text" == *'--audit-show'* ]]
+  [[ "$source_text" == *'--audit-export'* ]]
+}
+
+@test "traffic audit is explicit, proxy-or-fail, and removable from kept boxes" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *'--traffic-audit[=connect|off], -T'* ]]
+  [[ "$source_text" == *'--traffic-audit|-T) traffic_audit=connect'* ]]
+  [[ "$source_text" == *'--traffic-audit=*|-T=*) traffic_audit='* ]]
+  [[ "$source_text" == *'ensure_guest_nftables'* ]]
+  [[ "$source_text" == *'table inet devbox_traffic_audit'* ]]
+  [[ "$source_text" == *'tcp dport { 80, 443 } reject'* ]]
+  [[ "$source_text" == *'udp dport { 80, 443 } reject'* ]]
+  [[ "$source_text" == *'clear_connect_traffic_audit'* ]]
+  [[ "$source_text" != *'-a) with_agent_config=1; proxy="$PROXY_DEFAULT_URL"; ssh_agent=1; traffic_audit='* ]]
 }
 
 @test "GUI commands use Waypipe over Lima SSH without exposing the host socket" {
@@ -576,7 +614,7 @@ setup() {
   for alias in \
     '--image|-i' '--keep|-k' '--ssh-agent|-s' '--proxy|-p' '--no-auth|-n' \
     '--api-keys|-K' '--with-creds|-c' '--with-agent-config|-g' \
-    '--gui|-G' \
+    '--gui|-G' '--traffic-audit|-T' \
     '--mount|-m' '--copy|-C' '--name|-N' '--force|-f' '--all|-A' '--goldens|-G' \
     '--cpus|-j' '--memory|-M' '--disk|-D' '--yes|-y'; do
     [[ "$source_text" == *"$alias"* ]]

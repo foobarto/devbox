@@ -54,6 +54,63 @@ just to keep a session alive.
 The VM never receives an access or refresh token; the repository also has a
 pre-commit guard against embedding one in production scripts.
 
+## Detailed audit log
+
+By default, every request that reaches an authenticated AI or GitHub route is
+recorded on the host at `~/.config/devbox/proxy-audit.jsonl` with mode `0600`.
+This is intentionally a detailed action log, not only access metadata: it
+captures AI prompts and queries, GitHub REST/GraphQL request payloads, request
+method/path, classification (`read`, `create-or-action`, `modify`, `delete`, or
+GraphQL mutation), final status, duration, and response byte count. It never
+records request headers, response bodies, host tokens, or known token/password
+fields embedded in JSON bodies. Query values are omitted; only query parameter
+names are retained.
+
+The default capture cap is 1 MiB per request body. Larger or binary uploads
+record byte count and SHA-256 plus a bounded text preview when possible. The
+log can therefore contain prompts, source snippets, issue text, and other
+sensitive work data. Do not commit, upload, or share it casually.
+
+```sh
+devbox proxy audit status             # path, size, and capture settings
+devbox proxy audit show               # newest 50 JSONL entries
+devbox proxy audit show 200           # newest 200 entries
+devbox proxy audit export             # ~/.config/devbox/proxy-audit.html (mode 0600)
+devbox proxy audit export ~/audit.html
+```
+
+The HTML report escapes captured content and highlights mutating operations.
+Disable collection before starting the proxy with either
+`DEVBOX_PROXY_AUDIT=0`, or this host-local `proxy.config.json` section:
+
+```json
+"audit": { "enabled": false }
+```
+
+See [proxy audit logging](../docs/proxy-audit.md) for the data model, retention
+guidance, and the boundary between authentication auditing and optional traffic
+capture.
+
+## Opt-in CONNECT web egress audit
+
+`devbox --traffic-audit` (or `-T`) is separate from `--proxy` and from `-a`.
+It issues a different eight-hour capability for generic public web traffic,
+sets the guest's standard `HTTP(S)_PROXY` and `ALL_PROXY` variables, and blocks
+direct guest TCP/UDP ports 80 and 443 with nftables. Normal proxy-aware tools
+therefore use this host proxy or fail visibly instead of bypassing its log.
+
+HTTPS CONNECT records are intentionally metadata-only: destination host/port,
+time, status, and byte counts. TLS remains end-to-end, so request paths and
+bodies are unavailable. Plain HTTP proxy requests are visible and produce a
+detailed audit record. The generic capability cannot reach loopback, private,
+or link-local targets, preventing the proxy from becoming a route to host/LAN
+web services.
+
+This is a guest egress guard, not a hostile-root containment system: a process
+with guest sudo/root can remove its nftables table, and non-web ports are not
+covered. Remove it from a kept box with `devbox --traffic-audit=off`. See the
+[detailed audit guide](../docs/proxy-audit.md) for limitations and data handling.
+
 For Codex subscriptions, `devbox --proxy` gives the guest an isolated,
 non-secret Codex profile that points its ChatGPT backend and WebSocket traffic
 to the host proxy. The guest only receives the literal routing marker

@@ -1,5 +1,6 @@
 """Unit tests for host-side proxy auth selection (no network or VM)."""
 import importlib.util
+import http.client
 import json
 import os
 import socket
@@ -310,6 +311,206 @@ class GitHubCliWrapperTests(TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("host GitHub CLI login", result.stderr)
+
+
+class ProxyAuditTests(TestCase):
+    def test_audit_body_keeps_prompt_content_but_redacts_known_credential_fields(self):
+        body = json.dumps({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "review this change"}],
+            "api_key": "must-not-be-recorded",
+        }).encode()
+        with patch.object(proxy, "AUDIT_MAX_BODY_BYTES", 4096):
+            captured = proxy.audit_body(body, "application/json")
+        self.assertEqual(captured["bytes"], len(body))
+        self.assertFalse(captured["truncated"])
+        self.assertEqual(captured["json"]["messages"][0]["content"], "review this change")
+        self.assertEqual(captured["json"]["api_key"], "[redacted]")
+
+    def test_audit_classifies_github_graphql_mutations_as_state_changes(self):
+        mutation = json.dumps({"query": "mutation { closeIssue(input: {}) { issue { id } } }"}).encode()
+        query = json.dumps({"query": "query { viewer { login } }"}).encode()
+        self.assertEqual(proxy.audit_action("POST", "/graphql", mutation), ("graphql-mutation", True))
+        self.assertEqual(proxy.audit_action("POST", "/graphql", query), ("graphql-query", False))
+        self.assertEqual(proxy.audit_action("DELETE", "/repos/o/r/issues/1", None), ("delete", True))
+
+    def test_audit_log_is_owner_only_and_html_escapes_captured_prompt_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            audit_path = Path(directory) / "proxy-audit.jsonl"
+            report_path = Path(directory) / "report.html"
+            upstream = proxy.urlsplit("https://api.example.test")
+            event = proxy.build_audit_event(
+                method="POST",
+                target="/v1/messages?api_key=not-logged",
+                upstream=upstream,
+                body=b'{"prompt":"<script>alert(1)</script>"}',
+                content_type="application/json",
+                source="auth-proxy",
+                provider="test",
+                client="192.0.2.10",
+                status=200,
+                duration_ms=12,
+            )
+            with patch.object(proxy, "AUDIT_PATH", str(audit_path)), \
+                 patch.object(proxy, "AUDIT_ENABLED", True):
+                proxy.write_audit_event(event)
+                self.assertEqual(proxy.read_audit_events(), [event])
+                output = proxy.write_audit_html(str(report_path))
+            self.assertEqual(output, str(report_path))
+            self.assertEqual(audit_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(report_path.stat().st_mode & 0o777, 0o600)
+            rendered = report_path.read_text()
+            self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", rendered)
+            self.assertNotIn("api_key=not-logged", rendered)
+
+    def test_forwarded_request_emits_a_detailed_action_audit_event(self):
+        class UpstreamHandler(proxy.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.server.request_body = self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(201)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            audit_path = Path(directory) / "proxy-audit.jsonl"
+            upstream = proxy.ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+            upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+            upstream_thread.start()
+            route = {
+                "match": "/v1/messages",
+                "upstream": f"http://127.0.0.1:{upstream.server_address[1]}",
+            }
+            server = proxy.ThreadingHTTPServer(("127.0.0.1", 0), proxy.Handler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            body = json.dumps({"prompt": "audit this request", "token": "not-logged"}).encode()
+            try:
+                with patch.object(proxy, "ROUTES", [route]), \
+                     patch.object(proxy, "AUDIT_PATH", str(audit_path)), \
+                     patch.object(proxy, "AUDIT_ENABLED", True), \
+                     patch.object(proxy.Handler, "log_message"):
+                    connection = http.client.HTTPConnection(*server.server_address, timeout=5)
+                    connection.request("POST", "/v1/messages?credential=hidden", body=body,
+                                       headers={"Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 201)
+                    self.assertEqual(response.read(), b"ok")
+                    connection.close()
+                    events = proxy.read_audit_events()
+            finally:
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=5)
+                upstream.shutdown()
+                upstream.server_close()
+                upstream_thread.join(timeout=5)
+            self.assertEqual(upstream.request_body, body)
+            self.assertEqual(len(events), 1)
+            event = events[0]
+            self.assertEqual(event["request"]["action"], "create-or-action")
+            self.assertTrue(event["request"]["mutating"])
+            self.assertEqual(event["request"]["query_keys"], ["credential"])
+            self.assertEqual(event["request"]["body"]["json"]["prompt"], "audit this request")
+            self.assertEqual(event["request"]["body"]["json"]["token"], "[redacted]")
+            self.assertEqual(event["response"]["status"], 201)
+            self.assertEqual(event["response"]["bytes"], 2)
+
+
+class TrafficProxyTests(TestCase):
+    def test_traffic_capability_is_separate_from_github_and_limited_to_web_ports(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(proxy, "STATE_DIR", directory):
+            token = proxy.issue_traffic_proxy_token()
+            header = {"Proxy-Authorization": "Basic " + b64encode((token + ":").encode()).decode()}
+            self.assertTrue(proxy.traffic_proxy_authorized(header))
+            self.assertFalse(proxy.github_proxy_authorized(header))
+        self.assertEqual(proxy.traffic_connect_target("example.com:443"), ("example.com", 443))
+        self.assertEqual(proxy.traffic_connect_target("example.com:80"), ("example.com", 80))
+        self.assertIsNone(proxy.traffic_connect_target("example.com:22"))
+        self.assertEqual(
+            proxy.traffic_http_target("http://example.com/path?visible=yes"),
+            ("example.com", 80, "/path?visible=yes"),
+        )
+        self.assertIsNone(proxy.traffic_http_target("https://example.com/path"))
+
+    def test_traffic_proxy_refuses_private_or_loopback_destinations_before_connecting(self):
+        for address in ("127.0.0.1", "10.0.0.1", "169.254.1.1", "::1"):
+            with self.subTest(address=address), patch.object(
+                proxy.socket,
+                "getaddrinfo",
+                return_value=[(socket.AF_INET6 if ":" in address else socket.AF_INET,
+                               socket.SOCK_STREAM, 6, "", (address, 443, 0, 0)
+                               if ":" in address else (address, 443))],
+            ):
+                with self.assertRaisesRegex(OSError, "no public IP address"):
+                    proxy.open_traffic_connection("destination.test", 443)
+
+    def test_connect_audit_remains_metadata_only(self):
+        event = proxy.build_connect_audit_event(
+            client="192.0.2.10", host="example.com", port=443, status=200,
+            duration_ms=12, request_bytes=10, response_bytes=20,
+        )
+        self.assertEqual(event["source"], "traffic-connect")
+        self.assertEqual(event["request"]["action"], "opaque-connect")
+        self.assertIsNone(event["request"]["body"])
+        self.assertEqual(event["response"]["request_bytes"], 10)
+        self.assertEqual(event["response"]["bytes"], 20)
+
+    def test_plain_http_proxy_forwards_and_audits_the_actual_request(self):
+        class UpstreamHandler(proxy.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.server.request_path = self.path
+                self.server.request_body = self.rfile.read(int(self.headers["Content-Length"]))
+                self.server.proxy_authorization = self.headers.get("Proxy-Authorization")
+                self.send_response(202)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            audit_path = Path(directory) / "proxy-audit.jsonl"
+            upstream = proxy.ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+            upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+            upstream_thread.start()
+            server = proxy.ThreadingHTTPServer(("127.0.0.1", 0), proxy.Handler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            body = b'{"operation":"update"}'
+            try:
+                with patch.object(proxy, "traffic_proxy_authorized", return_value=True), \
+                     patch.object(proxy, "open_traffic_connection", side_effect=lambda *_: socket.create_connection(upstream.server_address)), \
+                     patch.object(proxy, "AUDIT_PATH", str(audit_path)), \
+                     patch.object(proxy, "AUDIT_ENABLED", True), \
+                     patch.object(proxy.Handler, "log_message"):
+                    connection = http.client.HTTPConnection(*server.server_address, timeout=5)
+                    connection.request(
+                        "POST", "http://example.test/action?secret=not-logged", body=body,
+                        headers={"Content-Type": "application/json", "Proxy-Authorization": "Basic ignored"},
+                    )
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 202)
+                    self.assertEqual(response.read(), b"ok")
+                    connection.close()
+                    events = proxy.read_audit_events()
+            finally:
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=5)
+                upstream.shutdown()
+                upstream.server_close()
+                upstream_thread.join(timeout=5)
+            self.assertEqual(upstream.request_path, "/action?secret=not-logged")
+            self.assertEqual(upstream.request_body, body)
+            self.assertIsNone(upstream.proxy_authorization)
+            self.assertEqual(events[0]["source"], "traffic-http")
+            self.assertEqual(events[0]["request"]["query_keys"], ["secret"])
+            self.assertEqual(events[0]["response"]["status"], 202)
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@
 #                                 [--cpus N|-j N] [--memory S|-M S] [--disk S|-D S]
 #   devbox ls
 #   devbox destroy NAME | --all | --goldens
-#   devbox proxy [start|stop|status]   manage the shared host-side AI proxy
+#   devbox proxy [start|stop|status|audit]   manage the shared host-side proxy
 #   devbox --version|-V
 #
 # Run flags
@@ -44,6 +44,12 @@
 #                    http://host.lima.internal:4141); real credentials stay on
 #                    the host. Auto-starts the proxy on this host if it isn't
 #                    already running (shared across boxes). See proxy/README.md.
+#   --traffic-audit[=connect|off], -T
+#                    opt in to proxy-or-fail web egress. `connect` sets standard
+#                    HTTP(S) proxy variables and blocks direct TCP/UDP 80/443
+#                    from the guest, leaving the audited host proxy as the way
+#                    out. It is separate from -a and may break proxy-unaware
+#                    tools; `--traffic-audit=off` removes it from a kept box.
 #   --no-auth, -n    do not inject proxy, API-key, or copied host credentials;
 #                    also removes devbox-managed proxy/key profiles from an
 #                    existing box. This is the default for a new box.
@@ -427,9 +433,9 @@ provision:
     RESOLVER
       systemctl restart systemd-resolved
     fi
-    apt="build-essential git curl wget jq ripgrep unzip ca-certificates procps file locales sudo python3 python3-venv python3-pip waypipe"
-    dnf="@development-tools git curl wget jq ripgrep unzip ca-certificates procps-ng file glibc-langpack-en sudo python3 python3-pip waypipe"
-    pac="base-devel git curl wget jq ripgrep unzip ca-certificates procps-ng file sudo python python-pip waypipe"
+    apt="build-essential git curl wget jq ripgrep unzip ca-certificates procps file locales sudo python3 python3-venv python3-pip waypipe nftables"
+    dnf="@development-tools git curl wget jq ripgrep unzip ca-certificates procps-ng file glibc-langpack-en sudo python3 python3-pip waypipe nftables"
+    pac="base-devel git curl wget jq ripgrep unzip ca-certificates procps-ng file sudo python python-pip waypipe nftables"
     if   command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y --no-install-recommends $apt
     elif command -v dnf     >/dev/null 2>&1; then dnf install -y $dnf
     elif command -v pacman  >/dev/null 2>&1; then pacman -Sy --noconfirm $pac
@@ -554,7 +560,7 @@ proxy_port() {
 }
 # $1 bare http proxy URL; capability token arrives on stdin so it never appears
 # in the host process list. HTTP proxy URLs encode userinfo as Basic auth.
-github_proxy_url() {
+capability_proxy_url() {
   python3 -c '
 import sys
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -562,12 +568,15 @@ from urllib.parse import quote, urlsplit, urlunsplit
 source = urlsplit(sys.argv[1])
 token = sys.stdin.read().strip()
 if source.scheme != "http" or not source.netloc or source.username or source.password or source.path or source.query or source.fragment:
-    raise SystemExit("GitHub CLI proxy URL must be a bare http://host:port URL")
+    raise SystemExit("proxy URL must be a bare http://host:port URL")
 if not token:
-    raise SystemExit("GitHub CLI proxy capability is empty")
+    raise SystemExit("proxy capability is empty")
 print(urlunsplit((source.scheme, f"{quote(token)}@{source.netloc}", "", "", "")))
 ' "$1"
 }
+
+github_proxy_url() { capability_proxy_url "$@"; }
+traffic_proxy_url() { capability_proxy_url "$@"; }
 
 gh_proxy_state_path() { # $1 Lima instance name
   [[ "$1" =~ ^[[:alnum:]_.-]+$ ]] || die "invalid Devbox instance name for GitHub proxy state"
@@ -582,6 +591,40 @@ from urllib.parse import urlsplit
 source = urlsplit(sys.argv[1])
 sys.exit(0 if source.scheme == "http" and source.netloc and not source.username and not source.password and not source.path and not source.query and not source.fragment else 1)
 ' "$1"
+}
+
+traffic_proxy_state_path() { # $1 Lima instance name
+  [[ "$1" =~ ^[[:alnum:]_.-]+$ ]] || die "invalid Devbox instance name for traffic proxy state"
+  printf '%s/traffic-proxy-boxes/%s.url' "$CONFIG_DIR" "$1"
+}
+
+record_traffic_proxy_endpoint() { # $1 Lima instance $2 bare http proxy URL
+  local name="$1" url="$2" state_dir path tmp
+  valid_gh_proxy_endpoint "$url" || die "traffic proxy URL must be a bare http://host:port URL"
+  path="$(traffic_proxy_state_path "$name")"
+  state_dir="$(dirname "$path")"
+  umask 077
+  install -d -m 700 "$state_dir"
+  tmp="$(mktemp "$state_dir/.${name}.XXXXXX")"
+  printf '%s\n' "$url" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$path"
+}
+
+stored_traffic_proxy_endpoint() { # $1 Lima instance; prints host-owned remembered endpoint
+  local path value
+  path="$(traffic_proxy_state_path "$1")"
+  [[ -r "$path" ]] || return 1
+  value="$(<"$path")"
+  if ! valid_gh_proxy_endpoint "$value"; then
+    warn "ignoring invalid remembered traffic proxy endpoint for $1"
+    return 1
+  fi
+  printf '%s' "$value"
+}
+
+clear_traffic_proxy_endpoint() { # $1 Lima instance
+  rm -f -- "$(traffic_proxy_state_path "$1")"
 }
 
 record_gh_proxy_endpoint() { # $1 Lima instance $2 bare http proxy URL
@@ -721,7 +764,7 @@ proxy_ensure() {
   echo $! > "$CONFIG_DIR/proxy.pid"
   for i in $(seq 1 20); do proxy_health "$port" && break; sleep 0.2; done
   if proxy_health "$port"; then log "credential proxy up (pid $(cat "$CONFIG_DIR/proxy.pid" 2>/dev/null), log: $logf)"
-  else warn "proxy did not come up — see $logf"; fi
+  else warn "proxy did not come up — see $logf"; return 1; fi
 }
 
 apply_proxy() {
@@ -802,6 +845,118 @@ clear_auth() {
   # shellcheck disable=SC2016 # $HOME expands in the guest shell.
   limactl shell "$name" -- bash -c \
     'sudo rm -f /etc/profile.d/zz-devbox-10-proxy.sh /etc/profile.d/zz-devbox-11-codex-proxy.sh /etc/profile.d/zz-devbox-12-gh-proxy.sh /etc/profile.d/zz-devbox-20-keys.sh; rm -rf "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"'
+}
+
+# ------------------------------------------------------- traffic audit egress ---
+# `--traffic-audit=connect` is deliberately separate from `--proxy`: it grants
+# a generic, short-lived CONNECT capability but never authenticates a provider.
+# The guest firewall makes proxy-unaware apps fail instead of silently taking a
+# direct HTTP(S) route. It is a workflow guard, not containment against code
+# with guest root/sudo, which can change guest firewall rules.
+ensure_guest_nftables() { # $1 Lima instance
+  local name="$1"
+  # shellcheck disable=SC2016 # Guest package-manager commands expand in the guest.
+  limactl shell "$name" -- bash -lc '
+    command -v nft >/dev/null 2>&1 && exit 0
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get update
+      sudo apt-get install -y --no-install-recommends nftables
+    elif command -v dnf >/dev/null 2>&1; then
+      sudo dnf install -y nftables
+    elif command -v pacman >/dev/null 2>&1; then
+      sudo pacman -Sy --noconfirm nftables
+    else
+      printf "%s\\n" "devbox traffic audit needs nftables in this guest" >&2
+      exit 1
+    fi
+  '
+}
+
+traffic_proxy_endpoint_parts() { # $1 bare http proxy URL; print host<TAB>port
+  python3 - "$1" <<'PY'
+import sys
+from urllib.parse import urlsplit
+
+source = urlsplit(sys.argv[1])
+if source.scheme != "http" or not source.hostname or source.username or source.password or source.path or source.query or source.fragment:
+    raise SystemExit("traffic proxy URL must be a bare http://host:port URL")
+print(f"{source.hostname}\t{source.port or 4141}")
+PY
+}
+
+apply_connect_traffic_firewall() { # $1 Lima instance $2 proxy hostname $3 port
+  local name="$1" proxy_host="$2" proxy_port="$3"
+  if ! [[ "$proxy_port" =~ ^[1-9][0-9]{0,4}$ ]] || (( proxy_port > 65535 )); then
+    die "invalid traffic proxy port: $proxy_port"
+  fi
+  # The proxy endpoint is the only direct web exception. Resolve its IPv4
+  # address inside the guest so Lima's host DNS name works with all tools.
+  limactl shell "$name" -- bash -s -- "$proxy_host" "$proxy_port" <<'EOF'
+set -euo pipefail
+proxy_host="$1"
+proxy_port="$2"
+proxy_ip="$(getent ahostsv4 "$proxy_host" | awk 'NR == 1 { print $1}')"
+[[ "$proxy_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || {
+  printf 'could not resolve an IPv4 address for Devbox traffic proxy %s\n' "$proxy_host" >&2
+  exit 1
+}
+sudo nft delete table inet devbox_traffic_audit 2>/dev/null || true
+sudo nft -f - <<RULES
+table inet devbox_traffic_audit {
+  chain output {
+    type filter hook output priority 0; policy accept;
+    ip daddr 127.0.0.0/8 accept
+    ip6 daddr ::1 accept
+    ip daddr $proxy_ip tcp dport $proxy_port accept
+    tcp dport { 80, 443 } reject with tcp reset
+    udp dport { 80, 443 } reject
+  }
+}
+RULES
+EOF
+}
+
+clear_connect_traffic_audit() { # $1 Lima instance
+  local name="$1"
+  log "Removing proxy-or-fail traffic audit from $name"
+  clear_traffic_proxy_endpoint "$name"
+  limactl shell "$name" -- bash -c \
+    'sudo rm -f /etc/profile.d/zz-devbox-30-traffic-audit.sh; command -v nft >/dev/null 2>&1 && sudo nft delete table inet devbox_traffic_audit 2>/dev/null || true'
+}
+
+apply_connect_traffic_audit() { # $1 Lima instance $2 bare host proxy URL
+  local name="$1" url="$2" launcher traffic_proxy_token traffic_url parts proxy_host proxy_port
+  valid_gh_proxy_endpoint "$url" || die "traffic proxy URL must be a bare http://host:port URL"
+  launcher="$(proxy_launcher)" || die "traffic proxy launcher not found"
+  traffic_proxy_token="$("$launcher" --new-traffic-proxy-token)" || \
+    die "could not issue traffic proxy capability"
+  [[ "$traffic_proxy_token" == *.* ]] || die "traffic proxy returned an invalid capability"
+  traffic_url="$(printf '%s' "$traffic_proxy_token" | traffic_proxy_url "$url")" || \
+    die "could not configure traffic proxy URL"
+  parts="$(traffic_proxy_endpoint_parts "$url")" || die "could not parse traffic proxy URL"
+  IFS=$'\t' read -r proxy_host proxy_port <<< "$parts"
+
+  log "Enabling proxy-or-fail web traffic audit in $name"
+  ensure_guest_nftables "$name" || die "could not install nftables in $name"
+  apply_connect_traffic_firewall "$name" "$proxy_host" "$proxy_port" || \
+    die "could not block direct web egress in $name"
+  # This is a short-lived network capability, not a host credential. It must
+  # be readable by guest applications through their login-shell profile;
+  # applications which ignore it still hit the direct-port firewall and fail.
+  printf '%s' "$traffic_url" | python3 -c '
+import shlex
+import sys
+url = sys.stdin.read().strip()
+if not url:
+    raise SystemExit("empty traffic proxy URL")
+quoted = shlex.quote(url)
+print("# devbox --traffic-audit=connect: route ordinary web tools through the audited")
+print("# host CONNECT proxy. Direct TCP/UDP 80/443 is blocked by the guest nft table.")
+for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+    print(f"export {key}={quoted}")
+print("unset NO_PROXY no_proxy")
+' | limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-30-traffic-audit.sh >/dev/null'
+  record_traffic_proxy_endpoint "$name" "$url"
 }
 
 # ------------------------------------------------------------ GUI / Waypipe ---
@@ -1251,12 +1406,14 @@ run_cleanup() {
     log "Destroying ${_DB_NAME}…"
     limactl stop -f "$_DB_NAME" 2>/dev/null || true
     limactl delete -f "$_DB_NAME" 2>/dev/null || true
+    clear_gh_proxy_endpoint "$_DB_NAME"
+    clear_traffic_proxy_endpoint "$_DB_NAME"
   fi
   exit "$rc"
 }
 
 cmd_run() {
-  local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 with_agent_config=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name="" gui=0
+  local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 with_agent_config=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name="" gui=0 traffic_audit=""
   local extra_mounts=() extra_copies=() manifest_requests=() gui_command=()
   local cli_cpus="" cli_memory="" cli_disk=""
   local golden_digest="" golden_provision="" golden_provision_user=""
@@ -1280,6 +1437,8 @@ cmd_run() {
       --api-keys=*|-K=*) api_keys="$(abspath "${1#*=}")";;
       --proxy|-p) proxy="$PROXY_DEFAULT_URL";;
       --proxy=*|-p=*) proxy="${1#*=}";;
+      --traffic-audit|-T) traffic_audit=connect;;
+      --traffic-audit=*|-T=*) traffic_audit="${1#*=}";;
       --mount|-m) shift; extra_mounts+=("${1:?--mount needs PATH[:ro|:rw]}");;
       --mount=*|-m=*) extra_mounts+=("${1#*=}");;
       --copy|-C) shift; extra_copies+=("${1:?--copy needs SRC[:DEST]}");;
@@ -1295,6 +1454,10 @@ cmd_run() {
   done
   [[ $gui -eq 1 || ${#gui_command[@]} -eq 0 ]] || \
     die "-- is only valid with devbox gui"
+  case "$traffic_audit" in
+    ""|connect|off) ;;
+    *) die "--traffic-audit accepts connect or off";;
+  esac
   dir="$(abspath "${dir:-$PWD}")"
   [[ -d "$dir" ]] || die "not a directory: $dir"
   [[ $gui -eq 0 ]] || require_host_gui
@@ -1454,6 +1617,23 @@ cmd_run() {
     [[ -n "$api_keys"  ]] && apply_api_keys "$name" "$api_keys"
     [[ $with_creds -eq 1 ]] && apply_creds  "$name"
   fi
+
+  local managed_traffic_audit="$traffic_audit" traffic_proxy_endpoint=""
+  if [[ -z "$managed_traffic_audit" && $preexisting -eq 1 ]]; then
+    traffic_proxy_endpoint="$(stored_traffic_proxy_endpoint "$name" || true)"
+    if [[ -n "$traffic_proxy_endpoint" ]]; then
+      managed_traffic_audit=connect
+      log "Refreshing remembered proxy-or-fail traffic audit for $name"
+    fi
+  fi
+  case "$managed_traffic_audit" in
+    off) clear_connect_traffic_audit "$name";;
+    connect)
+      [[ -n "$traffic_proxy_endpoint" ]] || \
+        traffic_proxy_endpoint="${proxy:-$PROXY_DEFAULT_URL}"
+      proxy_ensure "$traffic_proxy_endpoint" || die "could not start traffic proxy"
+      apply_connect_traffic_audit "$name" "$traffic_proxy_endpoint";;
+  esac
   [[ $with_agent_config -eq 1 ]] && apply_agent_config "$name"
   if [[ ${#extra_copies[@]} -gt 0 ]]; then
     local c; for c in "${extra_copies[@]}"; do apply_copy "$name" "$c"; done
@@ -1488,7 +1668,7 @@ cmd_gui() { cmd_run --gui "$@"; }
 cmd_ls() { limactl list 2>/dev/null | awk 'NR==1 || $1 ~ /^devbox-/'; }
 
 cmd_proxy() {
-  local sub="${1:-status}" url="${DEVBOX_PROXY_URL:-$PROXY_DEFAULT_URL}" port pid
+  local sub="${1:-status}" url="${DEVBOX_PROXY_URL:-$PROXY_DEFAULT_URL}" port pid launcher audit_sub audit_arg
   port="$(proxy_port "$url")"
   case "$sub" in
     start)  proxy_ensure "$url";;
@@ -1500,7 +1680,16 @@ cmd_proxy() {
     status) if proxy_health "$port"; then log "AI proxy: RUNNING on 127.0.0.1:$port"
             elif proxy_port_open "$port"; then warn "port $port held by another (non-devbox) service"
             else log "AI proxy: not running (port $port)"; fi;;
-    *) die "usage: devbox proxy [start|stop|status]";;
+    audit) shift
+           audit_sub="${1:-show}"
+           launcher="$(proxy_launcher)" || die "proxy launcher not found"
+           case "$audit_sub" in
+             status) "$launcher" --audit-status;;
+             show) audit_arg="${2:-50}"; "$launcher" --audit-show "$audit_arg";;
+             export) audit_arg="${2:-}"; "$launcher" --audit-export "$audit_arg";;
+             *) die "usage: devbox proxy audit [status|show [LIMIT]|export [FILE]]";;
+           esac;;
+    *) die "usage: devbox proxy [start|stop|status|audit]";;
   esac
 }
 
@@ -1519,6 +1708,7 @@ cmd_destroy() {
     limactl stop -f "$i" 2>/dev/null || true
     limactl delete -f "$i"
     clear_gh_proxy_endpoint "$i"
+    clear_traffic_proxy_endpoint "$i"
   done <<< "$list"
 }
 

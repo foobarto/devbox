@@ -33,6 +33,7 @@ that it is authorized to use.
 |---|---|---|
 | `--ssh-agent` / `-s` | Request authentication and signatures using identities currently loaded in the host SSH agent. This includes SSH/Git access accepted by those identities and Devbox's SSH-format Git commit signing. | It cannot read or copy the private-key material from the agent. It does not gain access to unmounted host files or a host shell. |
 | `--proxy` / `-p` | Make requests through Devbox's configured AI and GitHub routes using the host account's authentication. It can consume quotas and create, read, modify, or upload remote data to the extent the authenticated provider account permits. | It does not receive the underlying API keys, OAuth tokens, or host `gh` token. The guest runs its own CLIs; it cannot run host commands through the proxy. |
+| `--traffic-audit` / `-T` | Send proxy-aware public web traffic through a short-lived generic CONNECT capability. Direct TCP/UDP 80/443 fails under the guest firewall; CONNECT audit records reveal destination, timing, and byte counts, while plaintext HTTP can be recorded in detail. | It grants no AI, GitHub, SSH, or host-login credential. HTTPS remains encrypted after CONNECT, and non-web ports remain outside the rule. The generic proxy refuses host/private/LAN destinations. |
 | `--gui` / `-G` | Become a Wayland client of the host session through Waypipe. | It does not receive the raw host Wayland socket or host GPU/render-device nodes. This is still a host-desktop capability, not an isolation boundary; see [GUI forwarding security](gui-security.md). |
 | `--with-agent-config` / `-g` | Read selected non-secret rules, prompts, settings, and custom agents copied into the guest. Those instructions can affect agent behavior. | Authentication state, histories, caches, key directories, and files detected as credentials are excluded. |
 | `--api-keys` / `-K` or `--with-creds` / `-c` | Read actual keys or copied OAuth credentials in the guest. | These deliberately weaken the host-only credential boundary. Prefer `--proxy` when the provider workflow supports it. |
@@ -70,6 +71,12 @@ guest does not receive an access or refresh token. The GitHub wrapper also
 rejects guest-side token-changing `gh auth` commands. See the [proxy
 design](../proxy/README.md).
 
+The host records detailed authenticated-proxy request audits by default,
+including prompts and GitHub mutation payloads. This helps attribute actions,
+but creates a second sensitive host-local data store. Read [proxy audit
+logging](proxy-audit.md) before using `--proxy` with secrets or confidential
+source material.
+
 Keeping a token out of the VM prevents a compromised guest from copying that
 token elsewhere. It does not prevent that guest from asking the proxy to make
 allowed API calls while the capability is active. Treat prompt text, source
@@ -86,12 +93,35 @@ or GitHub credentials. An agent running on the host can invoke the authenticated
 host CLIs directly, inspect accessible credential configuration, and modify the
 proxy's host-side configuration.
 
+## Proxy-or-fail web traffic audit
+
+`--traffic-audit=connect` is an explicit egress-control choice, not an implied
+part of `--proxy` or `-a`. It gives the guest a separate, short-lived capability
+to use the host proxy for public HTTP(S) destinations, exports the usual proxy
+variables, and blocks direct TCP/UDP web ports in the guest. This makes normal
+tools that ignore the proxy fail rather than silently bypassing the audit.
+
+For an agent inside the Devbox, the practical effect is a broad ability to send
+arbitrary public web requests through the host network; it does **not** expose
+host provider tokens, and CONNECT does not decrypt HTTPS prompts, paths, or
+bodies. A host agent can instead use any host browser, network client, local
+service, and credential the user can access. Neither situation should be
+treated as safe for untrusted code simply because its traffic is logged.
+
+The guest firewall is not a security boundary against a malicious process with
+guest root/sudo, which can remove it. Non-web traffic is also intentionally not
+blocked. Use this feature as a proxy-or-fail workflow guard for ordinary
+developer tooling; do not rely on it to contain hostile privileged code. The
+generic proxy rejects loopback, private, and link-local destinations so this
+capability cannot be used as a route to host or LAN web services. See [proxy
+audit logging](proxy-audit.md) for the retained data and limitations.
+
 ## Combining capabilities
 
-Capabilities compose. For example, `devbox --gui -a` grants non-secret agent
-configuration, provider request capability, SSH-agent operations, and host GUI
-access. A malicious project process can use every enabled capability; granting
-one does not make the others safer.
+Capabilities compose. For example, `devbox --gui -a -T` grants non-secret agent
+configuration, provider request capability, SSH-agent operations, host GUI
+access, and generic proxy-or-fail web egress. A malicious project process can
+use every enabled capability; granting one does not make the others safer.
 
 `-a` intentionally remains `--with-agent-config --proxy --ssh-agent` only.
 GUI forwarding must be added explicitly with `--gui` or `-G`.
@@ -120,4 +150,5 @@ capabilities you selected.
 4. For `--gui`, trust the application with host-desktop access; see the
    [GUI forwarding security guide](gui-security.md).
 5. Remove a capability when finished: exit and destroy the disposable box, or
-   re-enter a kept box with `--no-auth` to remove Devbox-managed proxy state.
+   re-enter a kept box with `--no-auth` to remove credential-proxy state and
+   `--traffic-audit=off` to remove proxy-or-fail traffic auditing.

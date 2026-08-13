@@ -82,6 +82,7 @@ devbox destroy NAME | --all | --goldens
 | `--keep`, `-k` | don't auto-delete the box on exit. |
 | `--ssh-agent`, `-s` | forward the host SSH agent into the box (git/GitHub) and configure signed Git commits. Host **private keys never enter the VM** — only the agent socket and selected public key are used. |
 | `--proxy[=URL]`, `-p[=URL]` | point the AI CLIs and `gh` at a host-side credential proxy; credentials stay on the host. Default `http://host.lima.internal:4141`. |
+| `--traffic-audit[=connect\|off]`, `-T` | explicitly route normal web tooling through an audited CONNECT proxy and block direct TCP/UDP 80/443. `off` removes it from a kept box. It is separate from `-a`. |
 | `--no-auth`, `-n` | explicitly disable Devbox-managed proxy, API-key, and copied-credential auth; removes its proxy/key profiles from an existing box. |
 | `--api-keys[=FILE]`, `-K[=FILE]` | inject API keys into the box from an env file (default `~/.config/devbox/api-keys.env`). |
 | `--with-creds`, `-c` | copy host AI-tool credential files into the box (OAuth logins for claude/codex without a proxy). Best-effort. |
@@ -197,6 +198,43 @@ enters the box. See
 recommended default for disposable boxes, and it auto-starts the host proxy
 (once, shared across boxes) — no separate launch step. Manage it with
 `devbox proxy [start|stop|status]`.
+
+Every authenticated proxy request is also written to a host-owned, owner-only
+audit log. It captures AI prompts/queries and GitHub API request payloads (with
+known credential fields redacted), then records the outcome and classifies
+GitHub writes such as create, modify, delete, and GraphQL mutations. Inspect it
+with `devbox proxy audit show`, or create a private self-contained report with
+`devbox proxy audit export [FILE]`. These logs can contain source snippets and
+prompt content; see [proxy audit logging](docs/proxy-audit.md) before enabling
+`--proxy` for sensitive work.
+
+### Opt-in web egress audit
+
+Use `--traffic-audit` when you want ordinary guest web tools to be auditable
+too, rather than only the built-in AI and GitHub authentication routes:
+
+```sh
+devbox --traffic-audit                 # equivalent to --traffic-audit=connect
+devbox --keep --traffic-audit          # renew a kept box's short-lived capability
+devbox --keep --traffic-audit=off      # remove its profile and guest firewall rule
+```
+
+It sets standard `HTTP(S)_PROXY`/`ALL_PROXY` variables with a short-lived
+Devbox capability, then rejects direct TCP and UDP traffic to ports 80 and 443
+inside the guest. Proxy-aware HTTPS traffic therefore uses CONNECT; its audit
+record contains destination, timing, and byte counts, but not encrypted paths
+or request bodies. Plain HTTP proxy requests can be recorded in detail because
+they are not encrypted. Tools that ignore proxy variables, use certificate
+pinning, or use non-web ports can fail or fall outside this coverage. The
+generic proxy accepts only public destinations, so it cannot be used to reach
+host loopback or private-network web services.
+
+This is intentionally explicit and is not included in `-a`. It is an egress
+guard for normal guest applications, not a containment boundary against a
+process that has guest root/sudo and can remove the guest firewall. See
+[proxy audit logging](docs/proxy-audit.md) and [agent capability
+security](docs/agent-capabilities-security.md) before granting it to untrusted
+code.
 
 For `gh`, log in once on the host with `gh auth login`; `devbox --proxy` gives
 the guest CLI a dummy routing marker plus a short-lived Devbox proxy capability,

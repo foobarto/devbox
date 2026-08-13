@@ -20,8 +20,11 @@ Config: JSON at $DEVBOX_PROXY_CONFIG (defaults to proxy.config.example.json next
 to this file). See that file for the shape.
 """
 import base64
+import hashlib
+import html
 import hmac
 import http.client
+import ipaddress
 import json
 import os
 import select
@@ -52,6 +55,28 @@ ROUTES = CONFIG.get("routes", [])
 STATE_DIR = os.path.expanduser(
     os.environ.get("DEVBOX_PROXY_STATE_DIR", os.path.join("~", ".config", "devbox"))
 )
+_AUDIT_CONFIG = CONFIG.get("audit", {})
+if not isinstance(_AUDIT_CONFIG, dict):
+    _AUDIT_CONFIG = {}
+_audit_enabled = os.environ.get("DEVBOX_PROXY_AUDIT")
+AUDIT_ENABLED = (
+    _AUDIT_CONFIG.get("enabled", True)
+    if _audit_enabled is None
+    else _audit_enabled.lower() not in ("0", "false", "no", "off")
+)
+AUDIT_PATH = os.path.abspath(os.path.expanduser(os.environ.get(
+    "DEVBOX_PROXY_AUDIT_PATH",
+    _AUDIT_CONFIG.get("path", os.path.join(STATE_DIR, "proxy-audit.jsonl")),
+)))
+try:
+    AUDIT_MAX_BODY_BYTES = max(
+        0,
+        int(os.environ.get("DEVBOX_PROXY_AUDIT_MAX_BODY_BYTES", _AUDIT_CONFIG.get("max_body_bytes", 1048576))),
+    )
+except (TypeError, ValueError):
+    AUDIT_MAX_BODY_BYTES = 1048576
+AUDIT_SCHEMA = "devbox.proxy.audit/v1"
+_AUDIT_LOCK = threading.Lock()
 
 # OAuth credentials stay on the host. Access tokens are reread for every
 # request, refreshed before expiry, and retried once after an auth failure.
@@ -70,14 +95,234 @@ REFRESH_POLL_SECONDS = 60
 _REFRESH_LOCKS = {"anthropic": threading.Lock(), "openai": threading.Lock()}
 _GITHUB_CERT_LOCK = threading.Lock()
 _GITHUB_CAPABILITY_LOCK = threading.Lock()
+_TRAFFIC_CAPABILITY_LOCK = threading.Lock()
 GITHUB_MITM_HOSTS = {"api.github.com", "uploads.github.com"}
 GITHUB_PROXY_TOKEN_TTL_SECONDS = 8 * 60 * 60
+TRAFFIC_PROXY_TOKEN_TTL_SECONDS = 8 * 60 * 60
 
 # hop-by-hop + length/host headers we never forward verbatim
 DROP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "content-length", "host",
 }
+
+# Audit records intentionally omit all request headers. Redact the credential
+# fields that may occur in JSON request bodies too, while preserving prompts,
+# GitHub payloads, and a hash of the original bytes for forensic correlation.
+AUDIT_SECRET_KEYS = {
+    "access_token", "api_key", "authorization", "client_secret", "cookie",
+    "password", "proxy_authorization", "refresh_token", "secret", "token",
+}
+
+
+def _audit_key_is_secret(key: object) -> bool:
+    normalized = str(key).lower().replace("-", "_")
+    return normalized in AUDIT_SECRET_KEYS or normalized.endswith("_token") or normalized.endswith("_secret")
+
+
+def _redact_audit_value(value):
+    if isinstance(value, dict):
+        return {
+            str(key): "[redacted]" if _audit_key_is_secret(key) else _redact_audit_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_audit_value(item) for item in value]
+    return value
+
+
+def audit_body(body: bytes | None, content_type: str = "") -> dict | None:
+    """Capture a request payload without retaining headers or known secrets."""
+    if body is None:
+        return None
+    captured = body[:AUDIT_MAX_BODY_BYTES]
+    record = {
+        "bytes": len(body),
+        "sha256": hashlib.sha256(body).hexdigest(),
+        "truncated": len(captured) != len(body),
+    }
+    if not captured:
+        return record
+    try:
+        text = captured.decode("utf-8")
+    except UnicodeDecodeError:
+        record["encoding"] = "binary"
+        return record
+    media_type = content_type.partition(";")[0].strip().lower()
+    if not record["truncated"] and (media_type.endswith("/json") or media_type.endswith("+json")):
+        try:
+            record["json"] = _redact_audit_value(json.loads(text))
+            return record
+        except json.JSONDecodeError:
+            pass
+    record["text"] = text
+    return record
+
+
+def audit_action(method: str, path: str, body: bytes | None) -> tuple[str, bool]:
+    """Classify the externally observable operation without guessing its result."""
+    method = method.upper()
+    if path.rstrip("/") == "/graphql" and method == "POST":
+        try:
+            payload = json.loads((body or b"").decode("utf-8"))
+            query = payload.get("query", "") if isinstance(payload, dict) else ""
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            query = ""
+        operation = query.lstrip().lower()
+        if operation.startswith("mutation"):
+            return "graphql-mutation", True
+        if operation.startswith(("query", "subscription", "{")):
+            return "graphql-query", False
+        return "graphql-operation", False
+    if method in ("GET", "HEAD", "OPTIONS"):
+        return "read", False
+    if method == "POST":
+        return "create-or-action", True
+    if method in ("PUT", "PATCH"):
+        return "modify", True
+    if method == "DELETE":
+        return "delete", True
+    return "other", False
+
+
+def audit_request_target(target: str) -> tuple[str, list[str]]:
+    """Preserve the action path but never persist possibly-secret query values."""
+    parsed = urlsplit(target)
+    query_keys = sorted({part.partition("=")[0] for part in parsed.query.split("&") if part})
+    return parsed.path or "/", query_keys
+
+
+def build_audit_event(
+    *, method: str, target: str, upstream, body: bytes | None, content_type: str,
+    source: str, provider: str, client: str, status: int, duration_ms: int,
+    response_bytes: int = 0, attempts: int = 1, error: str = "", websocket: bool = False,
+) -> dict:
+    path, query_keys = audit_request_target(target)
+    action, mutating = audit_action(method, path, body)
+    request = {
+        "method": method,
+        "path": path,
+        "query_keys": query_keys,
+        "action": action,
+        "mutating": mutating,
+        "body": audit_body(body, content_type),
+    }
+    return {
+        "schema": AUDIT_SCHEMA,
+        "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "source": source,
+        "client": client,
+        "upstream": {"scheme": upstream.scheme, "host": upstream.hostname, "port": upstream.port},
+        "provider": provider or None,
+        "request": request,
+        "response": {
+            "status": status,
+            "bytes": response_bytes,
+            "duration_ms": duration_ms,
+            "attempts": attempts,
+            "websocket": websocket,
+            "error": error or None,
+        },
+    }
+
+
+def write_audit_event(event: dict) -> None:
+    """Append a host-only JSONL record without ever exposing it to the guest."""
+    if not AUDIT_ENABLED:
+        return
+    directory = os.path.dirname(AUDIT_PATH)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    encoded = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    with _AUDIT_LOCK:
+        descriptor = os.open(AUDIT_PATH, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as audit_file:
+                audit_file.write(encoded)
+            descriptor = -1
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
+def read_audit_events() -> list[dict]:
+    """Read valid JSONL entries, skipping a partial final line after a crash."""
+    try:
+        events = []
+        with open(AUDIT_PATH, encoding="utf-8") as audit_file:
+            for line in audit_file:
+                if not line.strip():
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # An abrupt host shutdown can leave a final partial line.
+                    continue
+        return events
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"could not read proxy audit log: {exc}") from exc
+
+
+def audit_status() -> dict:
+    try:
+        size = os.stat(AUDIT_PATH).st_size
+    except FileNotFoundError:
+        size = 0
+    return {
+        "enabled": AUDIT_ENABLED,
+        "path": AUDIT_PATH,
+        "max_body_bytes": AUDIT_MAX_BODY_BYTES,
+        "bytes": size,
+    }
+
+
+def audit_html(events: list[dict]) -> str:
+    """Render a self-contained, escaped report. Its contents are sensitive."""
+    mutations = sum(bool(event.get("request", {}).get("mutating")) for event in events)
+    rows = []
+    for event in reversed(events):
+        request = event.get("request", {})
+        response = event.get("response", {})
+        upstream = event.get("upstream", {})
+        payload = json.dumps(request.get("body"), ensure_ascii=False, indent=2, sort_keys=True)
+        rows.append(
+            "<tr class=\"%s\"><td>%s</td><td>%s</td><td>%s</td><td>%s %s</td>"
+            "<td>%s</td><td>%s</td><td><details><summary>payload</summary><pre>%s</pre></details></td></tr>"
+            % (
+                "mutation" if request.get("mutating") else "read",
+                html.escape(str(event.get("timestamp", ""))),
+                html.escape(str(event.get("provider") or event.get("source", ""))),
+                html.escape(str(upstream.get("host", ""))),
+                html.escape(str(request.get("method", ""))),
+                html.escape(str(request.get("path", ""))),
+                html.escape(str(request.get("action", ""))),
+                html.escape(str(response.get("status", ""))),
+                html.escape(payload),
+            )
+        )
+    return """<!doctype html>
+<meta charset=\"utf-8\"><title>Devbox proxy audit</title>
+<style>body{font:14px system-ui;margin:2rem;background:#111;color:#eee}table{border-collapse:collapse;width:100%%}th,td{border:1px solid #555;padding:.5rem;text-align:left;vertical-align:top}.mutation{background:#3b1d1d}pre{white-space:pre-wrap;word-break:break-word;max-width:72rem}summary{cursor:pointer}</style>
+<h1>Devbox proxy audit</h1><p>%d request(s); %d mutating request(s). This report can contain prompts, source snippets, and GitHub payloads. Keep it private.</p>
+<table><thead><tr><th>Time</th><th>Provider</th><th>Host</th><th>Request</th><th>Action</th><th>Status</th><th>Captured request payload</th></tr></thead><tbody>%s</tbody></table>
+""" % (len(events), mutations, "".join(rows))
+
+
+def write_audit_html(path: str) -> str:
+    destination = os.path.abspath(os.path.expanduser(path or os.path.join(STATE_DIR, "proxy-audit.html")))
+    os.makedirs(os.path.dirname(destination), mode=0o700, exist_ok=True)
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as report_file:
+            report_file.write(audit_html(read_audit_events()).encode("utf-8"))
+        descriptor = -1
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return destination
 
 
 def resolve_source(source: str) -> str:
@@ -484,6 +729,176 @@ def github_proxy_authorized(headers) -> bool:
     return bool(separator) and not password and valid_github_proxy_token(username)
 
 
+def traffic_proxy_key_path() -> str:
+    return os.path.join(STATE_DIR, "traffic-proxy-capability-key")
+
+
+def traffic_proxy_key() -> bytes:
+    """Load or create the host-only key for generic traffic-audit grants."""
+    with _TRAFFIC_CAPABILITY_LOCK:
+        path = traffic_proxy_key_path()
+        try:
+            with open(path, "rb") as key_file:
+                key = key_file.read()
+            if len(key) >= 32:
+                return key
+        except OSError:
+            pass
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        key = secrets.token_bytes(32)
+        descriptor, temporary = tempfile.mkstemp(prefix=".devbox-traffic-capability-", dir=STATE_DIR)
+        try:
+            with os.fdopen(descriptor, "wb") as key_file:
+                key_file.write(key)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+        return key
+
+
+def issue_traffic_proxy_token() -> str:
+    """Issue a VM-only generic HTTP(S) CONNECT capability, never a host token."""
+    payload = json.dumps(
+        {"aud": "devbox-traffic", "exp": int(time.time()) + TRAFFIC_PROXY_TOKEN_TTL_SECONDS},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded = _base64url(payload)
+    signature = hmac.new(traffic_proxy_key(), encoded.encode("ascii"), "sha256").digest()
+    return f"{encoded}.{_base64url(signature)}"
+
+
+def valid_traffic_proxy_token(token: str) -> bool:
+    try:
+        encoded, signature = token.split(".", 1)
+        expected = hmac.new(traffic_proxy_key(), encoded.encode("ascii"), "sha256").digest()
+        if not hmac.compare_digest(_base64url_decode(signature), expected):
+            return False
+        payload = json.loads(_base64url_decode(encoded))
+        return payload.get("aud") == "devbox-traffic" and int(payload.get("exp", 0)) >= int(time.time())
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, OSError):
+        return False
+
+
+def traffic_proxy_authorized(headers) -> bool:
+    """Validate a time-limited generic CONNECT capability from a Devbox."""
+    authorization = headers.get("Proxy-Authorization", "")
+    if not authorization.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(authorization[6:], validate=True).decode("utf-8")
+        username, separator, password = decoded.partition(":")
+    except (ValueError, UnicodeError):
+        return False
+    return bool(separator) and not password and valid_traffic_proxy_token(username)
+
+
+def traffic_connect_target(authority: str) -> tuple[str, int] | None:
+    """Allow the capability only to make web CONNECT tunnels on ports 80/443."""
+    try:
+        parsed = urlsplit("//" + authority)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        return None
+    if not host or parsed.username or parsed.password or port not in (80, 443):
+        return None
+    return host, port
+
+
+def traffic_http_target(target: str) -> tuple[str, int, str] | None:
+    """Parse an ordinary HTTP proxy request, limited to port 80.
+
+    HTTPS clients use CONNECT. Plain HTTP proxy clients use an absolute-form
+    request target instead, so accepting this form avoids an unnecessary
+    compatibility hole while retaining the same capability and target checks.
+    """
+    try:
+        parsed = urlsplit(target)
+        host, port = parsed.hostname, parsed.port or 80
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "http" or not host or parsed.username or parsed.password
+        or port != 80 or parsed.fragment
+    ):
+        return None
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    return host, port, path
+
+
+def open_traffic_connection(host: str, port: int) -> socket.socket:
+    """Connect only to an address that cannot pivot through the host proxy.
+
+    Resolve once and connect to the selected numeric address.  This prevents a
+    hostname from resolving publicly during validation and privately during a
+    later connection (DNS rebinding), while keeping the original hostname for
+    the client's TLS SNI inside a CONNECT tunnel.
+    """
+    errors: list[OSError] = []
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise OSError(f"could not resolve traffic destination: {exc}") from exc
+    for family, socktype, protocol, _, sockaddr in addresses:
+        try:
+            address = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            continue
+        # Generic guest traffic must not turn the host proxy into access to its
+        # loopback, LAN, or link-local services.  `is_global` rejects all such
+        # ranges and other special-use addresses.
+        if not address.is_global:
+            continue
+        connection = socket.socket(family, socktype, protocol)
+        connection.settimeout(30)
+        try:
+            connection.connect(sockaddr)
+            return connection
+        except OSError as exc:
+            errors.append(exc)
+            connection.close()
+    if errors:
+        raise OSError(f"could not connect to public traffic destination: {errors[-1]}")
+    raise OSError("traffic destination has no public IP address")
+
+
+def build_connect_audit_event(
+    *, client: str, host: str, port: int, status: int, duration_ms: int,
+    request_bytes: int = 0, response_bytes: int = 0, error: str = "",
+) -> dict:
+    return {
+        "schema": AUDIT_SCHEMA,
+        "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "source": "traffic-connect",
+        "client": client,
+        "upstream": {"scheme": "https" if port == 443 else "http", "host": host, "port": port},
+        "provider": None,
+        "request": {
+            "method": "CONNECT",
+            "path": "/",
+            "query_keys": [],
+            "action": "opaque-connect",
+            "mutating": False,
+            "body": None,
+        },
+        "response": {
+            "status": status,
+            "bytes": response_bytes,
+            "request_bytes": request_bytes,
+            "duration_ms": duration_ms,
+            "attempts": 1,
+            "websocket": False,
+            "error": error or None,
+        },
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "devbox-ai-proxy"
@@ -549,6 +964,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _relay_socket(self, upstream):
         sockets = (self.connection, upstream)
+        request_bytes = response_bytes = 0
         try:
             while True:
                 readable, _, _ = select.select(sockets, (), (), 600)
@@ -557,16 +973,58 @@ class Handler(BaseHTTPRequestHandler):
                 for source in readable:
                     data = source.recv(65536)
                     if not data:
-                        return
-                    (upstream if source is self.connection else self.connection).sendall(data)
+                        return request_bytes, response_bytes
+                    if source is self.connection:
+                        request_bytes += len(data)
+                        upstream.sendall(data)
+                    else:
+                        response_bytes += len(data)
+                        self.connection.sendall(data)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
             upstream.close()
             self.close_connection = True
+        return request_bytes, response_bytes
 
     def _connect(self):
-        """Support only GitHub HTTPS CONNECT traffic from the guest `gh` wrapper."""
+        """Handle capability-scoped generic web tunnels and GitHub `gh` tunnels."""
+        traffic_target = traffic_connect_target(self.path)
+        if traffic_target and traffic_proxy_authorized(self.headers):
+            hostname, port = traffic_target
+            started = time.monotonic()
+            try:
+                upstream = open_traffic_connection(hostname, port)
+            except OSError as exc:
+                self.send_error(502, "traffic CONNECT error: %s" % exc)
+                try:
+                    write_audit_event(build_connect_audit_event(
+                        client=self.client_address[0] if self.client_address else "",
+                        host=hostname,
+                        port=port,
+                        status=502,
+                        duration_ms=round((time.monotonic() - started) * 1000),
+                        error="connect-error",
+                    ))
+                except Exception as audit_exc:
+                    sys.stderr.write(f"[devbox-ai-proxy] audit write failed: {audit_exc}\n")
+                return
+            self.send_response(200, "Connection Established")
+            self.end_headers()
+            request_bytes, response_bytes = self._relay_socket(upstream)
+            try:
+                write_audit_event(build_connect_audit_event(
+                    client=self.client_address[0] if self.client_address else "",
+                    host=hostname,
+                    port=port,
+                    status=200,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    request_bytes=request_bytes,
+                    response_bytes=response_bytes,
+                ))
+            except Exception as audit_exc:
+                sys.stderr.write(f"[devbox-ai-proxy] audit write failed: {audit_exc}\n")
+            return
         target = github_connect_target(self.path)
         if target is None:
             self.send_error(403, "CONNECT is limited to GitHub HTTPS hosts")
@@ -628,6 +1086,10 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             self.close_connection = True
             return
+        traffic_target = traffic_http_target(self.path)
+        if traffic_target is not None:
+            self._traffic_http_proxy(*traffic_target)
+            return
         github_host = getattr(self, "_github_connect_host", "")
         route = (
             {"upstream": f"https://{github_host}", "auth": {"source": "auto:github"}}
@@ -641,6 +1103,33 @@ class Handler(BaseHTTPRequestHandler):
 
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else None
+        audit_started = time.monotonic()
+        audit_source = "github-connect" if github_host else "auth-proxy"
+        client = self.client_address[0] if self.client_address else ""
+
+        def audit_outcome(
+            status: int, provider: str = "", error: str = "", response_bytes: int = 0,
+            attempts: int = 1, websocket: bool = False,
+        ) -> None:
+            try:
+                write_audit_event(build_audit_event(
+                    method=self.command,
+                    target=self.path,
+                    upstream=up,
+                    body=body,
+                    content_type=self.headers.get("Content-Type", ""),
+                    source=audit_source,
+                    provider=provider,
+                    client=client,
+                    status=status,
+                    duration_ms=round((time.monotonic() - audit_started) * 1000),
+                    response_bytes=response_bytes,
+                    attempts=attempts,
+                    error=error,
+                    websocket=websocket,
+                ))
+            except Exception as exc:
+                sys.stderr.write(f"[devbox-ai-proxy] audit write failed: {exc}\n")
 
         strip = {h.lower() for h in (route.get("strip_headers") or [])}
         incoming_headers = {
@@ -674,10 +1163,12 @@ class Handler(BaseHTTPRequestHandler):
 
         is_websocket = self.headers.get("Upgrade", "").lower() == "websocket"
         if is_websocket:
+            attempts = 1
             try:
                 headers, provider = request_headers(websocket=True)
                 if headers is None:
                     self.send_error(503, "authentication source is unavailable")
+                    audit_outcome(503, error="authentication-unavailable", websocket=True)
                     return
                 conn, status, response = self._open_websocket(up, headers)
                 if status in (401, 403) and provider:
@@ -685,14 +1176,18 @@ class Handler(BaseHTTPRequestHandler):
                     headers, _ = request_headers(force_refresh=True, websocket=True)
                     if headers is None:
                         self.send_error(503, "OAuth refresh failed")
+                        audit_outcome(503, provider, "oauth-refresh-failed", attempts=2, websocket=True)
                         return
                     conn, status, response = self._open_websocket(up, headers)
+                    attempts = 2
             except Exception as exc:
                 self.send_error(502, "WebSocket upstream error: %s" % exc)
+                audit_outcome(502, error="websocket-upstream-error", attempts=attempts, websocket=True)
                 return
             try:
                 self.connection.sendall(response)
                 if status == 101:
+                    audit_outcome(status, provider, response_bytes=len(response), attempts=attempts, websocket=True)
                     self._relay_socket(conn)
                     return
             except (BrokenPipeError, ConnectionResetError, OSError):
@@ -700,12 +1195,14 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 if status != 101:
                     conn.close()
+            audit_outcome(status, provider, response_bytes=len(response), attempts=attempts, websocket=True)
             self.close_connection = True
             return
 
         headers, provider = request_headers()
         if headers is None:
             self.send_error(503, "authentication source is unavailable")
+            audit_outcome(503, error="authentication-unavailable")
             return
 
         def upstream_request(request_headers):
@@ -721,6 +1218,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             conn, resp = upstream_request(headers)
+            attempts = 1
             # OAuth access tokens can be revoked between the preflight and this
             # request. Refresh once and replay only the failed request.
             if resp.status in (401, 403) and provider:
@@ -729,10 +1227,13 @@ class Handler(BaseHTTPRequestHandler):
                 headers, _ = request_headers(force_refresh=True)
                 if headers is None:
                     self.send_error(503, "OAuth refresh failed")
+                    audit_outcome(503, provider, "oauth-refresh-failed", attempts=2)
                     return
                 conn, resp = upstream_request(headers)
+                attempts = 2
         except Exception as exc:  # upstream unreachable / TLS / etc.
             self.send_error(502, "upstream error: %s" % exc)
+            audit_outcome(502, provider, "upstream-error")
             return
 
         # Stream back with Connection: close (no re-chunking; works for SSE).
@@ -743,17 +1244,94 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.send_header("Connection", "close")
         self.end_headers()
+        response_bytes = 0
         try:
             while True:
                 chunk = resp.read(65536)
                 if not chunk:
                     break
+                response_bytes += len(chunk)
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
             conn.close()
+            audit_outcome(resp.status, provider, response_bytes=response_bytes, attempts=attempts)
+        self.close_connection = True
+
+    def _traffic_http_proxy(self, hostname: str, port: int, path: str) -> None:
+        """Forward plain HTTP through the generic capability-scoped proxy."""
+        if not traffic_proxy_authorized(self.headers):
+            self.send_response(407, "Devbox traffic proxy authentication required")
+            self.send_header("Proxy-Authenticate", 'Basic realm="devbox-traffic"')
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            return
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length) if length else None
+        started = time.monotonic()
+        client = self.client_address[0] if self.client_address else ""
+        upstream_url = urlsplit(f"http://{hostname}:{port}")
+
+        def audit_outcome(status: int, error: str = "", response_bytes: int = 0) -> None:
+            try:
+                write_audit_event(build_audit_event(
+                    method=self.command,
+                    target=self.path,
+                    upstream=upstream_url,
+                    body=body,
+                    content_type=self.headers.get("Content-Type", ""),
+                    source="traffic-http",
+                    provider="",
+                    client=client,
+                    status=status,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    response_bytes=response_bytes,
+                    error=error,
+                ))
+            except Exception as audit_exc:
+                sys.stderr.write(f"[devbox-ai-proxy] audit write failed: {audit_exc}\n")
+
+        try:
+            upstream_socket = open_traffic_connection(hostname, port)
+            connection = http.client.HTTPConnection(hostname, port, timeout=600)
+            connection.sock = upstream_socket
+            connection.putrequest(self.command, path, skip_host=True, skip_accept_encoding=True)
+            for header, value in self.headers.items():
+                if header.lower() not in DROP and header.lower() != "proxy-connection":
+                    connection.putheader(header, value)
+            connection.putheader("Host", hostname)
+            if body is not None:
+                connection.putheader("Content-Length", str(len(body)))
+            connection.endheaders(body)
+            response = connection.getresponse()
+        except Exception as exc:
+            self.send_error(502, "traffic HTTP error: %s" % exc)
+            audit_outcome(502, "upstream-error")
+            return
+
+        self.send_response(response.status, response.reason)
+        for header, value in response.getheaders():
+            if header.lower() not in DROP:
+                self.send_header(header, value)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        response_bytes = 0
+        try:
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                response_bytes += len(chunk)
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            connection.close()
+            audit_outcome(response.status, response_bytes=response_bytes)
         self.close_connection = True
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _proxy
@@ -761,12 +1339,36 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    if sys.argv[1:] == ["--init-gh-ca"]:
+    args = sys.argv[1:]
+    if args == ["--init-gh-ca"]:
         ca_path, _, _ = ensure_github_certificates()
         print(ca_path)
         return
-    if sys.argv[1:] == ["--new-gh-proxy-token"]:
+    if args == ["--new-gh-proxy-token"]:
         print(issue_github_proxy_token())
+        return
+    if args == ["--new-traffic-proxy-token"]:
+        print(issue_traffic_proxy_token())
+        return
+    if args == ["--audit-status"]:
+        print(json.dumps(audit_status(), sort_keys=True))
+        return
+    if args[:1] == ["--audit-show"]:
+        if len(args) > 2:
+            raise SystemExit("usage: devbox-ai-proxy --audit-show [LIMIT]")
+        try:
+            limit = int(args[1]) if len(args) == 2 else 50
+        except ValueError as exc:
+            raise SystemExit("audit LIMIT must be a non-negative integer") from exc
+        if limit < 0:
+            raise SystemExit("audit LIMIT must be a non-negative integer")
+        for event in read_audit_events()[-limit:]:
+            print(json.dumps(event, ensure_ascii=False, sort_keys=True))
+        return
+    if args[:1] == ["--audit-export"]:
+        if len(args) > 2:
+            raise SystemExit("usage: devbox-ai-proxy --audit-export [FILE]")
+        print(write_audit_html(args[1] if len(args) == 2 else ""))
         return
     srv = ThreadingHTTPServer((BIND_HOST, BIND_PORT), Handler)
     sys.stderr.write(

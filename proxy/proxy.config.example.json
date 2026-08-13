@@ -15,6 +15,13 @@
     "  OPENAI_BASE_URL=http://host.lima.internal:4141/v1"
   ],
 
+  "audit": {
+    "_comment": "Host-only detailed request audit. It records AI prompts/queries and GitHub API payloads, with known credential fields redacted. Keep the 0600 JSONL file private; set enabled false to disable.",
+    "enabled": true,
+    "path": "~/.config/devbox/proxy-audit.jsonl",
+    "max_body_bytes": 1048576
+  },
+
   "routes": [
     {
       "_comment": "Anthropic / Claude — automatic mode. It prefers a host-side ANTHROPIC_API_KEY when configured, otherwise uses the host Claude Code OAuth login. The access token is read fresh on every request.",
