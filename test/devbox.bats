@@ -156,6 +156,17 @@ setup() {
   grep -q 'brew install herdr' "$tmp"
 }
 
+@test "golden yaml includes the Stado Linux sandbox helpers and scoped Ubuntu bwrap policy" {
+  tmp="$BATS_TEST_TMPDIR/g.yaml"
+  emit_golden_yaml ubuntu-24.04 "$tmp"
+  grep -q 'bubblewrap passt apparmor apparmor-profiles' "$tmp"
+  grep -q 'apparmor_restrict_unprivileged_userns' "$tmp"
+  grep -q 'bwrap-userns-restrict' "$tmp"
+  grep -q '/usr/share/apparmor/extra-profiles/bwrap-userns-restrict' "$tmp"
+  grep -q '/usr/sbin/apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict' "$tmp"
+  ! grep -q 'apparmor_restrict_unprivileged_userns=0' "$tmp"
+}
+
 @test "golden yaml installs Waypipe through every supported guest package manager" {
   tmp="$BATS_TEST_TMPDIR/g.yaml"
   emit_golden_yaml ubuntu-24.04 "$tmp"
@@ -183,6 +194,13 @@ setup() {
   [[ "$source_text" == *'ssh-keygen -F github.com'* ]]
   [[ "$source_text" == *"grep -c '^github.com '"* ]]
   [[ "$source_text" == *'Golden verification failed; removing unusable'* ]]
+}
+
+@test "golden verification exercises Stado's Linux sandbox helpers" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *'for t in brew gh claude codex opencode pi herdr stado bwrap pasta'* ]]
+  [[ "$source_text" == *'bwrap --unshare-user --unshare-net --uid 0 --gid 0'* ]]
+  [[ "$source_text" == *'pasta --help 2>&1 | grep -q -- "--splice-only"'* ]]
 }
 
 @test "generated golden yaml validates with limactl" {

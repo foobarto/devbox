@@ -433,12 +433,26 @@ provision:
     RESOLVER
       systemctl restart systemd-resolved
     fi
-    apt="build-essential git curl wget jq ripgrep unzip ca-certificates procps file locales sudo python3 python3-venv python3-pip waypipe nftables"
-    dnf="@development-tools git curl wget jq ripgrep unzip ca-certificates procps-ng file glibc-langpack-en sudo python3 python3-pip waypipe nftables"
-    pac="base-devel git curl wget jq ripgrep unzip ca-certificates procps-ng file sudo python python-pip waypipe nftables"
+    apt="build-essential git curl wget jq ripgrep unzip ca-certificates procps file locales sudo python3 python3-venv python3-pip waypipe nftables bubblewrap passt apparmor apparmor-profiles"
+    dnf="@development-tools git curl wget jq ripgrep unzip ca-certificates procps-ng file glibc-langpack-en sudo python3 python3-pip waypipe nftables bubblewrap passt"
+    pac="base-devel git curl wget jq ripgrep unzip ca-certificates procps-ng file sudo python python-pip waypipe nftables bubblewrap passt"
     if   command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y --no-install-recommends $apt
     elif command -v dnf     >/dev/null 2>&1; then dnf install -y $dnf
     elif command -v pacman  >/dev/null 2>&1; then pacman -Sy --noconfirm $pac
+    fi
+    # Ubuntu 24.04 restricts unprivileged user namespaces through a generic
+    # AppArmor policy. Stado's Linux sandbox needs bwrap to construct private
+    # mount/pid/network namespaces. Enable AppArmor's dedicated bwrap policy:
+    # it permits bwrap's short-lived setup capabilities, then stacks a more
+    # restrictive profile on the sandboxed child. Do not weaken the global
+    # restriction: standalone unshare remains unavailable.
+    if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] \
+       && [[ "$(</proc/sys/kernel/apparmor_restrict_unprivileged_userns)" == 1 ]] \
+       && [[ -x /usr/sbin/apparmor_parser ]] \
+       && [[ -r /usr/share/apparmor/extra-profiles/bwrap-userns-restrict ]]; then
+      install -D -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+        /etc/apparmor.d/bwrap-userns-restrict
+      /usr/sbin/apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
     fi
 - mode: user
   script: |
@@ -539,13 +553,24 @@ verify_golden() {
   local name="$1" out host_keys
   # shellcheck disable=SC2016 # $t and $(...) expand in the guest shell.
   out="$(limactl shell "$name" -- bash -lc '
-    for t in brew gh claude codex opencode pi herdr stado; do
+    for t in brew gh claude codex opencode pi herdr stado bwrap pasta; do
       if command -v "$t" >/dev/null 2>&1; then printf "  ok   %-9s %s\n" "$t" "$(command -v "$t")"
       else printf "  MISS %-9s (not on PATH)\n" "$t"; fi
     done' </dev/null 2>/dev/null || true)"
   printf '%s\n' "$out" >&2
   if printf '%s' "$out" | grep -q MISS; then
     warn "some tools missing in golden — inspect with: limactl shell $name"
+  fi
+  # Stado's Linux sandbox uses bwrap for process/filesystem isolation and
+  # `pasta --splice-only` for proxy-only host allowlist networking. Exercise
+  # both in the golden: Ubuntu's AppArmor exception is deliberately scoped to
+  # bwrap, so a standalone `unshare` probe would correctly remain blocked.
+  if ! limactl shell "$name" -- bash -lc '
+    bwrap --unshare-user --unshare-net --uid 0 --gid 0 --ro-bind / / true
+    pasta --help 2>&1 | grep -q -- "--splice-only"
+  ' </dev/null 2>/dev/null; then
+    warn "golden sandbox prerequisites are unusable (bwrap/pasta)"
+    return 1
   fi
   # shellcheck disable=SC2016 # $HOME expands in the guest shell.
   host_keys="$(limactl shell "$name" -- bash -lc '
