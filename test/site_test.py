@@ -30,10 +30,16 @@ class WebsiteTests(TestCase):
         self.assertTrue(page.is_file())
         parser = PageParser()
         parser.feed(page.read_text(encoding="utf-8"))
-        self.assertTrue({"top", "main", "how", "capabilities", "flags", "manifest"} <= parser.ids)
+        self.assertTrue({"top", "main", "how", "capabilities", "audit", "flags", "manifest"} <= parser.ids)
         for asset in ("assets/site.css", "assets/site.js", "assets/favicon.svg"):
             self.assertIn(asset, parser.links)
             self.assertTrue((SITE / asset).is_file())
+
+    def test_site_explains_detailed_and_connect_audit_boundaries(self):
+        page = (SITE / "index.html").read_text(encoding="utf-8")
+        self.assertIn("devbox proxy audit export audit.html", page)
+        self.assertIn("GitHub writes are classified as create, modify, delete", page)
+        self.assertIn("HTTPS paths, prompts, and bodies remain end-to-end encrypted", page)
 
     def test_pages_workflow_publishes_only_the_website_directory(self):
         workflow = (ROOT / ".github/workflows/deploy-pages.yml").read_text(encoding="utf-8")

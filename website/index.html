@@ -32,6 +32,7 @@
       <nav id="site-nav" class="site-nav" aria-label="Main navigation">
         <a href="#how">How it works</a>
         <a href="#capabilities">Capabilities</a>
+        <a href="#audit">Audits</a>
         <a href="#flags">Flags</a>
         <a href="#manifest">Manifest</a>
         <a class="github-link" href="https://github.com/foobarto/devbox">GitHub <span aria-hidden="true">↗</span></a>
@@ -102,7 +103,7 @@
           </article>
           <article class="capability">
             <p class="capability-number">02</p><h3>Authenticated provider requests</h3>
-            <p>The host proxy makes permitted AI and GitHub requests without putting the underlying host tokens in the VM.</p>
+            <p>The host proxy makes permitted AI and GitHub requests without putting the underlying host tokens in the VM—and records the requested action.</p>
             <code>--proxy</code>
           </article>
           <article class="capability">
@@ -132,6 +133,34 @@
           </article>
         </div>
         <p class="security-note">Capabilities combine. A malicious process can use every capability you enable; use the smallest set that lets the task work. <a href="https://github.com/foobarto/devbox/blob/main/docs/agent-capabilities-security.md">Read the threat model <span aria-hidden="true">→</span></a></p>
+      </section>
+
+      <section id="audit" class="audit section">
+        <div class="shell audit-layout">
+          <div class="audit-copy">
+            <p class="eyebrow">HOST-LOCAL AUDIT LOG</p>
+            <h2>See the action, not just the connection.</h2>
+            <p>Every request that reaches the authenticated AI or GitHub proxy produces a private host-side record. AI prompts and queries, GitHub REST and GraphQL payloads, the requested action, its final status, and its duration are retained for review.</p>
+            <p>GitHub writes are classified as create, modify, delete, or GraphQL mutation. Known credential fields are redacted; request headers and response bodies are never recorded.</p>
+            <a class="text-link" href="https://github.com/foobarto/devbox/blob/main/docs/proxy-audit.md">Audit data model and retention guidance <span aria-hidden="true">→</span></a>
+          </div>
+          <div class="audit-cards">
+            <article>
+              <span>DETAILED REQUEST AUDIT</span>
+              <h3>AI + GitHub through <code>--proxy</code></h3>
+              <p>Capture the real submitted prompt or API payload, then see whether a remote mutation succeeded.</p>
+              <pre><code><span class="prompt">$</span> devbox proxy audit show
+<span class="prompt">$</span> devbox proxy audit export audit.html</code></pre>
+              <small>JSONL and the optional HTML report are owner-only files on the host.</small>
+            </article>
+            <article>
+              <span>OPAQUE HTTPS METADATA</span>
+              <h3>General web traffic through <code>--traffic-audit</code></h3>
+              <p>The CONNECT tunnel logs destination, timing, and byte counts. HTTPS paths, prompts, and bodies remain end-to-end encrypted.</p>
+              <small>Proxy-unaware tools fail on direct TCP/UDP web ports rather than silently bypassing this audit.</small>
+            </article>
+          </div>
+        </div>
       </section>
 
       <section class="shell value-grid section" aria-label="Devbox properties">
