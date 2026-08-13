@@ -151,6 +151,9 @@ setup() {
   grep -q 'brew install gh' "$tmp"
   grep -q 'sst/tap/opencode' "$tmp"
   grep -q 'claude.ai/install.sh' "$tmp"
+  grep -q 'brew install node' "$tmp"
+  grep -q 'npm install -g --ignore-scripts @earendil-works/pi-coding-agent' "$tmp"
+  grep -q 'brew install herdr' "$tmp"
 }
 
 @test "golden yaml installs Waypipe through every supported guest package manager" {

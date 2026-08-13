@@ -485,10 +485,17 @@ provision:
     BREW="$(command -v brew || echo /home/linuxbrew/.linuxbrew/bin/brew)"
     [ -x "$BREW" ] && eval "$("$BREW" shellenv)" || true
     export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/.opencode/bin:$PATH"
-    # --- AI CLIs + GitHub CLI ---
+    # --- AI CLIs, terminal agent multiplexer, and GitHub CLI ---
     brew install codex || true
     brew install gh || true
     brew install sst/tap/opencode || curl -fsSL https://opencode.ai/install | bash || true
+    # Pi Coding Agent is distributed through npm.  The package does not need
+    # lifecycle scripts for normal use, so keep third-party install hooks off.
+    command -v npm >/dev/null 2>&1 || brew install node || true
+    command -v pi >/dev/null 2>&1 || \
+      npm install -g --ignore-scripts @earendil-works/pi-coding-agent || true
+    # Herdr is a standalone terminal agent multiplexer.
+    command -v herdr >/dev/null 2>&1 || brew install herdr || true
     # stado — Homebrew cask (installs on Linux for this binary cask). Fallback to
     # a Go source install only if the cask ever fails (installs go on demand).
     if ! command -v stado >/dev/null 2>&1; then
@@ -532,7 +539,7 @@ verify_golden() {
   local name="$1" out host_keys
   # shellcheck disable=SC2016 # $t and $(...) expand in the guest shell.
   out="$(limactl shell "$name" -- bash -lc '
-    for t in brew gh claude codex opencode stado; do
+    for t in brew gh claude codex opencode pi herdr stado; do
       if command -v "$t" >/dev/null 2>&1; then printf "  ok   %-9s %s\n" "$t" "$(command -v "$t")"
       else printf "  MISS %-9s (not on PATH)\n" "$t"; fi
     done' </dev/null 2>/dev/null || true)"
