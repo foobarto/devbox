@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Disposable, CWD-mounted development VMs on Lima/QEMU, built for secure AI-assisted development.">
+    <meta name="theme-color" content="#0e0d0c">
+    <link rel="canonical" href="https://devbox.foobarto.me/">
+    <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+    <meta property="og:title" content="devbox — agents should not run on your host">
+    <meta property="og:description" content="Disposable, CWD-mounted development VMs with explicit, capability-based access to host services.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://devbox.foobarto.me/">
+    <title>devbox — disposable development VMs</title>
+    <link rel="stylesheet" href="assets/site.css">
+    <script defer src="assets/site.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="devbox home">
+        <svg class="brand-mark" viewBox="0 0 60 66" aria-hidden="true">
+          <path d="M30 3 54 16.5v27L30 57 6 43.5v-27L30 3Z"></path>
+          <path d="m6 16.5 24 13.5 24-13.5M30 30v27"></path>
+        </svg>
+        <span>devbox</span>
+      </a>
+      <button class="menu-button" type="button" aria-expanded="false" aria-controls="site-nav">
+        <span class="sr-only">Toggle navigation</span>
+        <span></span><span></span>
+      </button>
+      <nav id="site-nav" class="site-nav" aria-label="Main navigation">
+        <a href="#how">How it works</a>
+        <a href="#capabilities">Capabilities</a>
+        <a href="#flags">Flags</a>
+        <a href="#manifest">Manifest</a>
+        <a class="github-link" href="https://github.com/foobarto/devbox">GitHub <span aria-hidden="true">↗</span></a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section id="top" class="hero section-grid">
+        <div class="hero-glow" aria-hidden="true"></div>
+        <div class="shell hero-copy">
+          <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> v1.1.0 · Lima ≥ 2.0</p>
+          <div class="hero-title">
+            <svg class="hero-mark" viewBox="0 0 60 66" aria-hidden="true">
+              <path d="M30 3 54 16.5v27L30 57 6 43.5v-27L30 3Z"></path>
+              <path d="m6 16.5 24 13.5 24-13.5M30 30v27"></path>
+            </svg>
+            <h1>devbox</h1>
+          </div>
+          <p class="hero-lede">A practical VM boundary for AI-assisted development.</p>
+          <p class="hero-detail">Claude, Codex, OpenCode, Stado, and <code>gh</code> are preloaded. Open exactly the host-backed capabilities a task needs—then throw the box away when you are done.</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="https://github.com/foobarto/devbox#readme">Read the docs <span aria-hidden="true">→</span></a>
+            <button class="install-command" type="button" data-copy="brew install foobarto/tap/devbox" aria-label="Copy installation command">
+              <span aria-hidden="true">$</span> brew install foobarto/tap/devbox <span class="copy-label">Copy</span>
+            </button>
+          </div>
+          <div class="terminal" aria-label="Example devbox session">
+            <div class="terminal-bar"><span></span><span></span><span></span><small>host — zsh</small></div>
+            <pre><code><span class="prompt">$</span> cd ~/code/some-project
+<span class="prompt">$</span> devbox <span class="comment"># clone → mount CWD → shell in → delete on exit</span>
+<span class="output">→ cloning devbox-golden-ubuntu-24-04 …</span>
+<span class="output">→ mounting ~/code/some-project (rw)</span>
+<span class="user">you@devbox</span>:<span class="path">~/code/some-project</span>$ <span class="cursor">▊</span></code></pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="intro shell section">
+        <div>
+          <p class="eyebrow">WHY IT EXISTS</p>
+          <h2>Agents should not run on your host.</h2>
+        </div>
+        <div class="prose">
+          <p class="lead">Devbox makes isolation of AI agents and tools from your credentials and private files easy enough to use every time.</p>
+          <p>Agents read untrusted repositories, issues, webpages, and tool output. Prompt injection turns that input into instructions; even without an attacker, an agent can decide it needs to read, install, or run more than expected.</p>
+          <p>A VM boundary makes the answer structural: the agent sees the mounted project and only the capabilities you explicitly select.</p>
+        </div>
+      </section>
+
+      <section id="capabilities" class="shell section section-capabilities">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">THE TRADE-OFF</p>
+            <h2>A sealed box is useless. An open one is risky.</h2>
+          </div>
+          <p>Devbox starts with no host access. Every feature below adds one named capability—so you can make the trade-off consciously, per task.</p>
+        </div>
+        <div class="capability-grid">
+          <article class="capability default">
+            <p class="capability-number">00</p><h3>Fresh by default</h3>
+            <p>No host credentials, desktop session, or SSH agent is exposed. You can log in inside the ephemeral VM if you choose.</p>
+            <code>(default)</code>
+          </article>
+          <article class="capability">
+            <p class="capability-number">01</p><h3>Non-secret agent context</h3>
+            <p>Selected rules, prompts, settings, and custom agents cross in. Credentials, histories, caches, and key directories do not.</p>
+            <code>--with-agent-config</code>
+          </article>
+          <article class="capability">
+            <p class="capability-number">02</p><h3>Authenticated provider requests</h3>
+            <p>The host proxy makes permitted AI and GitHub requests without putting the underlying host tokens in the VM.</p>
+            <code>--proxy</code>
+          </article>
+          <article class="capability">
+            <p class="capability-number">03</p><h3>Proxy-or-fail web egress</h3>
+            <p>Ordinary web tools use an audited CONNECT proxy or fail on direct web ports. HTTPS audit data remains metadata-only.</p>
+            <code>--traffic-audit</code>
+          </article>
+          <article class="capability">
+            <p class="capability-number">04</p><h3>SSH operations</h3>
+            <p>The guest can ask loaded host identities to authenticate or sign commits, but private keys do not enter the VM.</p>
+            <code>--ssh-agent</code>
+          </article>
+          <article class="capability">
+            <p class="capability-number">05</p><h3>Extra project material</h3>
+            <p>Mount an additional host path read-only by default, or make a one-time copy into the guest.</p>
+            <code>--mount / --copy</code>
+          </article>
+          <article class="capability warning">
+            <p class="capability-number">06</p><h3>Guest windows on your desktop</h3>
+            <p>Waypipe gives a guest application access to your host compositor. Useful for trusted code; deliberately not part of <code>-a</code>.</p>
+            <code>--gui</code>
+          </article>
+          <article class="capability warning">
+            <p class="capability-number">07</p><h3>Credentials in the VM</h3>
+            <p>API keys or OAuth files can be copied in when required. This intentionally weakens the host-only credential boundary.</p>
+            <code>--api-keys / --with-creds</code>
+          </article>
+        </div>
+        <p class="security-note">Capabilities combine. A malicious process can use every capability you enable; use the smallest set that lets the task work. <a href="https://github.com/foobarto/devbox/blob/main/docs/agent-capabilities-security.md">Read the threat model <span aria-hidden="true">→</span></a></p>
+      </section>
+
+      <section class="shell value-grid section" aria-label="Devbox properties">
+        <article><span>01</span><h3>Disposable</h3><p>Each box is deleted on exit by default. Nothing accumulates.</p></article>
+        <article><span>02</span><h3>Isolated</h3><p>Real development work happens in a VM boundary, not in your host session.</p></article>
+        <article><span>03</span><h3>Fast</h3><p>A one-time golden carries the toolchain; each run is a cheap clone.</p></article>
+        <article><span>04</span><h3>Deterministic</h3><p>A folder always maps to the same box name, so kept boxes are easy to find.</p></article>
+        <article><span>05</span><h3>Credential-safe</h3><p>Host tokens can remain on the host behind a request capability.</p></article>
+        <article><span>06</span><h3>Multi-distro</h3><p>Base provisioning adapts to apt, dnf, or pacman.</p></article>
+        <article><span>07</span><h3>Sparse</h3><p>Disk is a ceiling, not an allocation—only written data consumes space.</p></article>
+        <article><span>08</span><h3>Preloaded</h3><p>The CLIs, <code>gh</code>, and Homebrew are baked into the golden image.</p></article>
+      </section>
+
+      <section class="shell feature-panel" aria-labelledby="gui-title">
+        <div>
+          <p class="eyebrow">WAYLAND GUI FORWARDING</p>
+          <h2 id="gui-title">Guest GUI apps, on your host.</h2>
+          <p><code>devbox gui</code> and <code>devbox --gui</code> use Waypipe over the instance SSH transport. The raw host Wayland socket and GPU device nodes are never mounted into the guest.</p>
+          <p class="muted">This still widens the trust boundary: a forwarded app becomes a client of your host compositor. Use it only with code and GUI applications you trust.</p>
+          <a class="text-link" href="https://github.com/foobarto/devbox/blob/main/docs/gui-security.md">GUI forwarding security <span aria-hidden="true">→</span></a>
+        </div>
+        <pre class="command-block"><code><span class="prompt">$</span> devbox --gui
+<span class="comment">→ launch GUI apps from the shell</span>
+
+<span class="prompt">$</span> devbox gui -- weston-terminal
+<span class="comment">→ one app; returns when it exits</span>
+
+<span class="prompt">$</span> devbox --gui -a -- code .</code></pre>
+      </section>
+
+      <section id="how" class="how section">
+        <div class="shell">
+          <div class="section-heading stacked">
+            <div><p class="eyebrow">HOW IT WORKS</p><h2>Build once, clone per folder.</h2></div>
+            <p><code>devbox build</code> provisions a persistent golden image. Every project gets a deterministic clone from it—without re-installing the toolchain.</p>
+          </div>
+          <ol class="steps">
+            <li><span>01</span><h3>Build</h3><p>Provision Homebrew, AI CLIs, <code>gh</code>, and build essentials into a golden image.</p></li>
+            <li><span>02</span><h3>Clone</h3><p>Attach to a kept box or quickly clone the golden image for the project directory.</p></li>
+            <li><span>03</span><h3>Mount</h3><p>Mount the project writable at the same path, apply approved configuration, and enter.</p></li>
+            <li><span>04</span><h3>Destroy</h3><p>Exit to delete the clone, unless you explicitly used <code>--keep</code>.</p></li>
+          </ol>
+          <pre class="usage-block"><code><span class="prompt">$</span> devbox [DIR] [FLAGS]                     <span class="comment"># enter a disposable development VM</span>
+<span class="prompt">$</span> devbox gui [DIR] [FLAGS] [-- APP ...]  <span class="comment"># open a GUI-ready shell or app</span>
+<span class="prompt">$</span> devbox build [--image N] [--force]      <span class="comment"># create or refresh a golden image</span>
+<span class="prompt">$</span> devbox destroy NAME | --all | --goldens</code></pre>
+        </div>
+      </section>
+
+      <section id="flags" class="shell section">
+        <div class="section-heading stacked"><div><p class="eyebrow">KEY FLAGS</p><h2>The ones you’ll reach for.</h2></div><p>Flags make host-backed capabilities explicit. They work on a new box and, where applicable, refresh or remove state in an existing kept box.</p></div>
+        <div class="flag-list">
+          <article><code>--keep, -k</code><p>Leave the box running when the shell exits.</p></article>
+          <article><code>--proxy[=URL], -p</code><p>Use host-side AI and GitHub authentication without exposing real tokens in the VM.</p></article>
+          <article><code>--traffic-audit, -T</code><p>Route normal web tooling through the audited proxy or fail on direct web ports.</p></article>
+          <article><code>--ssh-agent, -s</code><p>Forward the host SSH agent for authentication and SSH-signed commits.</p></article>
+          <article><code>--gui, -G</code><p>Open a GUI-ready shell or a guest Wayland application through Waypipe.</p></article>
+          <article><code>-a</code><p>The common trusted-code preset: agent config, host credential proxy, and SSH agent—never GUI.</p></article>
+          <article><code>--no-auth, -n</code><p>Remove Devbox-managed proxy, API-key, and copied-credential profiles from a kept box.</p></article>
+          <article><code>--image NAME, -i</code><p>Select a Lima template, configuration file, or cloud image for the golden.</p></article>
+        </div>
+        <a class="text-link" href="https://github.com/foobarto/devbox#usage">All flags and examples <span aria-hidden="true">→</span></a>
+      </section>
+
+      <section id="manifest" class="manifest section">
+        <div class="shell manifest-layout">
+          <div><p class="eyebrow">PROJECT MANIFEST</p><h2><code>.devbox.toml</code></h2><p>Keep project-local packages, resource settings, mounts, and startup commands with the project. Devbox summarizes host-affecting requests and asks before applying them.</p><a class="text-link" href="https://github.com/foobarto/devbox/blob/main/examples/.devbox.toml">See the annotated example <span aria-hidden="true">→</span></a></div>
+          <pre class="toml"><code><span class="toml-key">image</span> = <span class="toml-string">"ubuntu-24.04"</span>
+
+[<span class="toml-key">resources</span>]
+<span class="toml-key">cpus</span> = <span class="toml-number">8</span>
+<span class="toml-key">memory</span> = <span class="toml-string">"12GiB"</span>
+
+<span class="toml-key">packages</span> = [<span class="toml-string">"just"</span>, <span class="toml-string">"watchexec"</span>]
+<span class="toml-key">start</span> = <span class="toml-string">"just dev"</span></code></pre>
+        </div>
+      </section>
+
+      <section class="cta">
+        <div class="shell"><p class="eyebrow">READY WHEN YOU ARE</p><h2>One command away.</h2><p>Clone the golden, mount your project, and give the task only the capabilities it needs.</p><div class="hero-actions"><a class="button button-primary" href="https://github.com/foobarto/devbox">View on GitHub <span aria-hidden="true">↗</span></a><button class="install-command" type="button" data-copy="brew install foobarto/tap/devbox"><span aria-hidden="true">$</span> brew install foobarto/tap/devbox <span class="copy-label">Copy</span></button></div></div>
+      </section>
+    </main>
+
+    <footer class="site-footer shell">
+      <a class="brand" href="#top" aria-label="Back to top"><svg class="brand-mark" viewBox="0 0 60 66" aria-hidden="true"><path d="M30 3 54 16.5v27L30 57 6 43.5v-27L30 3Z"></path><path d="m6 16.5 24 13.5 24-13.5M30 30v27"></path></svg><span>devbox</span></a>
+      <p>Disposable development VMs for deliberate AI-assisted work.</p>
+      <a href="https://github.com/foobarto/devbox">github.com/foobarto/devbox <span aria-hidden="true">↗</span></a>
+    </footer>
+  </body>
+</html>

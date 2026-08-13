@@ -4,6 +4,8 @@ Disposable, CWD-mounted dev VMs on [Lima](https://lima-vm.io)/QEMU, preloaded
 with an AI-CLI toolchain — **claude**, **codex**, **opencode**, **stado** — and
 the **GitHub CLI** (`gh`), plus **Homebrew**.
 
+Project site: [devbox.foobarto.me](https://devbox.foobarto.me/).
+
 `cd` into a project, type `devbox`, and you're in a throwaway Linux VM with the
 project mounted and the tools ready. Exit the shell and the VM is gone.
 
