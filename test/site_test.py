@@ -45,6 +45,7 @@ class WebsiteTests(TestCase):
         self.assertIn("devbox proxy audit export audit.html", page)
         self.assertIn("GitHub writes are classified as create, modify, delete", page)
         self.assertIn("HTTPS paths, prompts, and bodies remain end-to-end encrypted", page)
+        self.assertIn("Pi, Stado, Herdr", page)
 
     def test_site_marks_the_version_for_automation(self):
         page = (SITE / "index.html").read_text(encoding="utf-8")

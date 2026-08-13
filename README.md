@@ -1,8 +1,9 @@
 # devbox
 
 Disposable, CWD-mounted dev VMs on [Lima](https://lima-vm.io)/QEMU, preloaded
-with an AI-CLI toolchain — **claude**, **codex**, **opencode**, **stado** — and
-the **GitHub CLI** (`gh`), plus **Homebrew**.
+with an AI-CLI toolchain — **claude**, **codex**, **opencode**, **pi**, and
+**stado** — plus the **Herdr** terminal agent multiplexer, **GitHub CLI**
+(`gh`), and **Homebrew**.
 
 Project site: [devbox.foobarto.me](https://devbox.foobarto.me/).
 
