@@ -60,7 +60,7 @@
 #                    appear in the host Wayland session. With `-- APP`, run
 #                    just that GUI application instead of opening a shell.
 #                    `-g` remains --with-agent-config for compatibility.
-#   -a               shortcut for --with-agent-config --proxy --ssh-agent --gui.
+#   -a               shortcut for --with-agent-config --proxy --ssh-agent.
 #   --mount P[:ro|:rw], -m P[:ro|:rw]
 #                    mount an extra host path into the box at the same path
 #                    (default ro). Repeatable. Applied at box creation.
@@ -1274,7 +1274,7 @@ cmd_run() {
       --ssh-agent|-s) ssh_agent=1;;
       --with-creds|-c) with_creds=1;;
       --with-agent-config|-g) with_agent_config=1;;
-      -a) with_agent_config=1; proxy="$PROXY_DEFAULT_URL"; ssh_agent=1; gui=1;;
+      -a) with_agent_config=1; proxy="$PROXY_DEFAULT_URL"; ssh_agent=1;;
       --no-auth|-n) no_auth=1;;
       --api-keys|-K) api_keys="$DEFAULT_KEYS_FILE";;
       --api-keys=*|-K=*) api_keys="$(abspath "${1#*=}")";;

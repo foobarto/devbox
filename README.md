@@ -87,10 +87,17 @@ devbox destroy NAME | --all | --goldens
 | `--with-creds`, `-c` | copy host AI-tool credential files into the box (OAuth logins for claude/codex without a proxy). Best-effort. |
 | `--with-agent-config`, `-g` | copy an allowlisted set of non-secret Claude, Codex, OpenCode, and Stado settings, prompts, rules, and custom agents. Auth, histories, caches, and key directories are excluded; suspected credentials are skipped. |
 | `--gui`, `-G` | start a GUI-ready Devbox shell through Waypipe; after the optional `--`, run one guest GUI app instead. |
-| `-a` | shortcut for `--with-agent-config --proxy --ssh-agent --gui`; it never enables `--with-creds`. |
+| `-a` | shortcut for `--with-agent-config --proxy --ssh-agent`; it never enables `--with-creds` or GUI forwarding. |
 | `--mount PATH[:ro\|:rw]`, `-m PATH[:ro\|:rw]` | mount an extra host path into the box at the same path (default `ro`). Repeatable; applied at box creation. |
 | `--copy SRC[:DEST]`, `-C SRC[:DEST]` | copy an extra host file/dir into the box (`DEST` defaults to the basename in `$HOME`). Repeatable; works on new **and** existing boxes. |
 | `--name NAME`, `-N NAME` | override the derived instance name. |
+
+> **Agent boundaries:** a Devbox agent cannot read host files or credentials by
+> default. `--ssh-agent` lets it use loaded SSH identities without extracting
+> their private keys; `--proxy` primarily prevents credential exfiltration by
+> keeping tokens on the host, while still letting it make permitted provider
+> requests. Give either capability only to trusted code. See [agent capability
+> security](docs/agent-capabilities-security.md).
 
 ### GUI apps on a Wayland host
 
@@ -116,10 +123,18 @@ Devboxes too: guest-side Waypipe is installed on demand. As with a normal
 `devbox` run, the box is removed when the shell or app exits unless `--keep` is
 supplied.
 
-Use `-a` for the GUI-ready agent-config + proxy + SSH-agent setup, or combine
-flags yourself, e.g. `devbox --gui -s -p -m ~/data:ro -C ~/.netrc`. Build
-accepts `-i` and `-f` for `--image` and `--force`; destroy accepts `-A` and
-`-G` for `--all` and `--goldens`. Help and version are `-h` and `-V`.
+> **Security:** GUI forwarding gives guest applications access to the host
+> Wayland session. Devbox uses Waypipe over SSH and does not mount the host
+> Wayland socket or GPU nodes, but it is **not** an isolation boundary. Use
+> `--gui` and `-G` only with projects and GUI applications you trust.
+> See [GUI forwarding security](docs/gui-security.md) for the threat model and
+> safe-use guidance.
+
+Use `-a` for the usual agent-config + proxy + SSH-agent setup. Add `--gui` or
+`-G` explicitly when you also want GUI forwarding, e.g.
+`devbox --gui -a -m ~/data:ro -C ~/.netrc`. Build accepts `-i` and `-f` for
+`--image` and `--force`; destroy accepts `-A` and `-G` for `--all` and
+`--goldens`. Help and version are `-h` and `-V`.
 
 ## How it works
 

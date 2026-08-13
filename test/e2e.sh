@@ -187,11 +187,8 @@ test -s "$MANIFEST_PROJECT/.codex-e2e-output"
 git -C "$MANIFEST_PROJECT" cat-file -p HEAD | grep -q '^gpgsig -----BEGIN SSH SIGNATURE-----'
 curl -fsS http://127.0.0.1:4141/_devbox | grep -q devbox-ai-proxy
 
-echo "[e2e] explicit agent preset components copy non-secret config without OAuth credentials"
-# `-a` also enables the interactive Waypipe GUI shell, which deliberately
-# requires a real host Wayland session. This headless e2e suite validates the
-# underlying safe agent/proxy/SSH components explicitly instead.
-run_session approve "$DEVBOX_BIN" "$MANIFEST_PROJECT" --with-agent-config --proxy --ssh-agent
+echo "[e2e] -a copies non-secret agent config without copying OAuth credentials"
+run_session approve "$DEVBOX_BIN" "$MANIFEST_PROJECT" -a
 # shellcheck disable=SC2016 # $HOME expands inside the guest shell.
 assert_guest "$manifest_instance" 'test -f "$HOME/.codex/AGENTS.md"; test ! -e "$HOME/.codex/auth.json"'
 

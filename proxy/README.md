@@ -4,6 +4,13 @@ A tiny host-side reverse proxy that lets disposable devboxes use AI and GitHub C
 **without ever holding a real credential**. Real keys/tokens stay on the host;
 the proxy injects them and forwards to the provider.
 
+> **Security boundary:** the primary purpose of `--proxy` is preventing token
+> extraction from a Devbox: real credentials remain on the host. An in-VM agent
+> can still make the proxy's permitted provider requests as the host account.
+> Restrict the proxy listener to trusted guests/networks and give the flag only
+> to trusted code. See
+> [agent capability security](../docs/agent-capabilities-security.md).
+
 - `devbox-ai-proxy.py` — the proxy. Python **standard library only**, no pip.
   Streams HTTP responses (SSE-safe), tunnels Codex WebSockets, and provides a
   GitHub-only TLS CONNECT proxy for `gh`.

@@ -305,7 +305,8 @@ setup() {
   source_text="$(<"$DEVBOX")"
   [[ "$source_text" == *'cmd_gui() { cmd_run --gui "$@"; }'* ]]
   [[ "$source_text" == *'--gui|-G) gui=1'* ]]
-  [[ "$source_text" == *'-a) with_agent_config=1; proxy="$PROXY_DEFAULT_URL"; ssh_agent=1; gui=1'* ]]
+  [[ "$source_text" == *'-a) with_agent_config=1; proxy="$PROXY_DEFAULT_URL"; ssh_agent=1'* ]]
+  [[ "$source_text" != *'-a) with_agent_config=1; proxy="$PROXY_DEFAULT_URL"; ssh_agent=1; gui=1'* ]]
   [[ "$source_text" == *'waypipe --no-gpu'*'ssh -F "$ssh_config" "lima-$name"'* ]]
   [[ "$source_text" == *'ssh -F "$ssh_config" -tt "lima-$name"'* ]]
   [[ "$source_text" == *'gui_remote_command'*'shlex.quote'* ]]
@@ -563,7 +564,8 @@ setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"--with-agent-config, -g"* ]]
   [[ "$output" == *"--gui, -G"* ]]
-  [[ "$output" == *"shortcut for --with-agent-config --proxy --ssh-agent --gui"* ]]
+  [[ "$output" == *"shortcut for --with-agent-config --proxy --ssh-agent"* ]]
+  [[ "$output" != *"shortcut for --with-agent-config --proxy --ssh-agent --gui"* ]]
   run bash "$DEVBOX" -V
   [ "$status" -eq 0 ]
   [ "$output" = "devbox $(tr -d "[:space:]" < "$BATS_TEST_DIRNAME/../VERSION")" ]
