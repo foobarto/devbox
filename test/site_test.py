@@ -1,11 +1,16 @@
 """Structural checks for the dependency-free GitHub Pages site."""
 from html.parser import HTMLParser
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
 from unittest import TestCase, main
 
 
 ROOT = Path(__file__).parents[1]
 SITE = ROOT / "website"
+SITE_VERSION_UPDATER = ROOT / "scripts" / "update-site-version.py"
 
 
 class PageParser(HTMLParser):
@@ -41,6 +46,34 @@ class WebsiteTests(TestCase):
         self.assertIn("GitHub writes are classified as create, modify, delete", page)
         self.assertIn("HTTPS paths, prompts, and bodies remain end-to-end encrypted", page)
 
+    def test_site_marks_the_version_for_automation(self):
+        page = (SITE / "index.html").read_text(encoding="utf-8")
+        self.assertRegex(
+            page,
+            r'<span data-current-version>v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?</span>',
+        )
+
+    def test_site_version_updater_changes_only_the_marked_version(self):
+        with TemporaryDirectory() as temporary_directory:
+            page = Path(temporary_directory) / "index.html"
+            shutil.copy(SITE / "index.html", page)
+            result = subprocess.run(
+                [sys.executable, SITE_VERSION_UPDATER, "v9.8.7", "--path", page],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("updated:", result.stdout)
+            self.assertIn("<span data-current-version>v9.8.7</span>", page.read_text())
+
+            unchanged = subprocess.run(
+                [sys.executable, SITE_VERSION_UPDATER, "v9.8.7", "--path", page],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual("unchanged: v9.8.7\n", unchanged.stdout)
+
     def test_pages_workflow_publishes_only_the_website_directory(self):
         workflow = (ROOT / ".github/workflows/deploy-pages.yml").read_text(encoding="utf-8")
         self.assertIn("actions/configure-pages@v5", workflow)
@@ -49,6 +82,16 @@ class WebsiteTests(TestCase):
         self.assertIn("path: website", workflow)
         self.assertIn("pages: write", workflow)
         self.assertIn("id-token: write", workflow)
+
+    def test_version_sync_workflow_updates_and_deploys_only_when_needed(self):
+        workflow = (ROOT / ".github/workflows/sync-site-version.yml").read_text(encoding="utf-8")
+        self.assertIn('cron: "17 5 * * 1"', workflow)
+        self.assertIn("tr -d '[:space:]' < VERSION", workflow)
+        self.assertIn("scripts/update-site-version.py", workflow)
+        self.assertIn("contents: write", workflow)
+        self.assertIn("actions: write", workflow)
+        self.assertIn("git diff --quiet -- website/index.html", workflow)
+        self.assertIn("gh workflow run deploy-pages.yml --ref main", workflow)
 
 
 if __name__ == "__main__":

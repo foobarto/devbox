@@ -1,0 +1,63 @@
+name: Sync website version
+
+on:
+  schedule:
+    # Monday, 05:17 UTC. Avoid the busiest start-of-hour schedule window.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+# The workflow commits a one-line website change, then dispatches the Pages
+# deployment. A commit made with GITHUB_TOKEN does not trigger push workflows.
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: sync-site-version
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Read the canonical Devbox version
+        id: version
+        run: |
+          version="v$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            printf 'VERSION is not a supported semantic version: %s\n' "$version" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Update the website version marker
+        id: update
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 scripts/update-site-version.py "$VERSION"
+          if git diff --quiet -- website/index.html; then
+            printf 'changed=false\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'changed=true\n' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit the current Devbox version
+        if: steps.update.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add website/index.html
+          git commit -m "docs(site): sync version to ${VERSION}"
+          git push
+
+      - name: Deploy the updated site
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run deploy-pages.yml --ref main
