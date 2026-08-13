@@ -1,11 +1,16 @@
 """Structural checks for the dependency-free GitHub Pages site."""
 from html.parser import HTMLParser
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
 from unittest import TestCase, main
 
 
 ROOT = Path(__file__).parents[1]
-SITE = ROOT / "website"
+SITE = ROOT / "docs"
+SITE_VERSION_UPDATER = ROOT / "scripts" / "update-site-version.py"
 
 
 class PageParser(HTMLParser):
@@ -41,14 +46,68 @@ class WebsiteTests(TestCase):
         self.assertIn("GitHub writes are classified as create, modify, delete", page)
         self.assertIn("HTTPS paths, prompts, and bodies remain end-to-end encrypted", page)
 
-    def test_pages_workflow_publishes_only_the_website_directory(self):
-        workflow = (ROOT / ".github/workflows/deploy-pages.yml").read_text(encoding="utf-8")
-        self.assertIn("actions/configure-pages@v5", workflow)
-        self.assertIn("actions/upload-pages-artifact@v4", workflow)
-        self.assertIn("actions/deploy-pages@v4", workflow)
-        self.assertIn("path: website", workflow)
+    def test_site_marks_the_version_for_automation(self):
+        page = (SITE / "index.html").read_text(encoding="utf-8")
+        self.assertRegex(
+            page,
+            r'<span data-current-version>v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?</span>',
+        )
+
+    def test_site_version_updater_changes_only_the_marked_version(self):
+        with TemporaryDirectory() as temporary_directory:
+            page = Path(temporary_directory) / "index.html"
+            shutil.copy(SITE / "index.html", page)
+            result = subprocess.run(
+                [sys.executable, SITE_VERSION_UPDATER, "v9.8.7", "--path", page],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("updated:", result.stdout)
+            self.assertIn(
+                "<span data-current-version>v9.8.7</span>", page.read_text(encoding="utf-8")
+            )
+
+            unchanged = subprocess.run(
+                [sys.executable, SITE_VERSION_UPDATER, "v9.8.7", "--path", page],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual("unchanged: v9.8.7\n", unchanged.stdout)
+
+    def test_site_version_updater_rejects_duplicate_markers(self):
+        with TemporaryDirectory() as temporary_directory:
+            page = Path(temporary_directory) / "index.html"
+            page.write_text(
+                "<span data-current-version>v1.0.0</span>"
+                "<span data-current-version>v1.0.0</span>",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [sys.executable, SITE_VERSION_UPDATER, "v9.8.7", "--path", page],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("expected one version marker", result.stderr)
+
+    def test_pages_source_contains_the_static_site_and_disables_jekyll(self):
+        self.assertTrue((SITE / ".nojekyll").is_file())
+        self.assertTrue((SITE / "index.html").is_file())
+
+    def test_version_sync_workflow_updates_and_deploys_only_when_needed(self):
+        workflow = (ROOT / ".github/workflows/sync-site-version.yml").read_text(encoding="utf-8")
+        self.assertIn('cron: "17 5 * * 1"', workflow)
+        self.assertIn("tr -d '[:space:]' < VERSION", workflow)
+        self.assertIn("scripts/update-site-version.py", workflow)
+        self.assertIn("contents: write", workflow)
         self.assertIn("pages: write", workflow)
-        self.assertIn("id-token: write", workflow)
+        self.assertIn("ref: main", workflow)
+        self.assertIn("git diff --quiet -- docs/index.html", workflow)
+        self.assertIn("git push origin HEAD:main", workflow)
+        self.assertIn('gh api --method POST "repos/${GITHUB_REPOSITORY}/pages/builds"', workflow)
 
 
 if __name__ == "__main__":
