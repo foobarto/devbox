@@ -359,6 +359,11 @@ installed.
   resolver. This keeps DNS working on cloud images such as Kali that accept a
   DHCP route but omit its DNS option, and it preserves host VPN/split-DNS
   resolution rather than substituting public resolvers.
+- New goldens include Stado's Linux sandbox helpers: `bwrap` for process and
+  filesystem isolation, plus `pasta` for proxy-only host-allowlist networking.
+  On Ubuntu 24.04, Devbox enables AppArmor's dedicated, restricted bwrap
+  profile; it does not disable Ubuntu's global user-namespace restriction, so
+  standalone `unshare` remains intentionally unavailable.
 - A box created before a `devbox build --force` keeps the *old* toolchain until
   you `destroy` and recreate it.
 - `--ssh-agent` enables Lima's agent socket for a new or existing box. An
