@@ -14,6 +14,8 @@
 #
 # Usage
 #   devbox [DIR] [FLAGS]        spin/attach a box for DIR (default: $PWD)
+#   devbox gui [DIR] [FLAGS] -- APP [ARGS...]
+#                               run a Wayland app from the box on the host
 #   devbox build [--image N|-i N] [--force|-f] [--yes|-y] [--manifest F]
 #                                 [--cpus N|-j N] [--memory S|-M S] [--disk S|-D S]
 #   devbox ls
@@ -63,6 +65,13 @@
 #                    to the basename in $HOME). Repeatable. Works on new+existing.
 #   --name NAME, -N NAME
 #                    override the derived instance name.
+#
+# GUI
+#   `devbox gui` runs a Wayland application through Waypipe over the existing
+#   Lima SSH transport. The host must be in a Wayland session with `waypipe`
+#   installed. Waypipe is installed in a new golden and on demand in a kept
+#   guest created by an older golden. Direct host Wayland-socket mounts are
+#   deliberately not used.
 #
 # Project manifest (.devbox.toml)
 #   image  = "ubuntu-24.04"          shorthand, or the table form:
@@ -414,9 +423,9 @@ provision:
     RESOLVER
       systemctl restart systemd-resolved
     fi
-    apt="build-essential git curl wget jq ripgrep unzip ca-certificates procps file locales sudo python3 python3-venv python3-pip"
-    dnf="@development-tools git curl wget jq ripgrep unzip ca-certificates procps-ng file glibc-langpack-en sudo python3 python3-pip"
-    pac="base-devel git curl wget jq ripgrep unzip ca-certificates procps-ng file sudo python python-pip"
+    apt="build-essential git curl wget jq ripgrep unzip ca-certificates procps file locales sudo python3 python3-venv python3-pip waypipe"
+    dnf="@development-tools git curl wget jq ripgrep unzip ca-certificates procps-ng file glibc-langpack-en sudo python3 python3-pip waypipe"
+    pac="base-devel git curl wget jq ripgrep unzip ca-certificates procps-ng file sudo python python-pip waypipe"
     if   command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y --no-install-recommends $apt
     elif command -v dnf     >/dev/null 2>&1; then dnf install -y $dnf
     elif command -v pacman  >/dev/null 2>&1; then pacman -Sy --noconfirm $pac
@@ -791,6 +800,73 @@ clear_auth() {
     'sudo rm -f /etc/profile.d/zz-devbox-10-proxy.sh /etc/profile.d/zz-devbox-11-codex-proxy.sh /etc/profile.d/zz-devbox-12-gh-proxy.sh /etc/profile.d/zz-devbox-20-keys.sh; rm -rf "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"'
 }
 
+# ------------------------------------------------------------ GUI / Waypipe ---
+host_wayland_socket() {
+  local runtime="${XDG_RUNTIME_DIR:-}" display="${WAYLAND_DISPLAY:-}" socket
+  [[ -n "$runtime" && -n "$display" ]] || \
+    die "devbox gui needs a host Wayland session (WAYLAND_DISPLAY and XDG_RUNTIME_DIR are unset)"
+  if [[ "$display" == /* ]]; then socket="$display"; else socket="$runtime/$display"; fi
+  [[ -S "$socket" ]] || die "devbox gui cannot find the host Wayland socket: $socket"
+}
+
+lima_ssh_config() { # $1 Lima instance; print its SSH config path
+  local name="$1" config
+  config="$(limactl list --format '{{.Name}}|{{.SSHConfigFile}}' \
+    | awk -F '|' -v name="$name" '$1 == name { print $2; exit }')"
+  [[ -n "$config" && -r "$config" ]] || \
+    die "could not find Lima SSH configuration for $name"
+  printf '%s' "$config"
+}
+
+ensure_guest_waypipe() { # $1 Lima instance
+  local name="$1"
+  # shellcheck disable=SC2016 # Guest package-manager commands expand in the guest.
+  limactl shell "$name" -- bash -lc '
+    command -v waypipe >/dev/null 2>&1 && exit 0
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get update
+      sudo apt-get install -y --no-install-recommends waypipe
+    elif command -v dnf >/dev/null 2>&1; then
+      sudo dnf install -y waypipe
+    elif command -v pacman >/dev/null 2>&1; then
+      sudo pacman -Sy --noconfirm waypipe
+    else
+      printf "%s\\n" "devbox gui needs waypipe installed in this guest" >&2
+      exit 1
+    fi
+  '
+}
+
+gui_remote_command() { # $1 guest workdir; remaining args are the guest app command
+  python3 - "$@" <<'PY'
+import shlex
+import sys
+
+directory, *command = sys.argv[1:]
+if not command:
+    raise SystemExit("missing GUI application command")
+print("cd " + shlex.quote(directory) + " && exec " + " ".join(map(shlex.quote, command)))
+PY
+}
+
+run_gui() { # $1 Lima instance $2 guest workdir; remaining args are the guest app command
+  local name="$1" directory="$2" ssh_config remote_command
+  shift 2
+  [[ $# -gt 0 ]] || die "usage: devbox gui [DIR] [FLAGS] -- APP [ARGS...]"
+  command -v waypipe >/dev/null 2>&1 || \
+    die "devbox gui needs host waypipe; install the distro package named 'waypipe'"
+  host_wayland_socket
+  ensure_guest_waypipe "$name" || die "could not install waypipe in $name"
+  ssh_config="$(lima_ssh_config "$name")"
+  remote_command="$(gui_remote_command "$directory" "$@")" || \
+    die "could not prepare the guest GUI command"
+  log "Opening $name GUI app on the host Wayland session: $(printf '%q ' "$@")"
+  # QEMU guests do not have host DRM/render-node passthrough. Blocking DMABUF
+  # protocols makes Waypipe use its safe, software-backed transport instead.
+  waypipe --no-gpu --title-prefix 'Devbox: ' ssh -F "$ssh_config" "lima-$name" \
+    bash -lc "$remote_command"
+}
+
 # PATH[:ro|:rw] -> a Lima --mount value (bare = read-only, :w suffix = writable).
 _lima_mount_arg() {
   local spec="$1"
@@ -1144,8 +1220,8 @@ run_cleanup() {
 }
 
 cmd_run() {
-  local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 with_agent_config=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name=""
-  local extra_mounts=() extra_copies=() manifest_requests=()
+  local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 with_agent_config=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name="" gui=0
+  local extra_mounts=() extra_copies=() manifest_requests=() gui_command=()
   local cli_cpus="" cli_memory="" cli_disk=""
   local golden_digest="" golden_provision="" golden_provision_user=""
   while [[ $# -gt 0 ]]; do
@@ -1174,11 +1250,17 @@ cmd_run() {
       --copy=*|-C=*) extra_copies+=("${1#*=}");;
       --name|-N) shift; name="${1:?--name needs a value}";;
       --name=*|-N=*) name="${1#*=}";;
+      --gui) gui=1;;
+      --) shift; gui_command=("$@"); break;;
       -h|--help) grep -E '^#( |$)' "$0" | sed -E 's/^# ?//'; return 0;;
       -*) die "unknown flag: $1 (see: devbox --help)";;
       *) dir="$1";;
     esac; shift
   done
+  [[ $gui -eq 0 || ${#gui_command[@]} -gt 0 ]] || \
+    die "usage: devbox gui [DIR] [FLAGS] -- APP [ARGS...]"
+  [[ $gui -eq 1 || ${#gui_command[@]} -eq 0 ]] || \
+    die "-- is only valid with devbox gui"
   dir="$(abspath "${dir:-$PWD}")"
   [[ -d "$dir" ]] || die "not a directory: $dir"
 
@@ -1351,11 +1433,18 @@ cmd_run() {
     warn ".devbox is no longer executed; migrate it to $PROJECT_MANIFEST_NAME"
   fi
 
+  if [[ $gui -eq 1 ]]; then
+    run_gui "$name" "$dir" "${gui_command[@]}"
+    return
+  fi
+
   local fate="destroy it"
   [[ $keep -eq 1 ]] && fate="leave it running"
   log "Entering $name — exit the shell to $fate."
   limactl shell --workdir "$dir" "$name" || true
 }
+
+cmd_gui() { cmd_run --gui "$@"; }
 
 cmd_ls() { limactl list 2>/dev/null | awk 'NR==1 || $1 ~ /^devbox-/'; }
 
@@ -1407,6 +1496,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   need limactl
   case "${1:-}" in
     build)          shift; cmd_build   "$@";;
+    gui)            shift; cmd_gui     "$@";;
     ls|list)        shift; cmd_ls      "$@";;
     destroy|rm)     shift; cmd_destroy "$@";;
     proxy)          shift; cmd_proxy   "$@";;

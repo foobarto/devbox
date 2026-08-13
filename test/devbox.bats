@@ -153,6 +153,13 @@ setup() {
   grep -q 'claude.ai/install.sh' "$tmp"
 }
 
+@test "golden yaml installs Waypipe through every supported guest package manager" {
+  tmp="$BATS_TEST_TMPDIR/g.yaml"
+  emit_golden_yaml ubuntu-24.04 "$tmp"
+  grep -q 'python3-pip waypipe' "$tmp"
+  grep -q 'python-pip waypipe' "$tmp"
+}
+
 @test "golden yaml fetches GitHub host keys through the Meta API" {
   tmp="$BATS_TEST_TMPDIR/g.yaml"
   emit_golden_yaml ubuntu-24.04 "$tmp"
@@ -292,6 +299,38 @@ setup() {
   [[ "$source_text" == *'start_gh_proxy_capability_renewal'* ]]
   [[ "$source_text" == *'stored_gh_proxy_endpoint'* ]]
   [[ "$source_text" == *'rm -rf "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"'* ]]
+}
+
+@test "GUI command uses Waypipe over Lima SSH without exposing the host socket" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *'cmd_gui() { cmd_run --gui "$@"; }'* ]]
+  [[ "$source_text" == *'waypipe --no-gpu'*'ssh -F "$ssh_config" "lima-$name"'* ]]
+  [[ "$source_text" == *'gui_remote_command'*'shlex.quote'* ]]
+  [[ "$source_text" == *'{{.SSHConfigFile}}'* ]]
+  [[ "$source_text" == *'host Wayland socket'* ]]
+  [[ "$source_text" != *'--mount "$XDG_RUNTIME_DIR'* ]]
+}
+
+@test "GUI command starts in the mounted project directory with safely quoted arguments" {
+  run gui_remote_command "/project with spaces" code "." "a value" "\$HOME"
+  [ "$status" -eq 0 ]
+  [ "$output" = "cd '/project with spaces' && exec code . 'a value' '\$HOME'" ]
+}
+
+@test "GUI runner uses the instance SSH config and forwards its quoted project command" {
+  host_wayland_socket() { :; }
+  ensure_guest_waypipe() { :; }
+  lima_ssh_config() { printf '%s' /tmp/devbox-gui-ssh.config; }
+  waypipe() { printf '%s\0' "$@" > "$BATS_TEST_TMPDIR/waypipe-args"; }
+  run_gui devbox-test "/project with spaces" code "." "a value"
+  mapfile -d '' -t args < "$BATS_TEST_TMPDIR/waypipe-args"
+  [ "${args[0]}" = "--no-gpu" ]
+  [ "${args[3]}" = "ssh" ]
+  [ "${args[4]}" = "-F" ]
+  [ "${args[5]}" = "/tmp/devbox-gui-ssh.config" ]
+  [ "${args[6]}" = "lima-devbox-test" ]
+  [ "${args[7]}" = "bash" ]
+  [ "${args[9]}" = "cd '/project with spaces' && exec code . 'a value'" ]
 }
 
 # ------------------------------------------------------- project manifest ----
