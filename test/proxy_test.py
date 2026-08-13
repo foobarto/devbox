@@ -235,6 +235,41 @@ class GitHubCliProxyTests(TestCase):
 
 
 class GitHubCliWrapperTests(TestCase):
+    def test_wrapper_reads_a_renewed_proxy_url_from_its_state_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake_gh = Path(directory) / "gh"
+            fake_gh.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os\n"
+                "print(json.dumps({key: os.environ.get(key) for key in "
+                "('HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY')}))\n"
+            )
+            fake_gh.chmod(0o755)
+            proxy_url_file = Path(directory) / "proxy-url"
+            proxy_url_file.write_text("http://renewed-capability@host.lima.internal:4141\n")
+            environment = {
+                "PATH": directory,
+                "DEVBOX_GH_PROXY_URL": "http://stale-capability@host.lima.internal:4141",
+                "DEVBOX_GH_PROXY_URL_FILE": str(proxy_url_file),
+                "DEVBOX_GH_PROXY_CERT_DIR": "/guest/certs",
+            }
+            result = subprocess.run(
+                [sys.executable, str(GH_WRAPPER)],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        routed = json.loads(result.stdout)
+        self.assertEqual(
+            routed,
+            {
+                "HTTPS_PROXY": "http://renewed-capability@host.lima.internal:4141",
+                "HTTP_PROXY": "http://renewed-capability@host.lima.internal:4141",
+                "ALL_PROXY": "http://renewed-capability@host.lima.internal:4141",
+            },
+        )
+
     def test_wrapper_routes_only_gh_through_the_credential_proxy(self):
         with tempfile.TemporaryDirectory() as directory:
             fake_gh = Path(directory) / "gh"

@@ -112,6 +112,9 @@ CONFIG_DIR="${DEVBOX_CONFIG_DIR:-$HOME/.config/devbox}"
 GLOBAL_CONFIG="$CONFIG_DIR/config.toml"
 DEFAULT_KEYS_FILE="$CONFIG_DIR/api-keys.env"
 PROXY_DEFAULT_URL="${DEVBOX_PROXY_URL:-http://host.lima.internal:4141}"
+# A GitHub proxy capability is valid for eight hours. Refresh it well before
+# expiry while this host-side `devbox` session remains attached to the guest.
+GH_PROXY_CAPABILITY_RENEW_SECONDS="${DEVBOX_GH_PROXY_CAPABILITY_RENEW_SECONDS:-25200}"
 PROJECT_MANIFEST_NAME=".devbox.toml"
 
 # Host credential paths copied into the box under --with-creds (best-effort;
@@ -552,6 +555,113 @@ if not token:
 print(urlunsplit((source.scheme, f"{quote(token)}@{source.netloc}", "", "", "")))
 ' "$1"
 }
+
+gh_proxy_state_path() { # $1 Lima instance name
+  [[ "$1" =~ ^[[:alnum:]_.-]+$ ]] || die "invalid Devbox instance name for GitHub proxy state"
+  printf '%s/gh-proxy-boxes/%s.url' "$CONFIG_DIR" "$1"
+}
+
+valid_gh_proxy_endpoint() { # $1 bare http proxy URL
+  python3 -c '
+import sys
+from urllib.parse import urlsplit
+
+source = urlsplit(sys.argv[1])
+sys.exit(0 if source.scheme == "http" and source.netloc and not source.username and not source.password and not source.path and not source.query and not source.fragment else 1)
+' "$1"
+}
+
+record_gh_proxy_endpoint() { # $1 Lima instance $2 bare http proxy URL
+  local name="$1" url="$2" state_dir path tmp
+  valid_gh_proxy_endpoint "$url" || die "GitHub CLI proxy URL must be a bare http://host:port URL"
+  path="$(gh_proxy_state_path "$name")"
+  state_dir="$(dirname "$path")"
+  umask 077
+  install -d -m 700 "$state_dir"
+  tmp="$(mktemp "$state_dir/.${name}.XXXXXX")"
+  printf '%s\n' "$url" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$path"
+}
+
+stored_gh_proxy_endpoint() { # $1 Lima instance; prints host-owned remembered endpoint
+  local path value
+  path="$(gh_proxy_state_path "$1")"
+  [[ -r "$path" ]] || return 1
+  value="$(<"$path")"
+  if ! valid_gh_proxy_endpoint "$value"; then
+    warn "ignoring invalid remembered GitHub CLI proxy endpoint for $1"
+    return 1
+  fi
+  printf '%s' "$value"
+}
+
+clear_gh_proxy_endpoint() { # $1 Lima instance
+  rm -f -- "$(gh_proxy_state_path "$1")"
+}
+
+write_gh_proxy_url() { # $1 Lima instance $2 full capability-bearing proxy URL
+  local name="$1" url="$2"
+  # Pass the capability on stdin, never as a guest command argument or env var.
+  # The wrapper reads this atomically replaced, owner-only file for each `gh`
+  # invocation, so a renewed capability is immediately effective in existing
+  # shells without rewriting their environment.
+  # shellcheck disable=SC2016 # $HOME and command substitutions expand in the guest.
+  printf '%s\n' "$url" | limactl shell "$name" -- bash -c '
+    set -e
+    state_dir="$HOME/.devbox/gh-proxy"
+    umask 077
+    install -d -m 700 "$state_dir"
+    tmp="$(mktemp "$state_dir/.proxy-url.XXXXXX")"
+    cat > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$state_dir/proxy-url"
+  '
+}
+
+renew_gh_proxy_capability() { # $1 Lima instance $2 bare http proxy URL
+  local name="$1" url="$2" launcher gh_proxy_token gh_proxy_url
+  launcher="$(proxy_launcher)" || { warn "GitHub CLI proxy launcher not found"; return 1; }
+  gh_proxy_token="$("$launcher" --new-gh-proxy-token)" || {
+    warn "could not renew GitHub CLI proxy capability"
+    return 1
+  }
+  [[ "$gh_proxy_token" == *.* ]] || {
+    warn "GitHub CLI proxy returned an invalid renewed capability"
+    return 1
+  }
+  gh_proxy_url="$(printf '%s' "$gh_proxy_token" | github_proxy_url "$url")" || {
+    warn "could not configure renewed GitHub CLI proxy URL"
+    return 1
+  }
+  write_gh_proxy_url "$name" "$gh_proxy_url" || {
+    warn "could not deliver renewed GitHub CLI proxy capability to $name"
+    return 1
+  }
+}
+
+start_gh_proxy_capability_renewal() { # $1 Lima instance $2 bare http proxy URL
+  local name="$1" url="$2"
+  [[ "$GH_PROXY_CAPABILITY_RENEW_SECONDS" =~ ^[1-9][0-9]*$ ]] || \
+    die "DEVBOX_GH_PROXY_CAPABILITY_RENEW_SECONDS must be a positive number of seconds"
+  (
+    while sleep "$GH_PROXY_CAPABILITY_RENEW_SECONDS"; do
+      [[ "$(instance_status "$name")" == "Running" ]] || continue
+      proxy_ensure "$url"
+      renew_gh_proxy_capability "$name" "$url" || \
+        warn "GitHub CLI proxy capability renewal failed; retrying in ${GH_PROXY_CAPABILITY_RENEW_SECONDS}s"
+    done
+  ) &
+  _DB_GH_PROXY_RENEW_PID=$!
+}
+
+stop_gh_proxy_capability_renewal() {
+  local pid="${_DB_GH_PROXY_RENEW_PID:-}"
+  [[ -n "$pid" ]] || return 0
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  unset _DB_GH_PROXY_RENEW_PID
+}
 # is *our* proxy answering on this port? (health endpoint, not just any listener)
 proxy_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -q 'devbox-ai-proxy'; }
 # is anything at all listening on the port?
@@ -602,7 +712,7 @@ proxy_ensure() {
 }
 
 apply_proxy() {
-  local name="$1" url="$2" tmpl="$CONFIG_DIR/proxy-env" launcher gh_wrapper ca_path gh_proxy_token gh_proxy_url
+  local name="$1" url="$2" tmpl="$CONFIG_DIR/proxy-env" launcher gh_wrapper ca_path
   log "Wiring AI and GitHub CLIs → proxy $url"
   if [[ -f "$tmpl" ]]; then
     sed "s|__PROXY_URL__|$url|g" "$tmpl" \
@@ -643,9 +753,6 @@ PY
   "$launcher" --init-gh-ca >/dev/null || die "could not initialise GitHub CLI proxy certificate"
   ca_path="$CONFIG_DIR/gh-proxy-ca.pem"
   [[ -r "$ca_path" ]] || die "GitHub CLI proxy CA was not created: $ca_path"
-  gh_proxy_token="$("$launcher" --new-gh-proxy-token)" || die "could not issue GitHub CLI proxy capability"
-  [[ "$gh_proxy_token" == *.* ]] || die "GitHub CLI proxy returned an invalid capability"
-  gh_proxy_url="$(printf '%s' "$gh_proxy_token" | github_proxy_url "$url")" || die "could not configure GitHub CLI proxy URL"
   gh_wrapper="$(proxy_asset gh-wrapper.py)" || die "GitHub CLI proxy wrapper not found"
   # shellcheck disable=SC2016 # $HOME expands inside the guest shell.
   limactl shell "$name" -- bash -c 'umask 077; install -d -m 700 "$HOME/.devbox/gh-proxy/bin" "$HOME/.devbox/gh-proxy/certs"'
@@ -653,6 +760,7 @@ PY
   limactl copy "$ca_path" "$name:.devbox/gh-proxy/certs/devbox-gh-proxy-ca.pem"
   # shellcheck disable=SC2016 # $HOME expands inside the guest shell.
   limactl shell "$name" -- bash -c 'chmod 755 "$HOME/.devbox/gh-proxy/bin/gh"; chmod 644 "$HOME/.devbox/gh-proxy/certs/devbox-gh-proxy-ca.pem"'
+  renew_gh_proxy_capability "$name" "$url" || die "could not issue GitHub CLI proxy capability"
   limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-12-gh-proxy.sh >/dev/null' <<EOF
 # devbox --proxy: GitHub CLI uses a host-authenticated, GitHub-only TLS proxy.
 # A function remains ahead of PATH even when a later user profile prepends
@@ -661,9 +769,10 @@ PY
 gh() {
   "\$HOME/.devbox/gh-proxy/bin/gh" "\$@"
 }
-export DEVBOX_GH_PROXY_URL="$gh_proxy_url"
+export DEVBOX_GH_PROXY_URL_FILE="\$HOME/.devbox/gh-proxy/proxy-url"
 export DEVBOX_GH_PROXY_CERT_DIR="\$HOME/.devbox/gh-proxy/certs"
 EOF
+  record_gh_proxy_endpoint "$name" "$url"
 }
 
 apply_api_keys() {
@@ -676,6 +785,7 @@ apply_api_keys() {
 clear_auth() {
   local name="$1"
   log "Disabling devbox-managed auth in $name"
+  clear_gh_proxy_endpoint "$name"
   # shellcheck disable=SC2016 # $HOME expands in the guest shell.
   limactl shell "$name" -- bash -c \
     'sudo rm -f /etc/profile.d/zz-devbox-10-proxy.sh /etc/profile.d/zz-devbox-11-codex-proxy.sh /etc/profile.d/zz-devbox-12-gh-proxy.sh /etc/profile.d/zz-devbox-20-keys.sh; rm -rf "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"'
@@ -1020,6 +1130,7 @@ cmd_build() {
 run_cleanup() {
   local rc=$?
   trap - EXIT INT TERM
+  stop_gh_proxy_capability_renewal
   if [[ "${_DB_KEEP:-0}" -eq 1 ]]; then
     log "--keep: retained ${_DB_NAME:-?}"
     log "  re-enter: devbox $(printf '%q' "${_DB_DIR:-.}")$([[ "${_DB_IMAGE:-}" != "$DEFAULT_IMAGE" ]] && printf ' --image %q' "${_DB_IMAGE:-}")"
@@ -1209,10 +1320,20 @@ cmd_run() {
   fi
   [[ $ssh_agent -eq 1 ]] && apply_git_signing "$name"
 
+  local managed_proxy=""
   if [[ $no_auth -eq 1 ]]; then
     clear_auth "$name"
   else
-    [[ -n "$proxy" ]] && { proxy_ensure "$proxy"; apply_proxy "$name" "$proxy"; }
+    managed_proxy="$proxy"
+    if [[ -z "$managed_proxy" && $preexisting -eq 1 ]]; then
+      managed_proxy="$(stored_gh_proxy_endpoint "$name" || true)"
+      [[ -z "$managed_proxy" ]] || log "Refreshing remembered GitHub CLI proxy for $name"
+    fi
+    [[ -z "$managed_proxy" ]] || {
+      proxy_ensure "$managed_proxy"
+      apply_proxy "$name" "$managed_proxy"
+      start_gh_proxy_capability_renewal "$name" "$managed_proxy"
+    }
     [[ -n "$api_keys"  ]] && apply_api_keys "$name" "$api_keys"
     [[ $with_creds -eq 1 ]] && apply_creds  "$name"
   fi
@@ -1269,6 +1390,7 @@ cmd_destroy() {
     log "destroying $i"
     limactl stop -f "$i" 2>/dev/null || true
     limactl delete -f "$i"
+    clear_gh_proxy_endpoint "$i"
   done <<< "$list"
 }
 

@@ -22,6 +22,19 @@ def real_gh() -> str | None:
     return None
 
 
+def proxy_url() -> str:
+    """Read the current host-issued proxy URL without retaining it in a shell."""
+    path = os.environ.get("DEVBOX_GH_PROXY_URL_FILE", "")
+    if path:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return handle.read().strip()
+        except OSError:
+            return ""
+    # Compatibility for boxes configured before capability renewal existed.
+    return os.environ.get("DEVBOX_GH_PROXY_URL", "")
+
+
 def main() -> None:
     arguments = sys.argv[1:]
     if arguments[:1] == ["auth"] and arguments[1:2] not in (["status"], ["--help"], ["-h"]):
@@ -40,9 +53,9 @@ def main() -> None:
         )
         raise SystemExit(127)
 
-    proxy_url = os.environ.get("DEVBOX_GH_PROXY_URL", "")
+    configured_proxy_url = proxy_url()
     certificate_dir = os.environ.get("DEVBOX_GH_PROXY_CERT_DIR", "")
-    if not proxy_url or not certificate_dir:
+    if not configured_proxy_url or not certificate_dir:
         # A manually created box may retain the wrapper after --no-auth. Keep
         # the normal CLI usable in that case rather than failing unexpectedly.
         os.execv(executable, [executable, *arguments])
@@ -52,12 +65,12 @@ def main() -> None:
         {
             "GH_TOKEN": "devbox-proxy",
             "GITHUB_TOKEN": "devbox-proxy",
-            "HTTPS_PROXY": proxy_url,
-            "https_proxy": proxy_url,
-            "HTTP_PROXY": proxy_url,
-            "http_proxy": proxy_url,
-            "ALL_PROXY": proxy_url,
-            "all_proxy": proxy_url,
+            "HTTPS_PROXY": configured_proxy_url,
+            "https_proxy": configured_proxy_url,
+            "HTTP_PROXY": configured_proxy_url,
+            "http_proxy": configured_proxy_url,
+            "ALL_PROXY": configured_proxy_url,
+            "all_proxy": configured_proxy_url,
         }
     )
     environment.pop("NO_PROXY", None)

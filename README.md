@@ -147,8 +147,8 @@ Installed ≠ authenticated. Three combinable strategies, pick per your setup:
 | nothing | *(default)* | you log in interactively inside the box |
 
 The proxy supports API keys plus Claude, Codex, and GitHub CLI logins. A host CLI login
-works with `--proxy` out of the box; its access token is read fresh, refreshed
-on the host when applicable, and never enters the box. See
+works with `--proxy` out of the box; its access token is read fresh and never
+enters the box. See
 [`proxy/README.md`](proxy/README.md) for the full explanation. `--proxy` is the
 recommended default for disposable boxes, and it auto-starts the host proxy
 (once, shared across boxes) — no separate launch step. Manage it with
@@ -157,8 +157,10 @@ recommended default for disposable boxes, and it auto-starts the host proxy
 For `gh`, log in once on the host with `gh auth login`; `devbox --proxy` gives
 the guest CLI a dummy routing marker plus a short-lived Devbox proxy capability,
 then injects the host token only inside a GitHub-only TLS proxy. The capability
-is not a GitHub token and expires after eight hours. GitHub Enterprise hosts are
-not proxied. Git/GitHub SSH auth is separate: use **`--ssh-agent`**. It also enables automatic
+is not a GitHub token, expires after eight hours, and is renewed every seven
+hours while the `devbox --proxy` session is active. The bare proxy endpoint is
+remembered on the host so re-entering a kept box renews its capability too.
+GitHub Enterprise hosts are not proxied. Git/GitHub SSH auth is separate: use **`--ssh-agent`**. It also enables automatic
 SSH-format Git commit signatures through the forwarded agent. Devbox copies the
 first public key exposed by `ssh-add -L` and the host Git name/email, then sets
 Git's signing defaults inside the VM; the private key remains in the host

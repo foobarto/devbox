@@ -268,6 +268,18 @@ setup() {
   [ "$status" -ne 0 ]
 }
 
+@test "GitHub proxy remembers only a bare host-side endpoint with owner-only permissions" {
+  original_config_dir="$CONFIG_DIR"
+  CONFIG_DIR="$BATS_TEST_TMPDIR/config"
+  endpoint="http://host.lima.internal:4141"
+  record_gh_proxy_endpoint devbox-test "$endpoint"
+  [ "$(stored_gh_proxy_endpoint devbox-test)" = "$endpoint" ]
+  [ "$(stat -c %a "$(gh_proxy_state_path devbox-test)")" = "600" ]
+  ! valid_gh_proxy_endpoint "http://capability@host.lima.internal:4141"
+  ! valid_gh_proxy_endpoint "https://host.lima.internal:4141"
+  CONFIG_DIR="$original_config_dir"
+}
+
 @test "proxy setup keeps gh credentials on the host behind a guest wrapper" {
   source_text="$(<"$DEVBOX")"
   [[ "$source_text" == *'gh-wrapper.py'* ]]
@@ -275,6 +287,10 @@ setup() {
   [[ "$source_text" == *'gh-proxy-ca.pem'* ]]
   [[ "$source_text" == *'gh auth login'* ]]
   [[ "$source_text" == *'gh() {'* ]]
+  [[ "$source_text" == *'DEVBOX_GH_PROXY_URL_FILE'* ]]
+  [[ "$source_text" == *'renew_gh_proxy_capability'* ]]
+  [[ "$source_text" == *'start_gh_proxy_capability_renewal'* ]]
+  [[ "$source_text" == *'stored_gh_proxy_endpoint'* ]]
   [[ "$source_text" == *'rm -rf "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"'* ]]
 }
 

@@ -40,9 +40,10 @@ chooses, in order:
 | GitHub CLI (`gh`) | `GH_TOKEN` / `GITHUB_TOKEN` | host `gh auth login` |
 
 The proxy reads access tokens fresh on every request. Its background check runs
-every minute, refreshes a session shortly before expiry, and retries a request
-once after a 401 or 403. It uses OAuth refresh grants rather than sending empty
-model prompts, so it does not consume model usage just to keep a session alive.
+every minute, refreshes Claude and Codex OAuth sessions shortly before expiry,
+and retries a request once after a 401 or 403. It uses OAuth refresh grants
+rather than sending empty model prompts, so it does not consume model usage
+just to keep a session alive.
 The VM never receives an access or refresh token; the repository also has a
 pre-commit guard against embedding one in production scripts.
 
@@ -64,8 +65,11 @@ into the guest, and injects the host token after TLS termination for
 `api.github.com` and `uploads.github.com`. The guest holds only the literal
 `devbox-proxy` routing marker plus a short-lived Devbox proxy capability, never
 the real GitHub token. The capability authenticates only the local proxy and
-expires after eight hours. GitHub-owned download hosts are tunnelled without TLS
-interception.
+expires after eight hours. While the host-side `devbox --proxy` session remains
+open, Devbox renews that capability every seven hours and atomically updates the
+guest wrapper state. Devbox remembers only the bare proxy endpoint on the host,
+so re-entering a kept box renews its capability even when `--proxy` is omitted.
+GitHub-owned download hosts are tunnelled without TLS interception.
 
 Log in on the host first:
 
@@ -92,6 +96,11 @@ devbox --keep --proxy
 The command refreshes the guest wrapper and proxy profile, then opens the box.
 Use `gh api /rate_limit --jq .rate.remaining` there as a credential-safe smoke
 check. Do not run `gh auth login` in the guest; log in on the host instead.
+For a session that was closed or suspended past the capability lifetime, the
+same command issues a fresh capability before opening the guest. Subsequent
+bare re-entry to that kept box does the same, using the host-owned remembered
+endpoint; use `--no-auth` to remove the proxy configuration and remembered
+endpoint.
 
 If the box says `gh` is missing, it predates the golden-image installation.
 First check that its project work is committed or otherwise safe, then rebuild
