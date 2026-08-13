@@ -96,6 +96,7 @@ class WebsiteTests(TestCase):
     def test_pages_source_contains_the_static_site_and_disables_jekyll(self):
         self.assertTrue((SITE / ".nojekyll").is_file())
         self.assertTrue((SITE / "index.html").is_file())
+        self.assertEqual("devbox.foobarto.me\n", (SITE / "CNAME").read_text(encoding="utf-8"))
 
     def test_version_sync_workflow_updates_and_deploys_only_when_needed(self):
         workflow = (ROOT / ".github/workflows/sync-site-version.yml").read_text(encoding="utf-8")
