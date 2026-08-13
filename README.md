@@ -29,7 +29,8 @@ devbox                       # clone → mount CWD → shell in → delete on ex
 
 - [Lima](https://lima-vm.io) ≥ 2.0 (`limactl`) with a QEMU or VZ backend
 - `python3` ≥ 3.11 (for the [proxy](proxy/README.md) and `.devbox.toml`; standard library only)
-- `waypipe` on the host when using `devbox gui` from a Wayland session
+- `waypipe` on the host when using `devbox gui` or `devbox --gui` from a
+  Wayland session
 
 ## Install
 
@@ -62,9 +63,9 @@ ln -s "${XDG_DATA_HOME:-$HOME/.local/share}/devbox/bin/devbox" ~/.local/bin/devb
 ## Usage
 
 ```
-devbox [DIR] [FLAGS]        spin up / attach a box for DIR (default: $PWD)
-devbox gui [DIR] [FLAGS] -- APP [ARGS...]
-                              run a guest Wayland app on the host
+devbox [DIR] [FLAGS]                         spin up / attach a box for DIR (default: $PWD)
+devbox gui [DIR] [FLAGS] [-- APP [ARGS...]]  open a GUI-ready shell or run a guest Wayland app
+devbox --gui|-G [DIR] [FLAGS] [-- APP ...]   same GUI behavior through the main command
 devbox build [--image N] [--force]   build/refresh the golden image
 devbox ls                            list devbox instances
 devbox destroy NAME | --all | --goldens
@@ -85,33 +86,39 @@ devbox destroy NAME | --all | --goldens
 | `--api-keys[=FILE]`, `-K[=FILE]` | inject API keys into the box from an env file (default `~/.config/devbox/api-keys.env`). |
 | `--with-creds`, `-c` | copy host AI-tool credential files into the box (OAuth logins for claude/codex without a proxy). Best-effort. |
 | `--with-agent-config`, `-g` | copy an allowlisted set of non-secret Claude, Codex, OpenCode, and Stado settings, prompts, rules, and custom agents. Auth, histories, caches, and key directories are excluded; suspected credentials are skipped. |
-| `-a` | shortcut for `--with-agent-config --proxy --ssh-agent`; it never enables `--with-creds`. |
+| `--gui`, `-G` | start a GUI-ready Devbox shell through Waypipe; after the optional `--`, run one guest GUI app instead. |
+| `-a` | shortcut for `--with-agent-config --proxy --ssh-agent --gui`; it never enables `--with-creds`. |
 | `--mount PATH[:ro\|:rw]`, `-m PATH[:ro\|:rw]` | mount an extra host path into the box at the same path (default `ro`). Repeatable; applied at box creation. |
 | `--copy SRC[:DEST]`, `-C SRC[:DEST]` | copy an extra host file/dir into the box (`DEST` defaults to the basename in `$HOME`). Repeatable; works on new **and** existing boxes. |
 | `--name NAME`, `-N NAME` | override the derived instance name. |
 
 ### GUI apps on a Wayland host
 
-`devbox gui` runs a Wayland application in the Devbox and displays it in the
-host session through [Waypipe](https://gitlab.freedesktop.org/mstoeckl/waypipe/)
-over Lima's per-instance SSH connection. It does not mount the host Wayland
-socket into the guest.
+`devbox gui` and `devbox --gui` start a GUI-ready Devbox shell whose Wayland
+applications display in the host session through
+[Waypipe](https://gitlab.freedesktop.org/mstoeckl/waypipe/) over Lima's
+per-instance SSH connection. It does not mount the host Wayland socket into the
+guest. Put an application after `--` when you want Devbox to run just that app.
 
 ```sh
-devbox gui . -- weston-terminal
-devbox gui . -a -- code .
+devbox --gui .                         # launch GUI apps from the Devbox shell
+devbox -G .                            # short form; -g remains --with-agent-config
+devbox gui . -- weston-terminal        # run one app and return when it exits
+devbox --gui . -a -- code .
 devbox gui . -- firefox --new-instance
 ```
 
 The host must be in an active Wayland session and have `waypipe` installed.
 New goldens include the guest-side package; an older kept box installs it on its
 first GUI launch. GUI apps use Waypipe's `--no-gpu` mode because Devbox does not
-pass host DRM/render nodes into QEMU guests. As with a normal `devbox` run, the
-box is removed when the app exits unless `--keep` is supplied.
+pass host DRM/render nodes into QEMU guests. This works with already-existing
+Devboxes too: guest-side Waypipe is installed on demand. As with a normal
+`devbox` run, the box is removed when the shell or app exits unless `--keep` is
+supplied.
 
-Use `-a` for the usual agent-config + proxy + SSH-agent setup, or combine
-flags yourself, e.g. `devbox -s -p -m ~/data:ro -C ~/.netrc`. Build accepts
-`-i` and `-f` for `--image` and `--force`; destroy accepts `-A` and
+Use `-a` for the GUI-ready agent-config + proxy + SSH-agent setup, or combine
+flags yourself, e.g. `devbox --gui -s -p -m ~/data:ro -C ~/.netrc`. Build
+accepts `-i` and `-f` for `--image` and `--force`; destroy accepts `-A` and
 `-G` for `--all` and `--goldens`. Help and version are `-h` and `-V`.
 
 ## How it works

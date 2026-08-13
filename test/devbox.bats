@@ -301,11 +301,15 @@ setup() {
   [[ "$source_text" == *'rm -rf "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"'* ]]
 }
 
-@test "GUI command uses Waypipe over Lima SSH without exposing the host socket" {
+@test "GUI commands use Waypipe over Lima SSH without exposing the host socket" {
   source_text="$(<"$DEVBOX")"
   [[ "$source_text" == *'cmd_gui() { cmd_run --gui "$@"; }'* ]]
+  [[ "$source_text" == *'--gui|-G) gui=1'* ]]
+  [[ "$source_text" == *'-a) with_agent_config=1; proxy="$PROXY_DEFAULT_URL"; ssh_agent=1; gui=1'* ]]
   [[ "$source_text" == *'waypipe --no-gpu'*'ssh -F "$ssh_config" "lima-$name"'* ]]
+  [[ "$source_text" == *'ssh -F "$ssh_config" -tt "lima-$name"'* ]]
   [[ "$source_text" == *'gui_remote_command'*'shlex.quote'* ]]
+  [[ "$source_text" == *'gui_remote_shell'*'exec bash -l'* ]]
   [[ "$source_text" == *'{{.SSHConfigFile}}'* ]]
   [[ "$source_text" == *'host Wayland socket'* ]]
   [[ "$source_text" != *'--mount "$XDG_RUNTIME_DIR'* ]]
@@ -331,6 +335,29 @@ setup() {
   [ "${args[6]}" = "lima-devbox-test" ]
   [ "${args[7]}" = "bash" ]
   [ "${args[9]}" = "cd '/project with spaces' && exec code . 'a value'" ]
+}
+
+@test "GUI shell starts in the mounted project directory" {
+  run gui_remote_shell "/project with spaces"
+  [ "$status" -eq 0 ]
+  [ "$output" = "cd '/project with spaces' && exec bash -l" ]
+}
+
+@test "GUI shell keeps Waypipe alive over an interactive Lima SSH session" {
+  host_wayland_socket() { :; }
+  ensure_guest_waypipe() { :; }
+  lima_ssh_config() { printf '%s' /tmp/devbox-gui-ssh.config; }
+  waypipe() { printf '%s\0' "$@" > "$BATS_TEST_TMPDIR/waypipe-args"; }
+  run_gui_shell devbox-test "/project with spaces"
+  mapfile -d '' -t args < "$BATS_TEST_TMPDIR/waypipe-args"
+  [ "${args[0]}" = "--no-gpu" ]
+  [ "${args[3]}" = "ssh" ]
+  [ "${args[4]}" = "-F" ]
+  [ "${args[5]}" = "/tmp/devbox-gui-ssh.config" ]
+  [ "${args[6]}" = "-tt" ]
+  [ "${args[7]}" = "lima-devbox-test" ]
+  [ "${args[8]}" = "bash" ]
+  [ "${args[10]}" = "cd '/project with spaces' && exec bash -l" ]
 }
 
 # ------------------------------------------------------- project manifest ----
@@ -535,7 +562,8 @@ setup() {
   run bash "$DEVBOX" -h
   [ "$status" -eq 0 ]
   [[ "$output" == *"--with-agent-config, -g"* ]]
-  [[ "$output" == *"shortcut for --with-agent-config --proxy --ssh-agent"* ]]
+  [[ "$output" == *"--gui, -G"* ]]
+  [[ "$output" == *"shortcut for --with-agent-config --proxy --ssh-agent --gui"* ]]
   run bash "$DEVBOX" -V
   [ "$status" -eq 0 ]
   [ "$output" = "devbox $(tr -d "[:space:]" < "$BATS_TEST_DIRNAME/../VERSION")" ]
@@ -546,6 +574,7 @@ setup() {
   for alias in \
     '--image|-i' '--keep|-k' '--ssh-agent|-s' '--proxy|-p' '--no-auth|-n' \
     '--api-keys|-K' '--with-creds|-c' '--with-agent-config|-g' \
+    '--gui|-G' \
     '--mount|-m' '--copy|-C' '--name|-N' '--force|-f' '--all|-A' '--goldens|-G' \
     '--cpus|-j' '--memory|-M' '--disk|-D' '--yes|-y'; do
     [[ "$source_text" == *"$alias"* ]]
