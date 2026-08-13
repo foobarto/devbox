@@ -6,11 +6,13 @@ on:
     - cron: "17 5 * * 1"
   workflow_dispatch:
 
-# The workflow commits a one-line website change, then explicitly requests a
-# Pages build. GITHUB_TOKEN commits do not trigger a GitHub Pages build.
+# The workflow creates a protected-branch-compliant version-sync PR, squash
+# merges it, then explicitly requests a Pages build. GITHUB_TOKEN merges do
+# not trigger a GitHub Pages build.
 permissions:
   contents: write
   pages: write
+  pull-requests: write
 
 concurrency:
   group: sync-site-version
@@ -47,19 +49,33 @@ jobs:
             printf 'changed=true\n' >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Commit the current Devbox version
+      - name: Create and merge the version-sync pull request
         if: steps.update.outputs.changed == 'true'
+        id: merge
         env:
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
+          branch="automation/sync-site-version-${VERSION}"
+          existing_pr="$(gh pr list --base main --head "$branch" --state open --json number --jq '.[0].number')"
+          if [[ -n "$existing_pr" ]]; then
+            printf 'merged=false\n' >> "$GITHUB_OUTPUT"
+            printf 'An open version-sync PR already exists: #%s\n' "$existing_pr"
+            exit 0
+          fi
+
+          git switch -c "$branch"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/index.html
           git commit -m "docs(site): sync version to ${VERSION}"
-          git push origin HEAD:main
+          git push --set-upstream origin "$branch"
+          pr_url="$(gh pr create --base main --head "$branch" --title "docs(site): sync version to ${VERSION}" --body "Automated website version update from \`VERSION\`.")"
+          gh pr merge "$pr_url" --squash --delete-branch
+          printf 'merged=true\n' >> "$GITHUB_OUTPUT"
 
       - name: Request a GitHub Pages build
-        if: steps.update.outputs.changed == 'true'
+        if: steps.merge.outputs.merged == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api --method POST "repos/${GITHUB_REPOSITORY}/pages/builds"

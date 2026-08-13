@@ -105,9 +105,11 @@ class WebsiteTests(TestCase):
         self.assertIn("scripts/update-site-version.py", workflow)
         self.assertIn("contents: write", workflow)
         self.assertIn("pages: write", workflow)
+        self.assertIn("pull-requests: write", workflow)
         self.assertIn("ref: main", workflow)
         self.assertIn("git diff --quiet -- docs/index.html", workflow)
-        self.assertIn("git push origin HEAD:main", workflow)
+        self.assertIn("gh pr create --base main", workflow)
+        self.assertIn("gh pr merge \"$pr_url\" --squash --delete-branch", workflow)
         self.assertIn('gh api --method POST "repos/${GITHUB_REPOSITORY}/pages/builds"', workflow)
 
 
