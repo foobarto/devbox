@@ -74,6 +74,51 @@ setup() {
   [ "$a" != "$b" ]
 }
 
+# ------------------------------------------------------ session persistence ----
+@test "project session state follows the project rather than the VM image" {
+  original="$AGENT_SESSION_BASE"
+  AGENT_SESSION_BASE="$BATS_TEST_TMPDIR/state"
+  a="$(project_session_dir /home/u/proj)"
+  b="$(project_session_dir /home/u/proj)"
+  [ "$a" = "$b" ]
+  [[ "$a" =~ /proj-[0-9a-f]{16}$ ]]
+  [ "$a" != "$(project_session_dir /home/u/other)" ]
+  AGENT_SESSION_BASE="$original"
+}
+
+@test "project session state is created owner-only" {
+  original="$AGENT_SESSION_BASE"
+  AGENT_SESSION_BASE="$BATS_TEST_TMPDIR/state"
+  path="$(project_session_dir /home/u/proj)"
+  prepare_session_dir "$path"
+  [ -d "$path" ]
+  [ "$(stat -c %a "$AGENT_SESSION_BASE")" = 700 ]
+  [ "$(stat -c %a "$path")" = 700 ]
+  AGENT_SESSION_BASE="$original"
+}
+
+@test "session persistence covers native stores without persisting auth homes" {
+  run declare -f apply_session_persistence
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'.claude/projects'* ]]
+  [[ "$output" == *'codex_home/sessions'* ]]
+  [[ "$output" == *'.devbox/codex-proxy'* ]]
+  [[ "$output" == *'.pi/agent/sessions'* ]]
+  [[ "$output" == *'OPENCODE_DB'* ]]
+  [[ "$output" == *'.local/share/stado/sessions'* ]]
+  [[ "$output" != *'.codex/auth.json'* ]]
+  [[ "$output" != *'.local/share/opencode/auth.json'* ]]
+}
+
+@test "new boxes mount persistent session state and kept boxes gain it once" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *'clone_args+=(--mount "${session_state}:w")'* ]]
+  [[ "$source_text" == *'ensure_session_mount "$name" "$session_state"'* ]]
+  [[ "$source_text" == *'remove_session_mount "$name" "$session_state"'* ]]
+  [[ "$source_text" == *'session_state_other_instance "$session_state" "$name"'* ]]
+  [[ "$source_text" == *'--ephemeral-sessions|-e) ephemeral_sessions=1'* ]]
+}
+
 # --------------------------------------------------------- emit_base_stanza ----
 @test "base stanza: bare template name" {
   run emit_base_stanza ubuntu-24.04
@@ -633,13 +678,28 @@ setup() {
 @test "every long run, build, and destroy flag has a single-letter alias" {
   source_text="$(<"$DEVBOX")"
   for alias in \
-    '--image|-i' '--keep|-k' '--ssh-agent|-s' '--proxy|-p' '--no-auth|-n' \
+    '--image|-i' '--keep|-k' '--ephemeral-sessions|-e' '--ssh-agent|-s' '--proxy|-p' '--no-auth|-n' \
     '--api-keys|-K' '--with-creds|-c' '--with-agent-config|-g' \
     '--gui|-G' '--traffic-audit|-T' \
     '--mount|-m' '--copy|-C' '--name|-N' '--force|-f' '--all|-A' '--goldens|-G' \
     '--cpus|-j' '--memory|-M' '--disk|-D' '--yes|-y'; do
     [[ "$source_text" == *"$alias"* ]]
   done
+}
+
+@test "sessions path works without Lima and clear has an explicit destructive path" {
+  project="$BATS_TEST_TMPDIR/project"
+  session_base="$BATS_TEST_TMPDIR/session-root"
+  mkdir -p "$project"
+  run env DEVBOX_SESSION_DIR="$session_base" bash "$DEVBOX" sessions path "$project"
+  [ "$status" -eq 0 ]
+  state="$output"
+  [[ "$state" == "$session_base/"* ]]
+  mkdir -p "$state"
+  printf 'session transcript\n' > "$state/example.jsonl"
+  run env DEVBOX_SESSION_DIR="$session_base" bash "$DEVBOX" sessions clear --yes "$project"
+  [ "$status" -eq 0 ]
+  [ ! -e "$state" ]
 }
 
 @test "help states that --keep is the only opt-out from cleanup" {

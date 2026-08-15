@@ -8,7 +8,9 @@ with an AI-CLI toolchain — **claude**, **codex**, **opencode**, **pi**, and
 Project site: [devbox.foobarto.me](https://devbox.foobarto.me/).
 
 `cd` into a project, type `devbox`, and you're in a throwaway Linux VM with the
-project mounted and the tools ready. Exit the shell and the VM is gone.
+project mounted and the tools ready. Exit the shell and the VM is gone; the
+project's resumable AI sessions remain in a narrow, owner-only host state
+directory so the next clone can continue them.
 
 ```sh
 cd ~/code/some-project
@@ -17,8 +19,9 @@ devbox                       # clone → mount CWD → shell in → delete on ex
 
 ## Why
 
-- **Disposable.** Each box is deleted on exit by default. Nothing to clean up,
-  nothing accretes.
+- **Disposable.** Each box is deleted on exit by default. Toolchains, package
+  installs, credentials, processes, and caches disappear; only the project and
+  its deliberately persistent AI session records remain.
 - **Isolated.** Real dev work in a VM boundary, not your host. Only the mounted
   folder is visible to the box.
 - **Fast.** A one-time *golden* image carries the heavy toolchain; each run is a
@@ -45,7 +48,7 @@ brew install foobarto/tap/devbox
 
 Installs `devbox` and `devbox-ai-proxy` on your `PATH`. The current stable
 GitHub release is
-[`v1.1.0`](https://github.com/foobarto/devbox/releases/tag/v1.1.0); source
+[`v1.2.0`](https://github.com/foobarto/devbox/releases/tag/v1.2.0); source
 archives are available from that release. Config lives under `~/.config/devbox/`
 (or `$XDG_CONFIG_HOME/devbox`).
 
@@ -72,6 +75,7 @@ devbox --gui|-G [DIR] [FLAGS] [-- APP ...]   same GUI behavior through the main 
 devbox build [--image N] [--force]   build/refresh the golden image
 devbox ls                            list devbox instances
 devbox destroy NAME | --all | --goldens
+devbox sessions [path|clear --yes] [DIR]
 ```
 
 ### Run flags
@@ -83,6 +87,7 @@ devbox destroy NAME | --all | --goldens
 | `--memory SIZE`, `-M SIZE` | memory for this box, e.g. `12GiB` (default `6GiB`). |
 | `--disk SIZE`, `-D SIZE` | disk ceiling, e.g. `80GiB` (default `100GiB`). Sparse, so it costs only what is written; grow-only. |
 | `--keep`, `-k` | don't auto-delete the box on exit. |
+| `--ephemeral-sessions`, `-e` | keep AI session records on this box's disposable disk instead of attaching the project's persistent session store. |
 | `--ssh-agent`, `-s` | forward the host SSH agent into the box (git/GitHub) and configure signed Git commits. Host **private keys never enter the VM** — only the agent socket and selected public key are used. |
 | `--proxy[=URL]`, `-p[=URL]` | point the AI CLIs and `gh` at a host-side credential proxy; credentials stay on the host. Default `http://host.lima.internal:4141`. |
 | `--traffic-audit[=connect\|off]`, `-T` | explicitly route normal web tooling through an audited CONNECT proxy and block direct TCP/UDP 80/443. `off` removes it from a kept box. It is separate from `-a`. |
@@ -154,12 +159,50 @@ Use `-a` for the usual agent-config + proxy + SSH-agent setup. Add `--gui` or
      path, and boots.
    - applies `DIR/.devbox.toml` if present (per-project setup — see
      [`examples/.devbox.toml`](examples/.devbox.toml)),
+   - mounts the project's owner-only AI session state and links each agent's
+     native transcript/index paths to it,
    - drops you into a shell in `DIR`,
    - on exit, **deletes** the clone — unless that invocation uses `--keep`.
 
 Because the name is deterministic, re-running `devbox` in the same folder finds
 the same box. That's what makes "one box per folder" and re-entering `--keep`
 boxes work.
+
+## AI session continuity
+
+Resumable session state is persistent by default even when the VM is not.
+Devbox gives each canonical project path a separate directory under
+`${XDG_STATE_HOME:-~/.local/state}/devbox/sessions/`, mounts only that directory
+read-write, and uses it for Claude Code, Codex (including the isolated
+`--proxy` profile), OpenCode, Pi, and Stado session records. Existing kept
+boxes gain the mount on their next entry and restart once if necessary.
+Devbox refuses to attach the same store to two differently named boxes at once,
+which avoids concurrent writers corrupting an agent's session database; destroy
+the retained owner first or make the second box ephemeral.
+
+Authentication remains separate: Claude/Codex/OpenCode auth files, provider
+keys, and unrelated sessions already present on the host are not placed in the
+session store. Session transcripts can still contain prompts, source snippets,
+paths, and tool output, so treat the directory as sensitive state. It is mode
+`0700` and is also a deliberate cross-lifecycle trust channel: instructions in
+an old transcript are available again when you resume it.
+
+Use each tool's native resume command after entering the same project. For
+example, Claude Code supports `claude --continue` / `claude --resume`, and
+Codex supports `codex resume --last` or its session picker. Inspect or remove
+the exact project store from the host with:
+
+```sh
+devbox sessions path .
+devbox sessions clear .          # confirms interactively; destroy a retained box first
+devbox sessions clear --yes .    # explicit non-interactive removal
+```
+
+`devbox destroy` intentionally leaves sessions intact. Use
+`--ephemeral-sessions` (`-e`) when a run should leave no resumable agent state;
+on a kept box that already has the host mount, the flag unlinks the native
+agent stores and restarts the box once to remove that mount completely.
+Override the host root with `DEVBOX_SESSION_DIR` when needed.
 
 ## Images
 
@@ -312,8 +355,8 @@ warning when it finds one.
 
 ## Config
 
-Everything host-side lives under `~/.config/devbox/` (override with
-`$DEVBOX_CONFIG_DIR`):
+Configuration and generated golden metadata live under `~/.config/devbox/`
+(override with `$DEVBOX_CONFIG_DIR`):
 
 ```
 ~/.config/devbox/
@@ -335,6 +378,11 @@ disk = "150GiB"
 
 Resource precedence is **CLI flags > `.devbox.toml` > `config.toml` > built-in
 defaults** (4 CPUs, 6GiB, 100GiB).
+
+Persistent AI transcripts are state rather than configuration, so they live
+separately under `${XDG_STATE_HOME:-~/.local/state}/devbox/sessions/` (override
+with `$DEVBOX_SESSION_DIR`). `devbox sessions path DIR` resolves the exact
+per-project directory.
 
 ## Tests
 

@@ -43,7 +43,7 @@
       <section id="top" class="hero section-grid">
         <div class="hero-glow" aria-hidden="true"></div>
         <div class="shell hero-copy">
-          <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> <span data-current-version>v1.1.0</span> · Lima ≥ 2.0</p>
+          <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> <span data-current-version>v1.2.0</span> · Lima ≥ 2.0</p>
           <div class="hero-title">
             <svg class="hero-mark" viewBox="0 0 60 66" aria-hidden="true">
               <path d="M30 3 54 16.5v27L30 57 6 43.5v-27L30 3Z"></path>
@@ -52,7 +52,7 @@
             <h1>devbox</h1>
           </div>
           <p class="hero-lede">A practical VM boundary for AI-assisted development.</p>
-          <p class="hero-detail">Claude, Codex, OpenCode, Pi, Stado, Herdr, and <code>gh</code> are preloaded. Open exactly the host-backed capabilities a task needs—then throw the box away when you are done.</p>
+          <p class="hero-detail">Claude, Codex, OpenCode, Pi, Stado, Herdr, and <code>gh</code> are preloaded. Open exactly the host-backed capabilities a task needs—then throw the box away while keeping only its resumable project sessions.</p>
           <div class="hero-actions">
             <a class="button button-primary" href="https://github.com/foobarto/devbox#readme">Read the docs <span aria-hidden="true">→</span></a>
             <button class="install-command" type="button" data-copy="brew install foobarto/tap/devbox" aria-label="Copy installation command">
@@ -78,7 +78,7 @@
         <div class="prose">
           <p class="lead">Devbox makes isolation of AI agents and tools from your credentials and private files easy enough to use every time.</p>
           <p>Agents read untrusted repositories, issues, webpages, and tool output. Prompt injection turns that input into instructions; even without an attacker, an agent can decide it needs to read, install, or run more than expected.</p>
-          <p>A VM boundary makes the answer structural: the agent sees the mounted project and only the capabilities you explicitly select.</p>
+          <p>A VM boundary makes the answer structural: the agent sees the mounted project, its narrow per-project session store, and only the additional capabilities you explicitly select.</p>
         </div>
       </section>
 
@@ -93,12 +93,12 @@
         <div class="capability-grid">
           <article class="capability default">
             <p class="capability-number">00</p><h3>Fresh by default</h3>
-            <p>No host credentials, desktop session, or SSH agent is exposed. You can log in inside the ephemeral VM if you choose.</p>
+            <p>No host credentials, desktop session, or SSH agent is exposed. Only this project's owner-only AI session store survives clone disposal; use <code>-e</code> to make that ephemeral too.</p>
             <code>(default)</code>
           </article>
           <article class="capability">
             <p class="capability-number">01</p><h3>Non-secret agent context</h3>
-            <p>Selected rules, prompts, settings, and custom agents cross in. Credentials, histories, caches, and key directories do not.</p>
+            <p>Selected rules, prompts, settings, and custom agents cross in. Credentials, unrelated host histories, caches, and key directories do not.</p>
             <code>--with-agent-config</code>
           </article>
           <article class="capability">
@@ -200,12 +200,13 @@
           <ol class="steps">
             <li><span>01</span><h3>Build</h3><p>Provision Homebrew, AI CLIs, <code>gh</code>, and build essentials into a golden image.</p></li>
             <li><span>02</span><h3>Clone</h3><p>Attach to a kept box or quickly clone the golden image for the project directory.</p></li>
-            <li><span>03</span><h3>Mount</h3><p>Mount the project writable at the same path, apply approved configuration, and enter.</p></li>
-            <li><span>04</span><h3>Destroy</h3><p>Exit to delete the clone, unless you explicitly used <code>--keep</code>.</p></li>
+            <li><span>03</span><h3>Mount</h3><p>Mount the project plus its narrow resumable-session store, apply approved configuration, and enter.</p></li>
+            <li><span>04</span><h3>Destroy</h3><p>Exit to delete the clone while retaining project sessions, unless you explicitly used <code>--keep</code>.</p></li>
           </ol>
           <pre class="usage-block"><code><span class="prompt">$</span> devbox [DIR] [FLAGS]                     <span class="comment"># enter a disposable development VM</span>
 <span class="prompt">$</span> devbox gui [DIR] [FLAGS] [-- APP ...]  <span class="comment"># open a GUI-ready shell or app</span>
 <span class="prompt">$</span> devbox build [--image N] [--force]      <span class="comment"># create or refresh a golden image</span>
+<span class="prompt">$</span> devbox sessions path|clear [DIR]       <span class="comment"># inspect or remove resumable state</span>
 <span class="prompt">$</span> devbox destroy NAME | --all | --goldens</code></pre>
         </div>
       </section>
@@ -214,6 +215,7 @@
         <div class="section-heading stacked"><div><p class="eyebrow">KEY FLAGS</p><h2>The ones you’ll reach for.</h2></div><p>Flags make host-backed capabilities explicit. They work on a new box and, where applicable, refresh or remove state in an existing kept box.</p></div>
         <div class="flag-list">
           <article><code>--keep, -k</code><p>Leave the box running when the shell exits.</p></article>
+          <article><code>--ephemeral-sessions, -e</code><p>Keep this run's AI transcripts on the disposable guest disk.</p></article>
           <article><code>--proxy[=URL], -p</code><p>Use host-side AI and GitHub authentication without exposing real tokens in the VM.</p></article>
           <article><code>--traffic-audit, -T</code><p>Route normal web tooling through the audited proxy or fail on direct web ports.</p></article>
           <article><code>--ssh-agent, -s</code><p>Forward the host SSH agent for authentication and SSH-signed commits.</p></article>
