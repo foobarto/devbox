@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.2.1 - 2026-08-15
+
+- Move GitHub proxy-capability renewal into the long-lived host proxy daemon so
+  registered running boxes refresh every seven hours without an open Devbox
+  terminal, guest restart, or `.devbox.toml`/image resolution. Add
+  `devbox proxy refresh` for an immediate manifest-independent refresh.
+- Route Homebrew's public `gh` path through the managed proxy wrapper under
+  `--proxy`, keeping the real binary as a private wrapper dependency and
+  restoring the normal Homebrew link under `--no-auth`.
+
 ## v1.2.0 - 2026-08-15
 
 - Persist resumable Claude Code, Codex, OpenCode, Pi, and Stado session state

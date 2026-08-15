@@ -48,7 +48,7 @@ brew install foobarto/tap/devbox
 
 Installs `devbox` and `devbox-ai-proxy` on your `PATH`. The current stable
 GitHub release is
-[`v1.2.0`](https://github.com/foobarto/devbox/releases/tag/v1.2.0); source
+[`v1.2.1`](https://github.com/foobarto/devbox/releases/tag/v1.2.1); source
 archives are available from that release. Config lives under `~/.config/devbox/`
 (or `$XDG_CONFIG_HOME/devbox`).
 
@@ -243,7 +243,8 @@ enters the box. See
 [`proxy/README.md`](proxy/README.md) for the full explanation. `--proxy` is the
 recommended default for disposable boxes, and it auto-starts the host proxy
 (once, shared across boxes) — no separate launch step. Manage it with
-`devbox proxy [start|stop|status]`.
+`devbox proxy [start|stop|status|refresh]`. `refresh` updates every registered,
+running box directly and never reads a project's `.devbox.toml`.
 
 Every authenticated proxy request is also written to a host-owned, owner-only
 audit log. It captures AI prompts/queries and GitHub API request payloads (with
@@ -286,8 +287,17 @@ For `gh`, log in once on the host with `gh auth login`; `devbox --proxy` gives
 the guest CLI a dummy routing marker plus a short-lived Devbox proxy capability,
 then injects the host token only inside a GitHub-only TLS proxy. The capability
 is not a GitHub token, expires after eight hours, and is renewed every seven
-hours while the `devbox --proxy` session is active. The bare proxy endpoint is
-remembered on the host so re-entering a kept box renews its capability too.
+hours by the long-lived host proxy daemon, independently of any `devbox` shell
+or project manifest. It checks recorded box names once a minute, so a host
+suspend or long idle is repaired promptly after resume without restarting the
+guest. `devbox proxy refresh` forces the same update immediately.
+
+To prevent an agent from accidentally bypassing the wrapper with Homebrew's
+absolute path, `--proxy` copies the real `gh` binary into the managed private
+wrapper directory and replaces Homebrew's public `bin/gh` link with the wrapper;
+`--no-auth` restores the normal Homebrew link. This is command-routing hygiene,
+not containment against hostile same-user guest code, which can still locate
+and execute files it is permitted to access.
 GitHub Enterprise hosts are not proxied. Git/GitHub SSH auth is separate: use **`--ssh-agent`**. It also enables automatic
 SSH-format Git commit signatures through the forwarded agent. Devbox copies the
 first public key exposed by `ssh-add -L` and the host Git name/email, then sets

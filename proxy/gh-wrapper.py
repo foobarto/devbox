@@ -14,6 +14,9 @@ import sys
 def real_gh() -> str | None:
     """Find the golden's gh binary without recursing back into this wrapper."""
     wrapper = os.path.realpath(__file__)
+    managed_real = os.path.join(os.path.dirname(os.path.dirname(wrapper)), "libexec", "gh-real")
+    if os.path.isfile(managed_real) and os.access(managed_real, os.X_OK):
+        return managed_real
     for directory in os.environ.get("PATH", "").split(os.pathsep):
         candidate = os.path.join(directory or ".", "gh")
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):

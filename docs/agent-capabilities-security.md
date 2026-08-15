@@ -98,6 +98,14 @@ guest does not receive an access or refresh token. The GitHub wrapper also
 rejects guest-side token-changing `gh auth` commands. See the [proxy
 design](../proxy/README.md).
 
+For `gh`, the host proxy daemon renews short-lived capabilities directly for
+host-registered running Lima boxes; it does not re-evaluate project manifests or
+restart guests. `--proxy` replaces Homebrew's public `gh` link with the wrapper
+to prevent accidental direct execution, while retaining a private executable
+copy for the wrapper itself. Because both remain executable by the guest user,
+this routing measure does not stop deliberately hostile same-user code from
+finding and invoking the private binary.
+
 The host records detailed authenticated-proxy request audits by default,
 including prompts and GitHub mutation payloads. This helps attribute actions,
 but creates a second sensitive host-local data store. Read [proxy audit

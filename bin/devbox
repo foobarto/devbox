@@ -20,7 +20,8 @@
 #                                 [--cpus N|-j N] [--memory S|-M S] [--disk S|-D S]
 #   devbox ls
 #   devbox destroy NAME | --all | --goldens
-#   devbox proxy [start|stop|status|audit]   manage the shared host-side proxy
+#   devbox proxy [start|stop|status|refresh|audit]
+#                               manage the shared host-side proxy
 #   devbox sessions [path|clear [--yes]] [DIR]
 #                               inspect or remove persistent AI session state
 #   devbox --version|-V
@@ -141,9 +142,6 @@ GLOBAL_CONFIG="$CONFIG_DIR/config.toml"
 DEFAULT_KEYS_FILE="$CONFIG_DIR/api-keys.env"
 AGENT_SESSION_BASE="${DEVBOX_SESSION_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/devbox/sessions}"
 PROXY_DEFAULT_URL="${DEVBOX_PROXY_URL:-http://host.lima.internal:4141}"
-# A GitHub proxy capability is valid for eight hours. Refresh it well before
-# expiry while this host-side `devbox` session remains attached to the guest.
-GH_PROXY_CAPABILITY_RENEW_SECONDS="${DEVBOX_GH_PROXY_CAPABILITY_RENEW_SECONDS:-25200}"
 PROJECT_MANIFEST_NAME=".devbox.toml"
 
 # Host credential paths copied into the box under --with-creds (best-effort;
@@ -850,30 +848,9 @@ renew_gh_proxy_capability() { # $1 Lima instance $2 bare http proxy URL
   }
 }
 
-start_gh_proxy_capability_renewal() { # $1 Lima instance $2 bare http proxy URL
-  local name="$1" url="$2"
-  [[ "$GH_PROXY_CAPABILITY_RENEW_SECONDS" =~ ^[1-9][0-9]*$ ]] || \
-    die "DEVBOX_GH_PROXY_CAPABILITY_RENEW_SECONDS must be a positive number of seconds"
-  (
-    while sleep "$GH_PROXY_CAPABILITY_RENEW_SECONDS"; do
-      [[ "$(instance_status "$name")" == "Running" ]] || continue
-      proxy_ensure "$url"
-      renew_gh_proxy_capability "$name" "$url" || \
-        warn "GitHub CLI proxy capability renewal failed; retrying in ${GH_PROXY_CAPABILITY_RENEW_SECONDS}s"
-    done
-  ) &
-  _DB_GH_PROXY_RENEW_PID=$!
-}
-
-stop_gh_proxy_capability_renewal() {
-  local pid="${_DB_GH_PROXY_RENEW_PID:-}"
-  [[ -n "$pid" ]] || return 0
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-  unset _DB_GH_PROXY_RENEW_PID
-}
 # is *our* proxy answering on this port? (health endpoint, not just any listener)
 proxy_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -q 'devbox-ai-proxy'; }
+proxy_self_renewal_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -q 'gh-self-renewal'; }
 # is anything at all listening on the port?
 proxy_port_open() { timeout 1 bash -c ">/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
 # locate a proxy asset across source (../proxy) and brew (../libexec/proxy)
@@ -899,11 +876,34 @@ proxy_launcher() {
   command -v devbox-ai-proxy 2>/dev/null && return 0
   return 1
 }
+
+proxy_stop_process() {
+  local pid
+  pid="$(cat "$CONFIG_DIR/proxy.pid" 2>/dev/null || true)"
+  if [[ -n "$pid" ]] && kill "$pid" 2>/dev/null; then
+    rm -f "$CONFIG_DIR/proxy.pid"
+    return 0
+  fi
+  if pkill -f 'devbox-ai-proxy\.py' 2>/dev/null; then
+    rm -f "$CONFIG_DIR/proxy.pid"
+    return 0
+  fi
+  return 1
+}
+
 # start the host proxy if it isn't already up (idempotent). Shared across boxes.
 proxy_ensure() {
   local url="$1" port launcher logf i
   port="$(proxy_port "$url")"
-  if proxy_health "$port"; then log "credential proxy already running on 127.0.0.1:$port"; return 0; fi
+  if proxy_health "$port"; then
+    if proxy_self_renewal_health "$port"; then
+      log "credential proxy already running on 127.0.0.1:$port"
+      return 0
+    fi
+    log "Restarting host credential proxy once to enable persistent GitHub capability renewal"
+    proxy_stop_process || { warn "could not stop the older credential proxy"; return 1; }
+    for i in $(seq 1 20); do proxy_port_open "$port" || break; sleep 0.1; done
+  fi
   if proxy_port_open "$port"; then
     warn "port $port is held by another service (not devbox's proxy)."
     warn "  pick a free port: export DEVBOX_PROXY_URL=http://host.lima.internal:<PORT>"
@@ -970,6 +970,38 @@ PY
   limactl copy "$ca_path" "$name:.devbox/gh-proxy/certs/devbox-gh-proxy-ca.pem"
   # shellcheck disable=SC2016 # $HOME expands inside the guest shell.
   limactl shell "$name" -- bash -c 'chmod 755 "$HOME/.devbox/gh-proxy/bin/gh"; chmod 644 "$HOME/.devbox/gh-proxy/certs/devbox-gh-proxy-ca.pem"'
+  # Keep the real Homebrew binary as a private wrapper dependency, then replace
+  # Homebrew's public `gh` link with the proxy wrapper. This covers agents that
+  # exec the usual absolute Homebrew path instead of asking a shell to resolve
+  # the managed gh() function. A same-user process can still deliberately find
+  # the private binary; this prevents accidental bypass, not hostile guest code.
+  # shellcheck disable=SC2016 # All variables expand in the guest.
+  limactl shell "$name" -- bash -s <<'GUEST'
+set -euo pipefail
+wrapper="$HOME/.devbox/gh-proxy/bin/gh"
+real_dir="$HOME/.devbox/gh-proxy/libexec"
+real_gh="$real_dir/gh-real"
+local_shim="$HOME/.local/bin/gh"
+brew_bin="$(command -v brew 2>/dev/null || true)"
+[ -n "$brew_bin" ] || brew_bin=/home/linuxbrew/.linuxbrew/bin/brew
+[ -x "$brew_bin" ] || { printf '%s\n' '[devbox] Homebrew is required for managed gh proxying' >&2; exit 1; }
+formula_prefix="$("$brew_bin" --prefix gh 2>/dev/null || true)"
+formula_gh="$formula_prefix/bin/gh"
+[ -n "$formula_prefix" ] && [ -x "$formula_gh" ] \
+  || { printf '%s\n' '[devbox] Homebrew gh is missing; rebuild the golden and recreate this box' >&2; exit 1; }
+install -d -m 700 "$real_dir" "$HOME/.local/bin"
+install -m 755 "$formula_gh" "$real_gh"
+
+brew_prefix="$("$brew_bin" --prefix)"
+brew_gh="$brew_prefix/bin/gh"
+rm -f -- "$brew_gh"
+ln -s "$wrapper" "$brew_gh"
+if [ ! -e "$local_shim" ] && [ ! -L "$local_shim" ]; then
+  ln -s "$wrapper" "$local_shim"
+elif [ "$(readlink -f "$local_shim" 2>/dev/null || true)" != "$wrapper" ]; then
+  printf '[devbox] WARN: preserving existing gh command at %s\n' "$local_shim" >&2
+fi
+GUEST
   renew_gh_proxy_capability "$name" "$url" || die "could not issue GitHub CLI proxy capability"
   limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-12-gh-proxy.sh >/dev/null' <<EOF
 # devbox --proxy: GitHub CLI uses a host-authenticated, GitHub-only TLS proxy.
@@ -996,9 +1028,34 @@ clear_auth() {
   local name="$1"
   log "Disabling devbox-managed auth in $name"
   clear_gh_proxy_endpoint "$name"
-  # shellcheck disable=SC2016 # $HOME expands in the guest shell.
-  limactl shell "$name" -- bash -c \
-    'sudo rm -f /etc/profile.d/zz-devbox-10-proxy.sh /etc/profile.d/zz-devbox-11-codex-proxy.sh /etc/profile.d/zz-devbox-12-gh-proxy.sh /etc/profile.d/zz-devbox-20-keys.sh; rm -rf "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"'
+  # Restore Homebrew's public gh link only when it still points at our wrapper.
+  # shellcheck disable=SC2016 # All variables expand in the guest.
+  limactl shell "$name" -- bash -s <<'GUEST'
+set -euo pipefail
+wrapper="$HOME/.devbox/gh-proxy/bin/gh"
+local_shim="$HOME/.local/bin/gh"
+restore_brew=0
+brew_bin="$(command -v brew 2>/dev/null || true)"
+[ -n "$brew_bin" ] || brew_bin=/home/linuxbrew/.linuxbrew/bin/brew
+if [ -x "$brew_bin" ]; then
+  brew_gh="$("$brew_bin" --prefix)/bin/gh"
+  if [ -L "$brew_gh" ] && [ "$(readlink -f "$brew_gh" 2>/dev/null || true)" = "$wrapper" ]; then
+    rm -f -- "$brew_gh"
+    restore_brew=1
+  fi
+fi
+if [ -L "$local_shim" ] && [ "$(readlink -f "$local_shim" 2>/dev/null || true)" = "$wrapper" ]; then
+  rm -f -- "$local_shim"
+fi
+sudo rm -f /etc/profile.d/zz-devbox-10-proxy.sh \
+  /etc/profile.d/zz-devbox-11-codex-proxy.sh \
+  /etc/profile.d/zz-devbox-12-gh-proxy.sh \
+  /etc/profile.d/zz-devbox-20-keys.sh
+rm -rf -- "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"
+if [ "$restore_brew" -eq 1 ]; then
+  "$brew_bin" link --overwrite gh >/dev/null
+fi
+GUEST
 }
 
 # ------------------------------------------------------- traffic audit egress ---
@@ -1723,7 +1780,6 @@ cmd_build() {
 run_cleanup() {
   local rc=$?
   trap - EXIT INT TERM
-  stop_gh_proxy_capability_renewal
   if [[ "${_DB_KEEP:-0}" -eq 1 ]]; then
     log "--keep: retained ${_DB_NAME:-?}"
     log "  re-enter: devbox $(printf '%q' "${_DB_DIR:-.}")$([[ "${_DB_IMAGE:-}" != "$DEFAULT_IMAGE" ]] && printf ' --image %q' "${_DB_IMAGE:-}")"
@@ -1954,7 +2010,6 @@ cmd_run() {
     [[ -z "$managed_proxy" ]] || {
       proxy_ensure "$managed_proxy"
       apply_proxy "$name" "$managed_proxy"
-      start_gh_proxy_capability_renewal "$name" "$managed_proxy"
     }
     [[ -n "$api_keys"  ]] && apply_api_keys "$name" "$api_keys"
     [[ $with_creds -eq 1 ]] && apply_creds  "$name"
@@ -2023,11 +2078,17 @@ cmd_proxy() {
   case "$sub" in
     start)  proxy_ensure "$url";;
     stop)   pid="$(cat "$CONFIG_DIR/proxy.pid" 2>/dev/null || true)"
-            if [[ -n "$pid" ]] && kill "$pid" 2>/dev/null; then
-              log "stopped AI proxy (pid $pid)"; rm -f "$CONFIG_DIR/proxy.pid"
-            elif pkill -f 'devbox-ai-proxy\.py' 2>/dev/null; then log "stopped AI proxy (matched by name)"
+            if proxy_stop_process; then log "stopped AI proxy${pid:+ (pid $pid)}"
             else warn "no running AI proxy found"; fi;;
-    status) if proxy_health "$port"; then log "AI proxy: RUNNING on 127.0.0.1:$port"
+    refresh) proxy_ensure "$url"
+             launcher="$(proxy_launcher)" || die "proxy launcher not found"
+             "$launcher" --refresh-gh-proxy-boxes;;
+    status) if proxy_health "$port"; then
+              if proxy_self_renewal_health "$port"; then
+                log "AI proxy: RUNNING on 127.0.0.1:$port (GitHub capability self-renewal enabled)"
+              else
+                warn "AI proxy: RUNNING on 127.0.0.1:$port (restart required for GitHub capability self-renewal)"
+              fi
             elif proxy_port_open "$port"; then warn "port $port held by another (non-devbox) service"
             else log "AI proxy: not running (port $port)"; fi;;
     audit) shift
@@ -2039,7 +2100,7 @@ cmd_proxy() {
              export) audit_arg="${2:-}"; "$launcher" --audit-export "$audit_arg";;
              *) die "usage: devbox proxy audit [status|show [LIMIT]|export [FILE]]";;
            esac;;
-    *) die "usage: devbox proxy [start|stop|status|audit]";;
+    *) die "usage: devbox proxy [start|stop|status|refresh|audit]";;
   esac
 }
 
