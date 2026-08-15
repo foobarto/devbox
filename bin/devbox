@@ -21,6 +21,8 @@
 #   devbox ls
 #   devbox destroy NAME | --all | --goldens
 #   devbox proxy [start|stop|status|audit]   manage the shared host-side proxy
+#   devbox sessions [path|clear [--yes]] [DIR]
+#                               inspect or remove persistent AI session state
 #   devbox --version|-V
 #
 # Run flags
@@ -37,6 +39,10 @@
 #                    disk ceiling, e.g. 80GiB (default 100GiB). qcow2 is sparse,
 #                    so this costs only what is written; it is grow-only.
 #   --keep, -k       do not auto-delete the box on shell exit.
+#   --ephemeral-sessions, -e
+#                    do not attach the project's persistent AI session store
+#                    for this box. By default, resumable agent sessions survive
+#                    disposal while credentials and unrelated host history do not.
 #   --ssh-agent, -s  forward the host SSH agent into the box (git/GitHub auth)
 #                    and configure SSH-signed commits; private keys stay host-side.
 #   --proxy[=URL], -p[=URL]
@@ -97,6 +103,9 @@
 #
 # Env
 #   DEVBOX_CONFIG_DIR   config/golden dir (default ~/.config/devbox)
+#   DEVBOX_SESSION_DIR  persistent per-project AI session root
+#                       (default $XDG_STATE_HOME/devbox/sessions, falling back
+#                       to ~/.local/state/devbox/sessions)
 #   DEVBOX_PROXY_URL    default --proxy URL
 #   DEVBOX_BUILD_TIMEOUT
 #                       how long a golden build may take (default 90m). Lima's
@@ -130,6 +139,7 @@ DEFAULT_BUILD_TIMEOUT="${DEVBOX_BUILD_TIMEOUT:-90m}"
 CONFIG_DIR="${DEVBOX_CONFIG_DIR:-$HOME/.config/devbox}"
 GLOBAL_CONFIG="$CONFIG_DIR/config.toml"
 DEFAULT_KEYS_FILE="$CONFIG_DIR/api-keys.env"
+AGENT_SESSION_BASE="${DEVBOX_SESSION_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/devbox/sessions}"
 PROXY_DEFAULT_URL="${DEVBOX_PROXY_URL:-http://host.lima.internal:4141}"
 # A GitHub proxy capability is valid for eight hours. Refresh it well before
 # expiry while this host-side `devbox` session remains attached to the guest.
@@ -270,12 +280,124 @@ instance_name() { # deterministic per (image, absolute dir)
   printf 'devbox-%s-%s' "$slug" "$hash"
 }
 
+# Session state follows the project rather than the disposable VM or selected
+# image. The longer hash avoids two same-named projects ever sharing transcripts
+# accidentally, while the slug keeps the host-side directory understandable.
+project_session_key() { # $1 absolute project directory
+  local dir="$1" slug hash
+  slug="$(_slug "$(basename -- "$dir")" 32)"
+  hash="$(printf '%s' "$dir" | sha256sum | cut -c1-16)"
+  printf '%s-%s' "$slug" "$hash"
+}
+
+agent_session_base() {
+  python3 - "$AGENT_SESSION_BASE" <<'PY'
+import os
+import sys
+print(os.path.realpath(os.path.abspath(os.path.expanduser(sys.argv[1]))))
+PY
+}
+
+project_session_dir() { # $1 absolute project directory
+  local base
+  base="$(agent_session_base)"
+  printf '%s/%s' "$base" "$(project_session_key "$1")"
+}
+
+validate_session_path() { # $1 exact per-project host directory
+  local path="$1" base
+  base="$(agent_session_base)"
+  case "$base" in
+    /|"$HOME"|"$HOME/.ssh"|"$HOME/.ssh/"*|"$HOME/.pki"|"$HOME/.pki/"*|"$HOME/.sigstore"|"$HOME/.sigstore/"*|"$HOME/.gnupg"|"$HOME/.gnupg/"*)
+      die "unsafe DEVBOX_SESSION_DIR: $base"
+      ;;
+  esac
+  [[ "$path" == "$base/"* && "$(dirname -- "$path")" == "$base" ]] \
+    || die "refusing non-project session path: $path"
+}
+
+prepare_session_dir() { # $1 exact per-project host directory
+  local path="$1" base owner old_umask
+  base="$(agent_session_base)"
+  validate_session_path "$path"
+  old_umask="$(umask)"
+  umask 077
+  mkdir -p -- "$base"
+  [[ -d "$base" && ! -L "$base" ]] || die "session root must be a real directory: $base"
+  owner="$(stat -c %u "$base" 2>/dev/null || true)"
+  [[ "$owner" == "$(id -u)" ]] || die "session root is not owned by the current user: $base"
+  chmod 700 -- "$base"
+  if [[ -e "$path" || -L "$path" ]]; then
+    [[ -d "$path" && ! -L "$path" ]] || die "project session path must be a real directory: $path"
+  else
+    mkdir -- "$path"
+  fi
+  chmod 700 -- "$path"
+  umask "$old_umask"
+}
+
 # ---------------------------------------------------------------- lima state --
 instance_exists() { limactl list -q 2>/dev/null | grep -qx "$1"; }
 instance_status() { limactl list "$1" --format '{{.Status}}' 2>/dev/null || echo Unknown; }
 ensure_golden_stopped() {
   [[ "$(instance_status "$1")" == "Running" ]] || return 0
   log "Stopping golden $1 before clone"; limactl stop "$1"
+}
+
+session_mount_enabled() { # $1 instance $2 exact host state directory
+  limactl list "$1" --json 2>/dev/null | python3 -c '
+import json, sys
+path = sys.argv[1]
+try:
+    item = json.load(sys.stdin)
+    if isinstance(item, list):
+        item = item[0] if item else {}
+    mounts = item.get("config", {}).get("mounts", [])
+    print(any(m.get("location") == path and m.get("writable") is True for m in mounts))
+except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
+    print(False)
+' "$2"
+}
+
+session_mount_present() { # $1 instance $2 exact host state directory
+  limactl list "$1" --json 2>/dev/null | python3 -c '
+import json, sys
+path = sys.argv[1]
+try:
+    item = json.load(sys.stdin)
+    if isinstance(item, list):
+        item = item[0] if item else {}
+    mounts = item.get("config", {}).get("mounts", [])
+    print(any(m.get("location") == path for m in mounts))
+except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
+    print(False)
+' "$2"
+}
+
+ensure_session_mount() { # $1 existing instance $2 exact host state directory
+  local name="$1" path="$2" status
+  [[ "$(session_mount_enabled "$name" "$path")" == True ]] && return 0
+  status="$(instance_status "$name")"
+  if [[ "$status" == Running ]]; then
+    log "Restarting $name once to attach persistent AI session state"
+    limactl stop "$name"
+  fi
+  log "Attaching persistent AI session state to $name"
+  limactl edit "$name" --mount "$path:w" >/dev/null
+  [[ "$status" == Running ]] && limactl start "$name"
+}
+
+remove_session_mount() { # $1 existing instance $2 exact host state directory
+  local name="$1" path="$2" status quoted
+  [[ "$(session_mount_present "$name" "$path")" == True ]] || return 0
+  status="$(instance_status "$name")"
+  if [[ "$status" == Running ]]; then
+    log "Restarting $name once to detach persistent AI session state"
+    limactl stop "$name"
+  fi
+  quoted="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$path")"
+  limactl edit "$name" --set "del(.mounts[] | select(.location == $quoted))" >/dev/null
+  [[ "$status" == Running ]] && limactl start "$name"
 }
 
 require_ssh_agent() {
@@ -1184,6 +1306,178 @@ apply_agent_config() {
   log "Copied $copied non-secret agent config file(s); skipped $skipped possible credential(s)."
 }
 
+apply_session_persistence() { # $1 instance $2 mounted per-project host directory
+  local name="$1" state="$2"
+  log "Linking resumable AI sessions to host state: $state"
+
+  # OpenCode keeps current session records in one SQLite database. Point only
+  # that database at persistent state; auth.json and the rest of its data home
+  # remain on the disposable guest disk.
+  python3 - "$state" <<'PY' \
+    | limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-08-session-persistence.sh >/dev/null; sudo chmod 644 /etc/profile.d/zz-devbox-08-session-persistence.sh'
+import shlex
+import sys
+
+root = sys.argv[1]
+print("# devbox: per-project resumable agent sessions; no credential homes")
+print(f"export DEVBOX_AI_SESSION_DIR={shlex.quote(root)}")
+print(f"export OPENCODE_DB={shlex.quote(root + '/opencode/opencode.db')}")
+PY
+
+  # Migrate session material already present in a kept VM on first use, then
+  # replace only known session paths with links into the mounted state root.
+  # Unknown/custom links are deliberately left alone.
+  limactl shell "$name" -- bash -s -- "$state" <<'GUEST'
+set -euo pipefail
+state="$1"
+umask 077
+mkdir -p "$state" "$state/claude" "$state/codex" "$state/opencode" \
+  "$state/pi" "$state/stado"
+chmod 700 "$state" "$state/claude" "$state/codex" "$state/opencode" \
+  "$state/pi" "$state/stado"
+
+link_dir() { # $1 guest path $2 path relative to state root
+  src="$1"; dst="$state/$2"
+  mkdir -p "$(dirname "$src")" "$(dirname "$dst")" "$dst"
+  chmod 700 "$dst"
+  if [ -L "$src" ]; then
+    current="$(readlink -f "$src" 2>/dev/null || true)"
+    if [ "$current" = "$dst" ]; then return 0; fi
+    printf '[devbox] WARN: preserving custom session link: %s\n' "$src" >&2
+    return 0
+  fi
+  if [ -e "$src" ]; then
+    if [ ! -d "$src" ]; then
+      printf '[devbox] WARN: expected a session directory, preserving: %s\n' "$src" >&2
+      return 0
+    fi
+    cp -au "$src/." "$dst/"
+    rm -rf -- "$src"
+  fi
+  ln -s "$dst" "$src"
+}
+
+link_append_file() { # append-only history/index file
+  src="$1"; dst="$state/$2"
+  mkdir -p "$(dirname "$src")" "$(dirname "$dst")"
+  if [ -L "$src" ]; then
+    current="$(readlink -f "$src" 2>/dev/null || true)"
+    if [ "$current" = "$dst" ]; then return 0; fi
+    printf '[devbox] WARN: preserving custom session link: %s\n' "$src" >&2
+    return 0
+  fi
+  if [ -e "$src" ]; then
+    if [ ! -f "$src" ]; then
+      printf '[devbox] WARN: expected a session index file, preserving: %s\n' "$src" >&2
+      return 0
+    fi
+    touch "$dst"
+    cat "$src" >> "$dst"
+    rm -f -- "$src"
+  else
+    touch "$dst"
+  fi
+  chmod 600 "$dst"
+  ln -s "$dst" "$src"
+}
+
+# Claude Code: transcripts plus the session-bound shell/file restore material.
+link_dir "$HOME/.claude/projects"        "claude/projects"
+link_dir "$HOME/.claude/sessions"        "claude/sessions"
+link_dir "$HOME/.claude/file-history"    "claude/file-history"
+link_dir "$HOME/.claude/session-env"     "claude/session-env"
+link_dir "$HOME/.claude/shell-snapshots" "claude/shell-snapshots"
+link_append_file "$HOME/.claude/history.jsonl" "claude/history.jsonl"
+
+# Codex uses a separate CODEX_HOME while --proxy is active. Both profiles share
+# the project transcript/index store, so changing auth mode does not hide chats.
+for codex_home in "$HOME/.codex"; do
+  link_dir "$codex_home/sessions"          "codex/sessions"
+  link_dir "$codex_home/archived_sessions" "codex/archived_sessions"
+  link_dir "$codex_home/shell_snapshots"   "codex/shell-snapshots"
+  link_append_file "$codex_home/session_index.jsonl" "codex/session_index.jsonl"
+done
+if [ -f /etc/profile.d/zz-devbox-11-codex-proxy.sh ]; then
+  codex_home="$HOME/.devbox/codex-proxy"
+  link_dir "$codex_home/sessions"          "codex/sessions"
+  link_dir "$codex_home/archived_sessions" "codex/archived_sessions"
+  link_dir "$codex_home/shell_snapshots"   "codex/shell-snapshots"
+  link_append_file "$codex_home/session_index.jsonl" "codex/session_index.jsonl"
+fi
+
+# Pi stores one JSONL session tree per working directory.
+link_dir "$HOME/.pi/agent/sessions" "pi/sessions"
+
+# Preserve OpenCode's legacy JSON store and session attachments alongside the
+# current database configured above. If upgrading a kept VM, move its current
+# database only when no persistent database exists yet; SQLite DBs are never
+# merged or overwritten.
+link_dir "$HOME/.local/share/opencode/storage"     "opencode/storage"
+link_dir "$HOME/.local/share/opencode/project"     "opencode/project"
+link_dir "$HOME/.local/share/opencode/snapshot"    "opencode/snapshot"
+link_dir "$HOME/.local/share/opencode/tool-output" "opencode/tool-output"
+oc_src="$HOME/.local/share/opencode/opencode.db"
+oc_dst="$state/opencode/opencode.db"
+if [ -f "$oc_src" ] && [ ! -e "$oc_dst" ]; then
+  mv "$oc_src" "$oc_dst"
+  for suffix in -wal -shm; do
+    [ ! -e "$oc_src$suffix" ] || mv "$oc_src$suffix" "$oc_dst$suffix"
+  done
+elif [ -f "$oc_src" ] && [ -e "$oc_dst" ]; then
+  conflict="$state/opencode/kept-box-conflict-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  mkdir -p "$conflict"
+  mv "$oc_src" "$conflict/opencode.db"
+  for suffix in -wal -shm; do
+    [ ! -e "$oc_src$suffix" ] || mv "$oc_src$suffix" "$conflict/opencode.db$suffix"
+  done
+  printf '[devbox] WARN: preserved conflicting kept-box OpenCode DB at %s\n' "$conflict" >&2
+fi
+
+# Stado keeps transcripts and persistent worktrees outside its credential and
+# plugin directories. Its Git refs remain in the already-mounted project.
+link_dir "$HOME/.local/share/stado/sessions" "stado/sessions"
+link_dir "$HOME/.local/state/stado/worktrees" "stado/worktrees"
+GUEST
+}
+
+disable_session_persistence() { # $1 instance $2 state path previously used by this project
+  local name="$1" state="$2"
+  log "Using ephemeral AI sessions in $name"
+  limactl shell "$name" -- bash -s -- "$state" <<'GUEST'
+set -euo pipefail
+state="$1"
+sudo rm -f /etc/profile.d/zz-devbox-08-session-persistence.sh
+for path in \
+  "$HOME/.claude/projects" "$HOME/.claude/sessions" \
+  "$HOME/.claude/file-history" "$HOME/.claude/session-env" \
+  "$HOME/.claude/shell-snapshots" \
+  "$HOME/.codex/sessions" "$HOME/.codex/archived_sessions" \
+  "$HOME/.codex/shell_snapshots" \
+  "$HOME/.devbox/codex-proxy/sessions" \
+  "$HOME/.devbox/codex-proxy/archived_sessions" \
+  "$HOME/.devbox/codex-proxy/shell_snapshots" \
+  "$HOME/.pi/agent/sessions" \
+  "$HOME/.local/share/opencode/storage" \
+  "$HOME/.local/share/opencode/project" \
+  "$HOME/.local/share/opencode/snapshot" \
+  "$HOME/.local/share/opencode/tool-output" \
+  "$HOME/.local/share/stado/sessions" "$HOME/.local/state/stado/worktrees"; do
+  if [ -L "$path" ]; then
+    target="$(readlink "$path" 2>/dev/null || true)"
+    case "$target" in "$state"/*) rm -f -- "$path"; mkdir -p "$path";; esac
+  fi
+done
+for path in "$HOME/.claude/history.jsonl" \
+  "$HOME/.codex/session_index.jsonl" \
+  "$HOME/.devbox/codex-proxy/session_index.jsonl"; do
+  if [ -L "$path" ]; then
+    target="$(readlink "$path" 2>/dev/null || true)"
+    case "$target" in "$state"/*) rm -f -- "$path";; esac
+  fi
+done
+GUEST
+}
+
 # --------------------------------------------------------- project manifest --
 project_manifest() { # $1 .devbox.toml -> normalized JSON
   python3 - "$1" <<'PY'
@@ -1441,11 +1735,15 @@ run_cleanup() {
     clear_gh_proxy_endpoint "$_DB_NAME"
     clear_traffic_proxy_endpoint "$_DB_NAME"
   fi
+  if [[ -n "${_DB_SESSION_DIR:-}" ]]; then
+    log "AI sessions retained: ${_DB_SESSION_DIR}"
+    log "  resume from the same project with the agent's native resume command"
+  fi
   exit "$rc"
 }
 
 cmd_run() {
-  local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 with_agent_config=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name="" gui=0 traffic_audit=""
+  local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 with_agent_config=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name="" gui=0 traffic_audit="" ephemeral_sessions=0
   local extra_mounts=() extra_copies=() manifest_requests=() gui_command=()
   local cli_cpus="" cli_memory="" cli_disk=""
   local golden_digest="" golden_provision="" golden_provision_user=""
@@ -1460,6 +1758,7 @@ cmd_run() {
       --disk|-D) shift; cli_disk="${1:?--disk needs a value}";;
       --disk=*|-D=*) cli_disk="${1#*=}";;
       --keep|-k) keep=1;;
+      --ephemeral-sessions|-e) ephemeral_sessions=1;;
       --ssh-agent|-s) ssh_agent=1;;
       --with-creds|-c) with_creds=1;;
       --with-agent-config|-g) with_agent_config=1;;
@@ -1583,6 +1882,14 @@ cmd_run() {
   golden_hash="$(golden_spec_hash "$image" "$golden_digest" "$golden_provision" "$golden_provision_user")"
   golden="$(golden_name "$image" "$golden_hash")"
   [[ -n "$name" ]] || name="$(instance_name "$image" "$dir")"
+  local session_state session_owner=""
+  session_state="$(project_session_dir "$dir")"
+  if [[ $ephemeral_sessions -eq 0 ]]; then
+    prepare_session_dir "$session_state"
+    session_owner="$(session_state_other_instance "$session_state" "$name")"
+    [[ -z "$session_owner" ]] || \
+      die "AI session state is already attached to $session_owner; destroy it or use --ephemeral-sessions"
+  fi
 
   local preexisting=0
   if instance_exists "$name"; then
@@ -1598,6 +1905,7 @@ cmd_run() {
     fi
     ensure_golden_stopped "$golden"
     local clone_args=(--mount "${dir}:w") m
+    [[ $ephemeral_sessions -eq 1 ]] || clone_args+=(--mount "${session_state}:w")
     for m in "${extra_mounts[@]}"; do clone_args+=(--mount "$(_lima_mount_arg "$m")"); done
     # CPU/memory are per-box: applied to the clone so a project can be sized
     # without rebuilding the shared golden.
@@ -1622,9 +1930,11 @@ cmd_run() {
     log "Cloning $golden → $name (mount: $dir${extra_mounts:+, +${#extra_mounts[@]} extra mount(s)})"
     limactl --tty=false clone "$golden" "$name" "${clone_args[@]}"
   fi
+  [[ $ephemeral_sessions -eq 1 || $preexisting -eq 0 ]] || ensure_session_mount "$name" "$session_state"
   [[ $ssh_agent -eq 1 && $preexisting -eq 1 ]] && enable_ssh_agent "$name"
 
   _DB_NAME="$name"; _DB_DIR="$dir"; _DB_IMAGE="$image"; _DB_KEEP="$keep"
+  _DB_SESSION_DIR=""; [[ $ephemeral_sessions -eq 1 ]] || _DB_SESSION_DIR="$session_state"
   trap run_cleanup EXIT INT TERM
 
   if [[ "$(instance_status "$name")" != "Running" ]]; then
@@ -1669,6 +1979,14 @@ cmd_run() {
   [[ $with_agent_config -eq 1 ]] && apply_agent_config "$name"
   if [[ ${#extra_copies[@]} -gt 0 ]]; then
     local c; for c in "${extra_copies[@]}"; do apply_copy "$name" "$c"; done
+  fi
+  if [[ $ephemeral_sessions -eq 1 ]]; then
+    if [[ $preexisting -eq 1 ]]; then
+      disable_session_persistence "$name" "$session_state"
+      remove_session_mount "$name" "$session_state"
+    fi
+  else
+    apply_session_persistence "$name" "$session_state"
   fi
 
   if [[ -n "$manifest" ]]; then
@@ -1725,6 +2043,84 @@ cmd_proxy() {
   esac
 }
 
+session_state_in_use() { # $1 exact per-project state directory
+  command -v limactl >/dev/null 2>&1 || return 1
+  limactl list --json 2>/dev/null | python3 -c '
+import json, sys
+path = sys.argv[1]
+try:
+    items = [json.loads(line) for line in sys.stdin if line.strip()]
+    used = any(
+        mount.get("location") == path
+        for item in items
+        for mount in item.get("config", {}).get("mounts", [])
+    )
+    raise SystemExit(0 if used else 1)
+except (json.JSONDecodeError, AttributeError, TypeError):
+    raise SystemExit(2)
+' "$1"
+}
+
+session_state_other_instance() { # $1 state directory $2 intended instance
+  limactl list --json 2>/dev/null | python3 -c '
+import json, sys
+path, intended = sys.argv[1:]
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    item = json.loads(line)
+    if item.get("name") == intended:
+        continue
+    if any(m.get("location") == path for m in item.get("config", {}).get("mounts", [])):
+        print(item.get("name", "unknown"))
+        break
+' "$1" "$2"
+}
+
+cmd_sessions() {
+  local sub="${1:-path}" dir="$PWD" assume_yes=0 state
+  [[ $# -eq 0 ]] || shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes|-y) assume_yes=1;;
+      -h|--help) die "usage: devbox sessions [path|clear [--yes]] [DIR]";;
+      -*) die "sessions: unknown flag: $1";;
+      *) dir="$1";;
+    esac
+    shift
+  done
+  dir="$(abspath "$dir")"
+  [[ -d "$dir" ]] || die "not a directory: $dir"
+  state="$(project_session_dir "$dir")"
+  validate_session_path "$state"
+  case "$sub" in
+    path) printf '%s\n' "$state";;
+    clear)
+      if [[ ! -e "$state" && ! -L "$state" ]]; then
+        log "no persistent AI sessions for $dir"
+        return 0
+      fi
+      [[ -d "$state" && ! -L "$state" ]] || die "refusing unexpected session path: $state"
+      local mount_status=0
+      if session_state_in_use "$state"; then
+        die "session state is still mounted by a Devbox; destroy that box before clearing it"
+      else
+        mount_status=$?
+        [[ $mount_status -eq 1 ]] || die "could not verify whether session state is still mounted"
+      fi
+      if [[ $assume_yes -eq 0 ]]; then
+        [[ -t 0 ]] || die "sessions clear needs an interactive terminal or --yes"
+        printf 'Delete persistent AI sessions for %s? [y/N] ' "$dir" >&2
+        local answer=""; IFS= read -r answer
+        [[ "$answer" == y || "$answer" == Y ]] || { log "cancelled."; return 0; }
+      fi
+      rm -rf -- "$state"
+      log "deleted persistent AI sessions for $dir"
+      ;;
+    *) die "usage: devbox sessions [path|clear [--yes]] [DIR]";;
+  esac
+}
+
 cmd_destroy() {
   local t="${1:-}"; [[ -n "$t" ]] || die "usage: devbox destroy NAME | --all | --goldens"
   local list
@@ -1753,6 +2149,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   case "${1:-}" in
     -h|--help|help) usage; exit 0;;
     -V|--version|version) printf 'devbox %s\n' "$DEVBOX_VERSION"; exit 0;;
+    sessions)       shift; cmd_sessions "$@"; exit $?;;
   esac
   need limactl
   case "${1:-}" in

@@ -46,6 +46,7 @@ destroy_project_box() {
 
 cleanup() {
   destroy_project_box "$MANIFEST_PROJECT"
+  "$DEVBOX_BIN" sessions clear --yes "$MANIFEST_PROJECT" >/dev/null 2>&1 || true
   [[ "${DEVBOX_E2E_KEEP_ARTIFACTS:-}" == 1 ]] || rm -rf "$PROJECT_ROOT"
 }
 trap cleanup EXIT INT TERM

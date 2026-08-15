@@ -18,19 +18,22 @@ allowed to use it.
 
 | capability | agent inside a default Devbox | same agent on the host |
 |---|---|---|
-| Files and processes | Sees the mounted project and guest filesystem/processes, plus only explicitly mounted or copied host paths. It cannot read the rest of the host home directory or control host processes. | Can read and modify every file and process the host user is permitted to access, including local tool configuration and authentication state. |
+| Files and processes | Sees the mounted project, its narrow Devbox-managed AI session store, and guest filesystem/processes, plus only explicitly mounted or copied host paths. It cannot read the rest of the host home directory or control host processes. | Can read and modify every file and process the host user is permitted to access, including local tool configuration and authentication state. |
 | Host credentials | Receives none by default. | Can read, copy, or invoke credentials and authenticated CLIs available to the host user. |
 | Desktop session | No access to the host Wayland socket or GPU nodes. | Can use the host desktop session and any local desktop capabilities available to the user. |
 | Network and remote services | Has normal guest networking and can use only credentials/capabilities explicitly provided to it. | Can use host network configuration, authenticated clients, and any credentials available to the host user. |
 
 The project directory is mounted read-write by default. Isolation does not stop
 an agent from changing the project or sending its contents to a network service
-that it is authorized to use.
+that it is authorized to use. The default per-project session store is also
+read-write so resumable transcripts survive clone deletion; use
+`--ephemeral-sessions` when that persistence is unwanted.
 
 ## Capability matrix
 
 | feature | what an agent in the Devbox can do | what remains outside the Devbox |
 |---|---|---|
+| Persistent AI sessions (default) | Read and modify this project's Devbox-managed Claude, Codex, OpenCode, Pi, and Stado session records across VM lifecycles. This enables native resume commands but also carries transcript instructions and tool output into future clones. | Other projects' Devbox stores, existing host agent histories, auth files, provider tokens, caches, and general host state remain unmounted. `--ephemeral-sessions` / `-e` disconnects the native session paths for that run. |
 | `--ssh-agent` / `-s` | Request authentication and signatures using identities currently loaded in the host SSH agent. This includes SSH/Git access accepted by those identities and Devbox's SSH-format Git commit signing. | It cannot read or copy the private-key material from the agent. It does not gain access to unmounted host files or a host shell. |
 | `--proxy` / `-p` | Make requests through Devbox's configured AI and GitHub routes using the host account's authentication. It can consume quotas and create, read, modify, or upload remote data to the extent the authenticated provider account permits. | It does not receive the underlying API keys, OAuth tokens, or host `gh` token. The guest runs its own CLIs; it cannot run host commands through the proxy. |
 | `--traffic-audit` / `-T` | Send proxy-aware public web traffic through a short-lived generic CONNECT capability. Direct TCP/UDP 80/443 fails under the guest firewall; CONNECT audit records reveal destination, timing, and byte counts, while plaintext HTTP can be recorded in detail. | It grants no AI, GitHub, SSH, or host-login credential. HTTPS remains encrypted after CONNECT, and non-web ports remain outside the rule. The generic proxy refuses host/private/LAN destinations. |
@@ -60,6 +63,30 @@ Without `--ssh-agent`, an in-Devbox agent cannot use the host agent. An agent
 running directly on the host can normally use the same agent socket and, unlike
 the Devbox agent, can also access other host files and authenticated tools that
 the user account can reach.
+
+## Persistent AI session state
+
+Devbox mounts one owner-only host directory derived from the canonical project
+path and links only the bundled agents' native transcript, index, attachment,
+and session-worktree paths into it. It does not mount `~/.claude`, `~/.codex`,
+the OpenCode data home, or another broad host configuration directory. Codex's
+normal and proxy-specific homes share only their project session records, so
+changing the authentication route does not expose or strand the transcript.
+The CLI refuses to attach one project store to two differently named boxes at
+the same time, avoiding concurrent SQLite/session writers across VMs.
+
+This storage is data persistence, not a security sandbox. An agent can rewrite
+its own saved transcript, and a resumed session can reintroduce old prompt
+content, source snippets, paths, tool output, or malicious instructions. The
+store can therefore act as a cross-lifecycle injection channel. Review a
+session before resuming it when the previous VM processed untrusted input.
+
+`devbox destroy` leaves this state intact by design. `devbox sessions path DIR`
+shows the exact directory; `devbox sessions clear DIR` removes it after every
+box mounting it has been destroyed. The clear command confirms interactively
+unless `--yes` is supplied. `--ephemeral-sessions` leaves new transcript data
+on the disposable guest disk; on an already-kept box it disconnects the native
+agent paths and restarts once to remove the host mount completely.
 
 ## Credential proxy
 
@@ -128,8 +155,9 @@ GUI forwarding must be added explicitly with `--gui` or `-G`.
 
 Avoid using `-a`, `--ssh-agent`, `--proxy`, or `--gui` for unknown code unless
 you have consciously accepted their separate risks. For the narrowest
-untrusted-code environment, begin with `devbox --no-auth` and no extra mounts,
-copies, agent forwarding, proxy, or GUI forwarding.
+untrusted-code environment, begin with
+`devbox --no-auth --ephemeral-sessions` and no extra mounts, copies, agent
+forwarding, proxy, or GUI forwarding.
 
 ## Reviewing repository-controlled requests
 
@@ -152,3 +180,6 @@ capabilities you selected.
 5. Remove a capability when finished: exit and destroy the disposable box, or
    re-enter a kept box with `--no-auth` to remove credential-proxy state and
    `--traffic-audit=off` to remove proxy-or-fail traffic auditing.
+6. Treat resumed transcripts as untrusted input when the previous session read
+   untrusted material. Use `--ephemeral-sessions` or `devbox sessions clear`
+   when cross-lifecycle state is not appropriate.

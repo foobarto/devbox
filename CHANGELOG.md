@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.2.0 - 2026-08-15
+
+- Persist resumable Claude Code, Codex, OpenCode, Pi, and Stado session state
+  in an owner-only, per-project host directory so default disposable clones can
+  be deleted and later recreated without losing their agent conversations.
+  Credentials and unrelated host histories remain outside the store.
+- Add `--ephemeral-sessions` / `-e` for runs that should leave no resumable
+  agent state, plus `devbox sessions path|clear` for inspecting and explicitly
+  deleting the retained project state.
+- Existing kept boxes gain the session mount on next entry and migrate known
+  in-guest session paths without overwriting a pre-existing OpenCode database.
+
 ## v1.1.0 - 2026-08-07
 
 - `gh` is now included in golden images. With `--proxy`, the real guest CLI uses
