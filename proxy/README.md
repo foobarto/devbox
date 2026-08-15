@@ -129,11 +129,20 @@ into the guest, and injects the host token after TLS termination for
 `api.github.com` and `uploads.github.com`. The guest holds only the literal
 `devbox-proxy` routing marker plus a short-lived Devbox proxy capability, never
 the real GitHub token. The capability authenticates only the local proxy and
-expires after eight hours. While the host-side `devbox --proxy` session remains
-open, Devbox renews that capability every seven hours and atomically updates the
-guest wrapper state. Devbox remembers only the bare proxy endpoint on the host,
-so re-entering a kept box renews its capability even when `--proxy` is omitted.
+expires after eight hours. The long-lived proxy daemon scans host-owned box
+registrations once a minute and renews due capabilities every seven hours.
+Renewal uses the recorded Lima box name directly: it does not depend on a
+`devbox` terminal remaining open, re-read `.devbox.toml`, start a stopped box,
+or restart a running guest. The wrapper reads the atomically replaced
+capability file for every invocation.
 GitHub-owned download hosts are tunnelled without TLS interception.
+
+`--proxy` also moves the usable Homebrew `gh` binary into the wrapper's managed
+private directory and replaces Homebrew's public `bin/gh` link with the wrapper.
+That prevents ordinary child-process and absolute-Homebrew-path mistakes. The
+real binary must remain executable by the same guest user for the wrapper to run
+it, so this is not a security boundary against deliberately hostile guest code.
+`--no-auth` restores Homebrew's normal link.
 
 Log in on the host first:
 
@@ -149,22 +158,20 @@ for GitHub.com; GitHub Enterprise hosts remain direct guest configuration.
 
 ### Repairing an existing box
 
-For a kept box where `gh` is installed but reports that it needs `gh auth
-login`, refresh the Devbox-managed proxy setup without deleting the box:
+For an immediate refresh of every registered running box, without resolving a
+project manifest or opening/restarting a guest, run:
 
 ```sh
-cd /path/to/project
-devbox --keep --proxy
+devbox proxy refresh
 ```
 
-The command refreshes the guest wrapper and proxy profile, then opens the box.
-Use `gh api /rate_limit --jq .rate.remaining` there as a credential-safe smoke
-check. Do not run `gh auth login` in the guest; log in on the host instead.
-For a session that was closed or suspended past the capability lifetime, the
-same command issues a fresh capability before opening the guest. Subsequent
-bare re-entry to that kept box does the same, using the host-owned remembered
-endpoint; use `--no-auth` to remove the proxy configuration and remembered
-endpoint.
+Use `gh api /rate_limit --jq .rate.remaining` in the existing guest as a
+credential-safe smoke check. Do not run `gh auth login` in the guest; log in on
+the host instead. Re-entering a kept box still repairs the wrapper/profile and
+records it for daemon renewal, but is no longer needed for routine refreshes.
+After upgrading from a proxy version without daemon renewal, the first new
+`devbox --proxy`, `devbox proxy start`, or `devbox proxy refresh` restarts only
+the host proxy process once; it does not restart any guest.
 
 If the box says `gh` is missing, it predates the golden-image installation.
 First check that its project work is committed or otherwise safe, then rebuild
@@ -199,6 +206,7 @@ Manage the shared proxy directly if you want:
 ```sh
 devbox proxy status     # RUNNING / not running / port held by another service
 devbox proxy start      # start it without a box
+devbox proxy refresh    # renew every registered running box; no guest restart
 devbox proxy stop       # stop it
 ```
 

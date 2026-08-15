@@ -27,6 +27,7 @@ import http.client
 import ipaddress
 import json
 import os
+import re
 import select
 import secrets
 import socket
@@ -38,7 +39,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 CONFIG_PATH = os.environ.get(
     "DEVBOX_PROXY_CONFIG",
@@ -99,6 +100,26 @@ _TRAFFIC_CAPABILITY_LOCK = threading.Lock()
 GITHUB_MITM_HOSTS = {"api.github.com", "uploads.github.com"}
 GITHUB_PROXY_TOKEN_TTL_SECONDS = 8 * 60 * 60
 TRAFFIC_PROXY_TOKEN_TTL_SECONDS = 8 * 60 * 60
+try:
+    GITHUB_PROXY_RENEW_SECONDS = int(
+        os.environ.get("DEVBOX_GH_PROXY_CAPABILITY_RENEW_SECONDS", 7 * 60 * 60)
+    )
+    GITHUB_PROXY_RENEW_POLL_SECONDS = int(
+        os.environ.get("DEVBOX_GH_PROXY_CAPABILITY_POLL_SECONDS", 60)
+    )
+except ValueError as exc:
+    raise SystemExit("GitHub proxy capability renewal intervals must be integers") from exc
+_LIMA_INSTANCE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+_GITHUB_PROXY_URL_UPDATE_SCRIPT = r'''
+set -e
+state_dir="$HOME/.devbox/gh-proxy"
+umask 077
+install -d -m 700 "$state_dir"
+tmp="$(mktemp "$state_dir/.proxy-url.XXXXXX")"
+cat > "$tmp"
+chmod 600 "$tmp"
+mv -f "$tmp" "$state_dir/proxy-url"
+'''
 
 # hop-by-hop + length/host headers we never forward verbatim
 DROP = {
@@ -716,6 +737,183 @@ def valid_github_proxy_token(token: str) -> bool:
         return False
 
 
+def github_proxy_registration_dir() -> str:
+    return os.path.join(STATE_DIR, "gh-proxy-boxes")
+
+
+def registered_github_proxy_boxes() -> dict[str, str]:
+    """Return host-approved Lima box names and their bare proxy endpoints."""
+    directory = github_proxy_registration_dir()
+    registrations = {}
+    try:
+        entries = list(os.scandir(directory))
+    except FileNotFoundError:
+        return registrations
+    except OSError as exc:
+        raise RuntimeError(f"could not read GitHub proxy registrations: {exc}") from exc
+
+    for entry in entries:
+        if not entry.name.endswith(".url") or not entry.is_file(follow_symlinks=False):
+            continue
+        name = entry.name[:-4]
+        if not _LIMA_INSTANCE_NAME.fullmatch(name):
+            continue
+        try:
+            with open(entry.path, encoding="utf-8") as endpoint_file:
+                endpoint = endpoint_file.read(4096).strip()
+            parsed = urlsplit(endpoint)
+            endpoint_port = parsed.port or 4141
+        except (OSError, ValueError):
+            continue
+        if (
+            parsed.scheme != "http"
+            or not parsed.netloc
+            or parsed.username
+            or parsed.password
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or endpoint_port != BIND_PORT
+        ):
+            continue
+        registrations[name] = endpoint
+    return registrations
+
+
+def running_lima_instances() -> set[str]:
+    """List running Lima instances without starting or changing any guest."""
+    try:
+        result = subprocess.run(
+            ["limactl", "list", "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"could not list Lima instances: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        raise RuntimeError(f"could not list Lima instances: {detail}")
+
+    items = []
+    output = result.stdout.strip()
+    if not output:
+        return set()
+    try:
+        decoded = json.loads(output)
+        items.extend(decoded if isinstance(decoded, list) else [decoded])
+    except json.JSONDecodeError:
+        try:
+            items.extend(json.loads(line) for line in output.splitlines() if line.strip())
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("could not parse Lima instance list") from exc
+    return {
+        item.get("name")
+        for item in items
+        if isinstance(item, dict)
+        and item.get("status") == "Running"
+        and isinstance(item.get("name"), str)
+    }
+
+
+def github_proxy_url(endpoint: str, capability: str) -> str:
+    parsed = urlsplit(endpoint)
+    return urlunsplit((
+        parsed.scheme,
+        f"{quote(capability, safe='')}@{parsed.netloc}",
+        "",
+        "",
+        "",
+    ))
+
+
+def deliver_github_proxy_capability(name: str, endpoint: str) -> None:
+    """Atomically update a running guest; capability bytes travel over stdin."""
+    capability_url = github_proxy_url(endpoint, issue_github_proxy_token())
+    try:
+        result = subprocess.run(
+            ["limactl", "shell", name, "--", "bash", "-c", _GITHUB_PROXY_URL_UPDATE_SCRIPT],
+            input=capability_url + "\n",
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"could not update {name}: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        raise RuntimeError(f"could not update {name}: {detail}")
+
+
+def refresh_registered_github_proxy_boxes(
+    renewed_at: dict[str, tuple[str, float]] | None = None,
+    *,
+    force: bool = False,
+    now: float | None = None,
+) -> dict[str, int]:
+    """Renew due capabilities by recorded box name, independent of manifests."""
+    if GITHUB_PROXY_RENEW_SECONDS <= 0:
+        raise RuntimeError("DEVBOX_GH_PROXY_CAPABILITY_RENEW_SECONDS must be positive")
+    registrations = registered_github_proxy_boxes()
+    running = running_lima_instances() if registrations else set()
+    timestamp = time.time() if now is None else now
+    history = renewed_at if renewed_at is not None else {}
+    for stale_name in set(history) - set(registrations):
+        history.pop(stale_name, None)
+
+    summary = {
+        "registered": len(registrations),
+        "running": 0,
+        "renewed": 0,
+        "failed": 0,
+    }
+    for name, endpoint in sorted(registrations.items()):
+        if name not in running:
+            continue
+        summary["running"] += 1
+        previous = history.get(name)
+        if (
+            not force
+            and previous is not None
+            and previous[0] == endpoint
+            and timestamp - previous[1] < GITHUB_PROXY_RENEW_SECONDS
+        ):
+            continue
+        try:
+            deliver_github_proxy_capability(name, endpoint)
+        except RuntimeError as exc:
+            summary["failed"] += 1
+            sys.stderr.write(f"[devbox-ai-proxy] GitHub capability renewal failed: {exc}\n")
+            continue
+        history[name] = (endpoint, timestamp)
+        summary["renewed"] += 1
+    return summary
+
+
+def maintain_github_proxy_capabilities() -> None:
+    """Keep registered running guests current for the proxy daemon's lifetime."""
+    if GITHUB_PROXY_RENEW_POLL_SECONDS <= 0:
+        sys.stderr.write(
+            "[devbox-ai-proxy] GitHub capability renewal disabled: "
+            "DEVBOX_GH_PROXY_CAPABILITY_POLL_SECONDS must be positive\n"
+        )
+        return
+    renewed_at: dict[str, tuple[str, float]] = {}
+    while True:
+        try:
+            summary = refresh_registered_github_proxy_boxes(renewed_at)
+            if summary["renewed"]:
+                sys.stderr.write(
+                    "[devbox-ai-proxy] renewed GitHub capability for %d running box(es)\n"
+                    % summary["renewed"]
+                )
+        except RuntimeError as exc:
+            sys.stderr.write(f"[devbox-ai-proxy] GitHub capability renewal check failed: {exc}\n")
+        time.sleep(GITHUB_PROXY_RENEW_POLL_SECONDS)
+
+
 def github_proxy_authorized(headers) -> bool:
     """Validate the short-lived Basic-proxy credential supplied by the wrapper."""
     authorization = headers.get("Proxy-Authorization", "")
@@ -1074,7 +1272,7 @@ class Handler(BaseHTTPRequestHandler):
         # Health/identity endpoint so callers can distinguish this proxy from
         # any other service that happens to hold the port.
         if self.path.startswith("/_devbox"):
-            body = b"devbox-ai-proxy ok\n"
+            body = b"devbox-ai-proxy ok gh-self-renewal\n"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
@@ -1350,6 +1548,19 @@ def main():
     if args == ["--new-traffic-proxy-token"]:
         print(issue_traffic_proxy_token())
         return
+    if args == ["--refresh-gh-proxy-boxes"]:
+        try:
+            summary = refresh_registered_github_proxy_boxes(force=True)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(
+            "GitHub proxy capabilities: "
+            f"{summary['renewed']} renewed, {summary['running']} running, "
+            f"{summary['registered']} registered, {summary['failed']} failed"
+        )
+        if summary["failed"]:
+            raise SystemExit(1)
+        return
     if args == ["--audit-status"]:
         print(json.dumps(audit_status(), sort_keys=True))
         return
@@ -1383,6 +1594,16 @@ def main():
     sys.stderr.write(
         "[devbox-ai-proxy] host OAuth refresh enabled (checks every %ss)\n"
         % REFRESH_POLL_SECONDS
+    )
+    threading.Thread(
+        target=maintain_github_proxy_capabilities,
+        name="devbox-gh-capability-refresh",
+        daemon=True,
+    ).start()
+    sys.stderr.write(
+        "[devbox-ai-proxy] GitHub capability self-renewal enabled "
+        "(checks every %ss, renews every %ss)\n"
+        % (GITHUB_PROXY_RENEW_POLL_SECONDS, GITHUB_PROXY_RENEW_SECONDS)
     )
     try:
         srv.serve_forever()

@@ -379,9 +379,30 @@ setup() {
   [[ "$source_text" == *'gh() {'* ]]
   [[ "$source_text" == *'DEVBOX_GH_PROXY_URL_FILE'* ]]
   [[ "$source_text" == *'renew_gh_proxy_capability'* ]]
-  [[ "$source_text" == *'start_gh_proxy_capability_renewal'* ]]
+  [[ "$source_text" != *'start_gh_proxy_capability_renewal'* ]]
   [[ "$source_text" == *'stored_gh_proxy_endpoint'* ]]
-  [[ "$source_text" == *'rm -rf "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"'* ]]
+  [[ "$source_text" == *'formula_prefix="$("$brew_bin" --prefix gh'* ]]
+  [[ "$source_text" == *'real_gh="$real_dir/gh-real"'* ]]
+  [[ "$source_text" == *'ln -s "$wrapper" "$brew_gh"'* ]]
+  [[ "$source_text" == *'"$brew_bin" link --overwrite gh'* ]]
+  [[ "$source_text" == *'rm -rf -- "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"'* ]]
+}
+
+@test "proxy refresh bypasses project manifest and image resolution" {
+  project="$BATS_TEST_TMPDIR/project"
+  fake_launcher="$BATS_TEST_TMPDIR/proxy-launcher"
+  mkdir -p "$project"
+  printf '%s\n' 'this is deliberately not valid TOML' > "$project/.devbox.toml"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "launcher:%s\n" "$1"' > "$fake_launcher"
+  chmod +x "$fake_launcher"
+  proxy_ensure() { printf 'ensure:%s\n' "$1"; }
+  proxy_launcher() { printf '%s' "$fake_launcher"; }
+
+  cd "$project"
+  output="$(cmd_proxy refresh)"
+
+  [[ "$output" == *'ensure:http://host.lima.internal:4141'* ]]
+  [[ "$output" == *'launcher:--refresh-gh-proxy-boxes'* ]]
 }
 
 @test "proxy command exposes host-owned audit viewing and HTML export" {

@@ -234,8 +234,110 @@ class GitHubCliProxyTests(TestCase):
             with patch.object(proxy.time, "time", return_value=proxy.time.time() + 61):
                 self.assertFalse(proxy.github_proxy_authorized(headers))
 
+    def test_daemon_renews_registered_running_box_without_project_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registrations = Path(directory) / "gh-proxy-boxes"
+            registrations.mkdir()
+            (registrations / "devbox-existing-1234.url").write_text(
+                "http://host.lima.internal:4141\n"
+            )
+            history = {}
+            with patch.object(proxy, "STATE_DIR", directory), \
+                 patch.object(proxy, "BIND_PORT", 4141), \
+                 patch.object(proxy, "GITHUB_PROXY_RENEW_SECONDS", 100), \
+                 patch.object(proxy, "running_lima_instances", return_value={"devbox-existing-1234"}), \
+                 patch.object(proxy, "deliver_github_proxy_capability") as deliver:
+                first = proxy.refresh_registered_github_proxy_boxes(history, now=1000)
+                second = proxy.refresh_registered_github_proxy_boxes(history, now=1050)
+                third = proxy.refresh_registered_github_proxy_boxes(history, now=1101)
+
+        self.assertEqual(first, {"registered": 1, "running": 1, "renewed": 1, "failed": 0})
+        self.assertEqual(second["renewed"], 0)
+        self.assertEqual(third["renewed"], 1)
+        self.assertEqual(deliver.call_count, 2)
+        deliver.assert_called_with("devbox-existing-1234", "http://host.lima.internal:4141")
+
+    def test_daemon_does_not_start_a_stopped_registered_box(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registrations = Path(directory) / "gh-proxy-boxes"
+            registrations.mkdir()
+            (registrations / "devbox-stopped.url").write_text(
+                "http://host.lima.internal:4141\n"
+            )
+            with patch.object(proxy, "STATE_DIR", directory), \
+                 patch.object(proxy, "BIND_PORT", 4141), \
+                 patch.object(proxy, "running_lima_instances", return_value=set()), \
+                 patch.object(proxy, "deliver_github_proxy_capability") as deliver:
+                summary = proxy.refresh_registered_github_proxy_boxes(force=True)
+
+        self.assertEqual(summary, {"registered": 1, "running": 0, "renewed": 0, "failed": 0})
+        deliver.assert_not_called()
+
+    def test_capability_delivery_keeps_token_out_of_process_arguments(self):
+        completed = Mock(returncode=0, stdout="", stderr="")
+        with patch.object(proxy, "issue_github_proxy_token", return_value="part.one"), \
+             patch.object(proxy.subprocess, "run", return_value=completed) as run:
+            proxy.deliver_github_proxy_capability(
+                "devbox-existing-1234",
+                "http://host.lima.internal:4141",
+            )
+
+        arguments = run.call_args.args[0]
+        self.assertNotIn("part.one", " ".join(arguments))
+        self.assertEqual(
+            run.call_args.kwargs["input"],
+            "http://part.one@host.lima.internal:4141\n",
+        )
+
+    def test_running_lima_instances_accepts_ndjson(self):
+        completed = Mock(
+            returncode=0,
+            stdout=(
+                '{"name":"devbox-running","status":"Running"}\n'
+                '{"name":"devbox-stopped","status":"Stopped"}\n'
+            ),
+            stderr="",
+        )
+        with patch.object(proxy.subprocess, "run", return_value=completed):
+            self.assertEqual(proxy.running_lima_instances(), {"devbox-running"})
+
 
 class GitHubCliWrapperTests(TestCase):
+    def test_wrapper_prefers_its_private_real_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            managed = Path(directory) / "gh-proxy"
+            wrapper = managed / "bin" / "gh"
+            real_gh = managed / "libexec" / "gh-real"
+            wrapper.parent.mkdir(parents=True)
+            real_gh.parent.mkdir(parents=True)
+            wrapper.write_text(GH_WRAPPER.read_text())
+            wrapper.chmod(0o755)
+            real_gh.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os\n"
+                "print(json.dumps({'argv': __import__('sys').argv[1:], "
+                "'token': os.environ.get('GH_TOKEN'), "
+                "'proxy': os.environ.get('HTTPS_PROXY')}))\n"
+            )
+            real_gh.chmod(0o755)
+            result = subprocess.run(
+                [sys.executable, str(wrapper), "api", "/rate_limit"],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": "",
+                    "DEVBOX_GH_PROXY_URL": "http://capability@host.lima.internal:4141",
+                    "DEVBOX_GH_PROXY_CERT_DIR": "/guest/certs",
+                },
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        routed = json.loads(result.stdout)
+        self.assertEqual(routed["argv"], ["api", "/rate_limit"])
+        self.assertEqual(routed["token"], "devbox-proxy")
+        self.assertEqual(routed["proxy"], "http://capability@host.lima.internal:4141")
+
     def test_wrapper_reads_a_renewed_proxy_url_from_its_state_file(self):
         with tempfile.TemporaryDirectory() as directory:
             fake_gh = Path(directory) / "gh"
