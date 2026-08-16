@@ -566,13 +566,22 @@ provision:
     # it permits bwrap's short-lived setup capabilities, then stacks a more
     # restrictive profile on the sandboxed child. Do not weaken the global
     # restriction: standalone unshare remains unavailable.
-    if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] \
-       && [[ "$(</proc/sys/kernel/apparmor_restrict_unprivileged_userns)" == 1 ]] \
-       && [[ -x /usr/sbin/apparmor_parser ]] \
+    # Deliberately NOT gated on the current value of
+    # apparmor_restrict_unprivileged_userns. That sysctl is applied by the
+    # apparmor package's own units, so its value during provisioning races with
+    # the package upgrade happening in the apt run above — a golden could be
+    # built with the profile silently absent and fail verification later, with
+    # no way to tell that from a genuinely unsupported kernel. Installing the
+    # profile is harmless when the restriction is off and required when it is
+    # on, so key it only on the profile and parser existing.
+    if [[ -x /usr/sbin/apparmor_parser ]] \
        && [[ -r /usr/share/apparmor/extra-profiles/bwrap-userns-restrict ]]; then
       install -D -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
         /etc/apparmor.d/bwrap-userns-restrict
-      /usr/sbin/apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+      # A parser failure must not abort provisioning under `set -e`: the profile
+      # file is still on disk for apparmor.service to load on the next boot.
+      /usr/sbin/apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict \
+        || echo "devbox: could not load bwrap AppArmor profile; it will load at next boot" >&2
     fi
 - mode: user
   script: |
@@ -682,15 +691,32 @@ verify_golden() {
     warn "some tools missing in golden — inspect with: limactl shell $name"
   fi
   # Stado's Linux sandbox uses bwrap for process/filesystem isolation and
-  # `pasta --splice-only` for proxy-only host allowlist networking. Exercise
-  # both in the golden: Ubuntu's AppArmor exception is deliberately scoped to
-  # bwrap, so a standalone `unshare` probe would correctly remain blocked.
+  # `pasta --splice-only` for proxy-only host allowlist networking. Probe them
+  # separately: they fail for unrelated reasons and only one is fatal, so a
+  # single combined check reported the wrong cause and discarded usable goldens.
+  #
+  # bwrap is the isolation primitive, and every supported image can provide it,
+  # so an unusable bwrap still fails the build. Ubuntu's AppArmor exception is
+  # deliberately scoped to bwrap: a standalone `unshare` probe would correctly
+  # remain blocked.
   if ! limactl shell "$name" -- bash -lc '
     bwrap --unshare-user --unshare-net --uid 0 --gid 0 --ro-bind / / true
+  ' </dev/null 2>/dev/null; then
+    warn "golden cannot run bwrap — Stado's sandbox would be unavailable"
+    warn "  inspect with: limactl shell $name -- bwrap --unshare-user --unshare-net --uid 0 --gid 0 --ro-bind / / true"
+    return 1
+  fi
+  # `--splice-only` postdates the passt in some supported archives — Ubuntu
+  # 24.04 carries 0.0~git20240220 with no backport — so requiring it here
+  # deleted every golden built from the default image. Report the missing
+  # capability and keep the golden: only Stado's proxy-only guest networking is
+  # affected, and the rest of the toolchain is verified above.
+  if ! limactl shell "$name" -- bash -lc '
     pasta --help 2>&1 | grep -q -- "--splice-only"
   ' </dev/null 2>/dev/null; then
-    warn "golden sandbox prerequisites are unusable (bwrap/pasta)"
-    return 1
+    warn "golden's passt predates 'pasta --splice-only'"
+    warn "  Stado's proxy-only sandbox networking is unavailable in this image."
+    warn "  Everything else is verified; the golden is kept."
   fi
   # shellcheck disable=SC2016 # $HOME expands in the guest shell.
   host_keys="$(limactl shell "$name" -- bash -lc '

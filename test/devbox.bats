@@ -749,3 +749,57 @@ setup() {
   [ "$status" -ne 0 ]
   [[ "$output" == *"unknown flag"* ]]
 }
+
+# ------------------------------------------------ golden sandbox verification --
+# Ubuntu 24.04 ships passt 0.0~git20240220, which predates
+# `pasta --splice-only`, so requiring it deleted every golden built from the
+# default image. bwrap remains fatal; the passt capability only warns.
+
+@test "golden verification probes bwrap and pasta separately" {
+  source_text="$(<"$DEVBOX")"
+  # A single combined probe cannot report which prerequisite is missing.
+  [[ "$source_text" != *'bwrap --unshare-user --unshare-net --uid 0 --gid 0 --ro-bind / / true
+    pasta --help'* ]]
+  [[ "$source_text" == *"golden cannot run bwrap"* ]]
+  [[ "$source_text" == *"predates 'pasta --splice-only'"* ]]
+}
+
+@test "an unusable bwrap still fails the golden" {
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() { case \"\$*\" in *bwrap*) return 1;; *) return 0;; esac; }
+    verify_golden fake-golden
+  "
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"golden cannot run bwrap"* ]]
+}
+
+@test "a passt without --splice-only warns but keeps the golden" {
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() {
+      case \"\$*\" in
+        *pasta*)  return 1;;
+        *known_hosts*) printf 'github.com ssh-rsa A\ngithub.com ssh-ed25519 B\ngithub.com ecdsa-sha2-nistp256 C\n';;
+        *) return 0;;
+      esac
+    }
+    verify_golden fake-golden
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"predates 'pasta --splice-only'"* ]]
+  [[ "$output" == *"the golden is kept"* ]]
+}
+
+@test "bwrap AppArmor profile install is not gated on the racy userns sysctl" {
+  source_text="$(<"$DEVBOX")"
+  # The sysctl is applied by apparmor's own units, so reading it during
+  # provisioning races the package upgrade in the same apt run.
+  [[ "$source_text" != *'&& [[ "$(</proc/sys/kernel/apparmor_restrict_unprivileged_userns)" == 1 ]]'* ]]
+  [[ "$source_text" == *"install -D -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict"* ]]
+}
+
+@test "a failed apparmor_parser does not abort golden provisioning" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *"could not load bwrap AppArmor profile; it will load at next boot"* ]]
+}
