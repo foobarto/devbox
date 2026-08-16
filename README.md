@@ -255,6 +255,21 @@ with `devbox proxy audit show`, or create a private self-contained report with
 prompt content; see [proxy audit logging](docs/proxy-audit.md) before enabling
 `--proxy` for sensitive work.
 
+### Agent first-run prompts
+
+Every run pre-answers the first-run gates the AI CLIs would otherwise show:
+Claude Code's onboarding, folder-trust, and custom-API-key dialogs, and Codex's
+folder-trust and sign-in prompts. Deciding to start a Devbox for a folder is
+already the decision to run an agent in it, and the VM is the boundary — so the
+box comes up ready to work instead of asking the same question again.
+
+Trust is seeded for the mounted project directory only: never `$HOME`, and never
+the read-only paths added with `--mount`. An answer already on record is left
+alone, and a real Codex `auth.json` copied in with `--with-creds` is never
+overwritten. This also means a repository's own `.claude/settings.json` and
+hooks run unprompted — see
+[agent capability security](docs/agent-capabilities-security.md).
+
 ### Opt-in web egress audit
 
 Use `--traffic-audit` when you want ordinary guest web tools to be auditable

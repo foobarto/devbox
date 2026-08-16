@@ -202,6 +202,45 @@ test -s "$MANIFEST_PROJECT/.codex-e2e-output"
 git -C "$MANIFEST_PROJECT" cat-file -p HEAD | grep -q '^gpgsig -----BEGIN SSH SIGNATURE-----'
 curl -fsS http://127.0.0.1:4141/_devbox | grep -q devbox-ai-proxy
 
+echo "[e2e] agent first-run prompts are pre-accepted for the mounted directory only"
+cat > "$MANIFEST_PROJECT/.e2e-trust-check.py" <<'PY'
+import json
+import os
+import pathlib
+import sys
+import tomllib
+
+project, mount_source = sys.argv[1], sys.argv[2]
+home = pathlib.Path.home()
+
+claude = json.loads((home / ".claude.json").read_text())
+assert claude.get("hasCompletedOnboarding") is True, "claude onboarding not pre-accepted"
+projects = claude.get("projects", {})
+assert projects[project].get("hasTrustDialogAccepted") is True, "claude trust not pre-accepted"
+approved = claude.get("customApiKeyResponses", {}).get("approved", [])
+assert os.environ["ANTHROPIC_API_KEY"][-20:] in approved, "custom API key not pre-approved"
+
+codex_home = pathlib.Path(os.environ.get("CODEX_HOME") or home / ".codex")
+codex = tomllib.loads((codex_home / "config.toml").read_text())
+assert codex["projects"][project]["trust_level"] == "trusted", "codex trust not pre-accepted"
+
+# Seeding is scoped to the mounted project: $HOME and --mount paths, which the
+# operator never pointed devbox at, must stay unanswered.
+for stray in (str(home), mount_source):
+    assert not projects.get(stray, {}).get("hasTrustDialogAccepted"), \
+        f"claude trust leaked to {stray}"
+    assert stray not in codex.get("projects", {}), f"codex trust leaked to {stray}"
+auth = json.loads((codex_home / "auth.json").read_text())
+assert auth["auth_mode"] == "apikey", "codex sign-in picker not pre-answered"
+# Only the dummy routing marker reaches the guest; no OAuth material.
+assert auth["OPENAI_API_KEY"] == os.environ["OPENAI_API_KEY"]
+assert "tokens" not in auth, "codex auth.json unexpectedly carries OAuth tokens"
+print("trust-seeding OK")
+PY
+# shellcheck disable=SC2016 # $HOME and the proxy profile expand inside the guest.
+assert_guest "$manifest_instance" \
+  "python3 '$MANIFEST_PROJECT/.e2e-trust-check.py' '$MANIFEST_PROJECT' '$MOUNT_SOURCE'"
+
 echo "[e2e] -a copies non-secret agent config without copying OAuth credentials"
 run_session approve "$DEVBOX_BIN" "$MANIFEST_PROJECT" -a
 # shellcheck disable=SC2016 # $HOME expands inside the guest shell.

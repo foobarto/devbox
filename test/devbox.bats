@@ -838,3 +838,115 @@ setup() {
   [[ "$suite" == *'DEVBOX_E2E_SESSION_TIMEOUT'* ]]
   [[ "$suite" != *"time.monotonic() + 600"* ]]
 }
+
+# ------------------------------------------------- agent trust seeding ----
+# Starting a devbox for a directory is the trust decision, so the box
+# pre-answers the AI CLIs' first-run gates. These cover the pure merge
+# functions; the guest-side wiring is exercised by test/e2e.sh.
+
+@test "claude_trust_config trusts only the mounted directory" {
+  run bash -c "printf '' | { source '$DEVBOX'; set +u; claude_trust_config /work/proj ''; }"
+  [ "$status" -eq 0 ]
+  trusted="$(printf '%s' "$output" | python3 -c 'import json,sys; c=json.load(sys.stdin); print(list(c["projects"]))')"
+  [ "$trusted" = "['/work/proj']" ]
+  [[ "$output" == *'"hasTrustDialogAccepted": true'* ]]
+  [[ "$output" == *'"hasCompletedOnboarding": true'* ]]
+}
+
+@test "claude_trust_config preserves unrelated existing config" {
+  existing='{"theme":"dark","projects":{"/other":{"allowedTools":["Bash"]}}}'
+  run bash -c "printf '%s' '$existing' | { source '$DEVBOX'; set +u; claude_trust_config /work/proj ''; }"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"theme": "dark"'* ]]
+  [[ "$output" == *'"/other"'* ]]
+  [[ "$output" == *'"/work/proj"'* ]]
+}
+
+@test "claude_trust_config approves the key by its last 20 characters" {
+  # Claude Code stores an approved custom key as key.trim().slice(-20).
+  run bash -c "printf '' | { source '$DEVBOX'; set +u; claude_trust_config /work/proj 'PREFIX-0123456789abcdefghij'; }"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"0123456789abcdefghij"'* ]]
+  [[ "$output" != *"PREFIX-0123456789abcdefghij"* ]]
+}
+
+@test "claude_trust_config drops a stale rejection for the same key" {
+  existing='{"customApiKeyResponses":{"approved":[],"rejected":["devbox-proxy"]}}'
+  run bash -c "printf '%s' '$existing' | { source '$DEVBOX'; set +u; claude_trust_config /work/proj devbox-proxy; }"
+  [ "$status" -eq 0 ]
+  rejected="$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["customApiKeyResponses"]["rejected"])')"
+  [ "$rejected" = "[]" ]
+  [[ "$output" == *'"devbox-proxy"'* ]]
+}
+
+@test "claude_trust_config records no key approval when none is set" {
+  run bash -c "printf '' | { source '$DEVBOX'; set +u; claude_trust_config /work/proj ''; }"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"customApiKeyResponses"* ]]
+}
+
+@test "claude_trust_config recovers from an unparseable config" {
+  run bash -c "printf 'not json{' | { source '$DEVBOX'; set +u; claude_trust_config /work/proj ''; }"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"hasTrustDialogAccepted": true'* ]]
+}
+
+@test "codex_trust_config appends a trusted project table" {
+  run bash -c "printf 'model = \"x\"' | { source '$DEVBOX'; set +u; codex_trust_config /work/proj; }"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'model = "x"'* ]]
+  [[ "$output" == *'[projects."/work/proj"]'* ]]
+  [[ "$output" == *'trust_level = "trusted"'* ]]
+}
+
+@test "codex_trust_config leaves an answer already on record alone" {
+  # A host config copied in with --with-agent-config, or an earlier run.
+  existing=$'[projects."/work/proj"]\ntrust_level = "untrusted"\n'
+  run bash -c "printf '%s' '$existing' | { source '$DEVBOX'; set +u; codex_trust_config /work/proj; }"
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf '%s' "$existing")" ]
+}
+
+@test "codex_trust_config is idempotent" {
+  once="$(printf '' | bash -c "source '$DEVBOX'; set +u; codex_trust_config /work/proj")"
+  twice="$(printf '%s\n' "$once" | bash -c "source '$DEVBOX'; set +u; codex_trust_config /work/proj")"
+  [ "$once" = "$(printf '%s' "$twice")" ]
+}
+
+@test "codex_trust_config emits parseable TOML for a path needing escapes" {
+  run bash -c "printf '' | { source '$DEVBOX'; set +u; codex_trust_config '/work/my \"repo\"'; }"
+  [ "$status" -eq 0 ]
+  run bash -c "printf '%s' '$output' | python3 -c 'import sys,tomllib; d=tomllib.loads(sys.stdin.read()); print(d[\"projects\"][\"/work/my \\\"repo\\\"\"][\"trust_level\"])'"
+  [ "$status" -eq 0 ]
+  [ "$output" = "trusted" ]
+}
+
+@test "seed_agent_trust runs on every box, with no flag to gate it" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *'seed_agent_trust "$name" "$dir"'* ]]
+  run bash "$DEVBOX" -h
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Agent first-run prompts"* ]]
+}
+
+@test "guest_login_value survives a guest profile that greets on stdout" {
+  # A login shell is needed for /etc/profile.d values, but a chatty profile must
+  # not be mistaken for the value: that used to corrupt the merged config and
+  # produce a garbage CODEX_HOME path.
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() { printf 'Welcome to Ubuntu! 3 updates available.\n<devbox:/home/u/.codex:xobved>'; }
+    guest_login_value fake-box '\${CODEX_HOME:-\$HOME/.codex}'
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "/home/u/.codex" ]
+}
+
+@test "guest_login_value yields empty when the fence never appears" {
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() { echo 'limactl: instance not running'; return 1; }
+    guest_login_value fake-box '\${ANTHROPIC_API_KEY:-}'
+  "
+  [ "$output" = "" ]
+}

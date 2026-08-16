@@ -90,6 +90,14 @@
 #   demand in a kept guest created by an older golden. Direct host
 #   Wayland-socket mounts are deliberately not used.
 #
+# Agent first-run prompts
+#   Every run pre-answers the AI CLIs' first-run gates for the mounted
+#   directory: Claude Code's onboarding, folder-trust, and custom-API-key
+#   dialogs, and Codex's folder-trust and sign-in prompts. Choosing to start a
+#   devbox for a folder is already the trust decision, and the VM — not a
+#   dialog inside the agent — is the boundary. Scoped to that one directory:
+#   never $HOME, and never the read-only paths added with --mount.
+#
 # Project manifest (.devbox.toml)
 #   image  = "ubuntu-24.04"          shorthand, or the table form:
 #   [image]
@@ -1589,6 +1597,182 @@ done
 GUEST
 }
 
+# ------------------------------------------------------- agent trust seeding --
+# Starting a devbox for a directory *is* the trust decision. The operator named
+# the folder, and the box exists to run an AI CLI in it; the VM boundary — not
+# a dialog inside the agent — is what contains the blast radius. So devbox
+# pre-answers the first-run gates instead of asking the same question twice.
+#
+# Every gate is plain config state, and each function below writes exactly what
+# the agent's own dialog would write:
+#
+#   claude  ~/.claude.json            hasCompletedOnboarding, plus, for this
+#                                     directory only, hasTrustDialogAccepted /
+#                                     hasCompletedProjectOnboarding, plus the
+#                                     custom-API-key approval.
+#   codex   $CODEX_HOME/config.toml   [projects."DIR"] trust_level = "trusted"
+#           $CODEX_HOME/auth.json     api-key auth mode, so the sign-in picker
+#                                     is skipped.
+#
+# Deliberately scoped to the single mounted project directory: never $HOME, and
+# never the extra paths added with --mount, which default to read-only and are
+# not what the operator pointed devbox at.
+
+# Merge Claude Code's answers into an existing ~/.claude.json read on stdin.
+# Claude Code records an approved custom key by its last 20 characters, so the
+# caller passes whatever ANTHROPIC_API_KEY the guest login shell resolves —
+# the --proxy marker, a custom proxy-env template, or a real --api-keys value.
+claude_trust_config() { # $1 project dir $2 ANTHROPIC_API_KEY (may be empty)
+  # The script goes to -c, not a heredoc: a heredoc would take over stdin and
+  # silently discard the existing config being piped in.
+  local src
+  src="$(cat <<'PY'
+import json
+import sys
+
+directory, api_key = sys.argv[1], sys.argv[2].strip()
+raw = sys.stdin.read().strip()
+try:
+    config = json.loads(raw) if raw else {}
+except json.JSONDecodeError:
+    # A truncated or hand-edited config must not block the box from starting.
+    config = {}
+if not isinstance(config, dict):
+    config = {}
+
+config["hasCompletedOnboarding"] = True
+
+projects = config.get("projects")
+if not isinstance(projects, dict):
+    projects = config["projects"] = {}
+project = projects.get(directory)
+if not isinstance(project, dict):
+    project = projects[directory] = {}
+project["hasTrustDialogAccepted"] = True
+project["hasCompletedProjectOnboarding"] = True
+
+if api_key:
+    responses = config.get("customApiKeyResponses")
+    if not isinstance(responses, dict):
+        responses = config["customApiKeyResponses"] = {}
+    approved = responses.get("approved")
+    if not isinstance(approved, list):
+        approved = responses["approved"] = []
+    rejected = responses.get("rejected")
+    if not isinstance(rejected, list):
+        rejected = responses["rejected"] = []
+    fingerprint = api_key[-20:]
+    if fingerprint not in approved:
+        approved.append(fingerprint)
+    # A stale rejection outranks the approval, so drop it for this key only.
+    responses["rejected"] = [entry for entry in rejected if entry != fingerprint]
+
+print(json.dumps(config, indent=2))
+PY
+)"
+  python3 -c "$src" "$1" "${2:-}"
+}
+
+# Merge Codex's directory trust into an existing config.toml read on stdin.
+# An answer already on record — a host config copied in with --with-agent-config,
+# or an earlier devbox run — is left exactly as it is.
+codex_trust_config() { # $1 project dir
+  local src
+  src="$(cat <<'PY'
+import json
+import re
+import sys
+
+directory = sys.argv[1]
+existing = sys.stdin.read()
+
+table = re.compile(r'''^[ \t]*\[projects\.("(?:[^"\\]|\\.)*"|'[^']*')[ \t]*\][ \t]*$''', re.M)
+escapes = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}
+
+
+def decode(token):  # TOML quoted key -> the path it names
+    if token.startswith("'"):  # literal string: no escapes
+        return token[1:-1]
+    return re.sub(r"\\(.)", lambda m: escapes.get(m.group(1), m.group(1)), token[1:-1])
+
+
+if any(decode(match.group(1)) == directory for match in table.finditer(existing)):
+    sys.stdout.write(existing)
+    raise SystemExit(0)
+
+out = existing
+if out and not out.endswith("\n"):
+    out += "\n"
+if out.strip():
+    out += "\n"
+# TOML basic strings escape like JSON, so json.dumps produces a valid quoted key.
+out += f'[projects.{json.dumps(directory)}]\ntrust_level = "trusted"\n'
+sys.stdout.write(out)
+PY
+)"
+  python3 -c "$src" "$1"
+}
+
+# Resolve one variable from the guest's login environment. A login shell is
+# required — the values come from /etc/profile.d — but a profile that greets the
+# user on stdout would otherwise be indistinguishable from the value itself, so
+# the value is fenced and extracted rather than read as the whole output.
+guest_login_value() { # $1 Lima instance $2 shell expression
+  local name="$1" expr="$2" raw
+  raw="$(limactl shell "$name" -- bash -lc "printf '<devbox:%s:xobved>' \"$expr\"" 2>/dev/null || true)"
+  [[ "$raw" =~ \<devbox:(.*):xobved\> ]] && printf '%s' "${BASH_REMATCH[1]}"
+}
+
+seed_agent_trust() { # $1 Lima instance $2 mounted project dir
+  local name="$1" dir="$2" api_key openai_key codex_home quoted_home
+  local claude_config quoted_config
+  log "Pre-accepting agent first-run prompts for $dir"
+
+  # Read what the guest login shell actually resolves rather than assuming the
+  # default profile: --api-keys and a custom proxy-env template both land here.
+  # shellcheck disable=SC2016 # Expressions are for the guest shell to expand.
+  api_key="$(guest_login_value "$name" '${ANTHROPIC_API_KEY:-}')"
+  # shellcheck disable=SC2016 # Expressions are for the guest shell to expand.
+  openai_key="$(guest_login_value "$name" '${OPENAI_API_KEY:-}')"
+  # shellcheck disable=SC2016 # Expressions are for the guest shell to expand.
+  codex_home="$(guest_login_value "$name" '${CODEX_HOME:-$HOME/.codex}')"
+  # Both CLIs let their config directory be relocated, so resolve rather than
+  # assume: writing to the default path would silently seed nothing.
+  # shellcheck disable=SC2016 # Expressions are for the guest shell to expand.
+  claude_config="$(guest_login_value "$name" '${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json')"
+
+  # Reads use a non-login shell: no profile runs, so nothing can be spliced into
+  # the file being merged.
+  if [[ -n "$claude_config" ]]; then
+    quoted_config="$(printf '%q' "$claude_config")"
+    limactl shell "$name" -- bash -c "cat $quoted_config 2>/dev/null || true" 2>/dev/null \
+      | claude_trust_config "$dir" "$api_key" \
+      | limactl shell "$name" -- bash -c "umask 077; mkdir -p \"\$(dirname $quoted_config)\" && cat > $quoted_config.devbox && mv $quoted_config.devbox $quoted_config" \
+      || warn "could not pre-accept Claude Code first-run prompts"
+  fi
+
+  # Seeding is a convenience, never a reason to fail a box that is otherwise up.
+  [[ -n "$codex_home" ]] || return 0
+  quoted_home="$(printf '%q' "$codex_home")"
+  limactl shell "$name" -- bash -c "umask 077; install -d -m 700 $quoted_home" \
+    || { warn "could not prepare $codex_home — leaving Codex prompts to the box"; return 0; }
+  limactl shell "$name" -- bash -c "cat $quoted_home/config.toml 2>/dev/null || true" 2>/dev/null \
+    | codex_trust_config "$dir" \
+    | limactl shell "$name" -- bash -c "umask 077; cat > $quoted_home/config.toml.devbox && chmod 600 $quoted_home/config.toml.devbox && mv $quoted_home/config.toml.devbox $quoted_home/config.toml" \
+    || warn "could not pre-accept the Codex directory trust prompt"
+
+  # Codex shows its sign-in picker whenever auth.json is missing, which is the
+  # normal state under --proxy (apply_proxy removes it so no OAuth material
+  # reaches the guest). Seed the same dummy routing marker that is already
+  # exported as OPENAI_API_KEY — it is not a credential, and the host proxy
+  # replaces it after TLS termination. A real auth.json copied in with
+  # --with-creds is never overwritten.
+  [[ -n "$openai_key" ]] || return 0
+  python3 -c 'import json, sys; print(json.dumps({"OPENAI_API_KEY": sys.argv[1], "auth_mode": "apikey"}))' "$openai_key" \
+    | limactl shell "$name" -- bash -c "umask 077; if [ -s $quoted_home/auth.json ]; then cat >/dev/null; else cat > $quoted_home/auth.json && chmod 600 $quoted_home/auth.json; fi" \
+    || warn "could not pre-accept the Codex sign-in prompt"
+}
+
 # --------------------------------------------------------- project manifest --
 project_manifest() { # $1 .devbox.toml -> normalized JSON
   python3 - "$1" <<'PY'
@@ -2097,6 +2281,10 @@ cmd_run() {
   else
     apply_session_persistence "$name" "$session_state"
   fi
+
+  # After every profile and config write, so the seeded API-key approval matches
+  # the key the guest login shell will really use.
+  seed_agent_trust "$name" "$dir"
 
   if [[ -n "$manifest" ]]; then
     local manifest_packages

@@ -40,6 +40,7 @@ read-write so resumable transcripts survive clone deletion; use
 | `--gui` / `-G` | Become a Wayland client of the host session through Waypipe. | It does not receive the raw host Wayland socket or host GPU/render-device nodes. This is still a host-desktop capability, not an isolation boundary; see [GUI forwarding security](gui-security.md). |
 | `--with-agent-config` / `-g` | Read selected non-secret rules, prompts, settings, and custom agents copied into the guest. Those instructions can affect agent behavior. | Authentication state, histories, caches, key directories, and files detected as credentials are excluded. |
 | `--api-keys` / `-K` or `--with-creds` / `-c` | Read actual keys or copied OAuth credentials in the guest. | These deliberately weaken the host-only credential boundary. Prefer `--proxy` when the provider workflow supports it. |
+| pre-accepted agent prompts *(always on, no flag)* | Start work in the mounted directory without a trust dialog, which also means the repository's own `.claude/settings.json` and hooks run unprompted. See [pre-accepted agent first-run prompts](#pre-accepted-agent-first-run-prompts). | It gains no capability the flags above do not already grant, and trust is never seeded for `$HOME` or for `--mount` paths. |
 
 ## SSH-agent forwarding
 
@@ -166,6 +167,42 @@ you have consciously accepted their separate risks. For the narrowest
 untrusted-code environment, begin with
 `devbox --no-auth --ephemeral-sessions` and no extra mounts, copies, agent
 forwarding, proxy, or GUI forwarding.
+
+## Pre-accepted agent first-run prompts
+
+Devbox answers the AI CLIs' own first-run gates for you, on every run:
+
+| prompt | what Devbox writes |
+|---|---|
+| Claude Code onboarding | `hasCompletedOnboarding` in `~/.claude.json` |
+| Claude Code folder trust | `projects."DIR".hasTrustDialogAccepted` |
+| Claude Code custom API key | the approval for whatever `ANTHROPIC_API_KEY` the guest resolves |
+| Codex folder trust | `[projects."DIR"] trust_level = "trusted"` in `$CODEX_HOME/config.toml` |
+| Codex sign-in picker | an api-key-mode `auth.json` holding the same dummy routing marker already exported as `OPENAI_API_KEY` |
+
+The reasoning is that these dialogs ask a question the operator has already
+answered. Choosing to start a Devbox for a directory *is* the decision to run an
+agent against that directory, and the VM — not a confirmation inside the agent —
+is what bounds the result. Asking twice trains people to hit "yes" without
+reading, which makes the prompt worth less everywhere it does matter.
+
+The seeding is scoped to the single mounted project directory. It never trusts
+`$HOME`, and never the extra paths added with `--mount`, which default to
+read-only. Codex answers already on record are left as they are, so an explicit
+`trust_level = "untrusted"` copied in with `--with-agent-config` still stands.
+A real `auth.json` copied in with `--with-creds` is never overwritten.
+
+What you give up: Claude Code's folder-trust dialog is also what gates a
+repository's own `.claude/settings.json` and hooks from executing. With trust
+pre-accepted, a hostile repository's hooks run when the agent starts, without a
+prompt. That is the intended trade for a disposable VM whose contents you are
+willing to lose, with one caveat worth naming: the box is disposable but the
+[session store](#persistent-ai-session-state) is not, so anything that reaches a
+transcript outlives the clone. Use `--ephemeral-sessions` for a repository you
+would not want resumed. It is *not* a reason to relax the guidance below. Treat
+`--ssh-agent`, `--proxy`, `--gui`, and extra writable mounts as the controls
+that actually matter, because none of them are gated by an agent-side dialog
+either.
 
 ## Reviewing repository-controlled requests
 
