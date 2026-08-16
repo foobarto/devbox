@@ -7,6 +7,11 @@
 #
 #   DEVBOX_E2E=1 DEVBOX_E2E_WITH_CREDS=1 test/e2e.sh
 #
+# The golden image is built up front, outside the per-session timeout, because a
+# first-time build far outlasts any sane session cap. Override the cap for the
+# individual Devbox sessions with DEVBOX_E2E_SESSION_TIMEOUT (seconds, default
+# 900) on a slow machine.
+#
 set -euo pipefail
 
 [[ "${DEVBOX_E2E:-}" == 1 ]] || {
@@ -70,7 +75,7 @@ pid, fd = pty.fork()
 if pid == 0:
     os.execvp(argv[0], argv)
 
-deadline = time.monotonic() + 600
+deadline = time.monotonic() + float(os.environ.get("DEVBOX_E2E_SESSION_TIMEOUT", "900"))
 transcript = bytearray()
 sent_approval = False
 sent_exit = False
@@ -171,6 +176,15 @@ path.write_text(
 )
 PY
 
+# Build the golden before any timed session. A first-time golden build downloads
+# a cloud image and a whole toolchain, which Devbox allows 90 minutes for, while
+# each run_session below is capped at DEVBOX_E2E_SESSION_TIMEOUT. Folding the
+# build into the first session made the suite fail on any machine without a
+# golden — and leave a half-provisioned one behind. This is idempotent: an
+# existing, verified golden is reused.
+echo "[e2e] ensure the ubuntu-24.04 golden exists (untimed; may take many minutes)"
+"$DEVBOX_BIN" build --image ubuntu-24.04 --yes
+
 echo "[e2e] reject manifest consent without creating a VM"
 manifest_instance="$(manifest_name "$MANIFEST_PROJECT")"
 run_session decline "$DEVBOX_BIN" "$MANIFEST_PROJECT"
@@ -187,6 +201,45 @@ test -s "$MANIFEST_PROJECT/.claude-e2e-output"
 test -s "$MANIFEST_PROJECT/.codex-e2e-output"
 git -C "$MANIFEST_PROJECT" cat-file -p HEAD | grep -q '^gpgsig -----BEGIN SSH SIGNATURE-----'
 curl -fsS http://127.0.0.1:4141/_devbox | grep -q devbox-ai-proxy
+
+echo "[e2e] agent first-run prompts are pre-accepted for the mounted directory only"
+cat > "$MANIFEST_PROJECT/.e2e-trust-check.py" <<'PY'
+import json
+import os
+import pathlib
+import sys
+import tomllib
+
+project, mount_source = sys.argv[1], sys.argv[2]
+home = pathlib.Path.home()
+
+claude = json.loads((home / ".claude.json").read_text())
+assert claude.get("hasCompletedOnboarding") is True, "claude onboarding not pre-accepted"
+projects = claude.get("projects", {})
+assert projects[project].get("hasTrustDialogAccepted") is True, "claude trust not pre-accepted"
+approved = claude.get("customApiKeyResponses", {}).get("approved", [])
+assert os.environ["ANTHROPIC_API_KEY"][-20:] in approved, "custom API key not pre-approved"
+
+codex_home = pathlib.Path(os.environ.get("CODEX_HOME") or home / ".codex")
+codex = tomllib.loads((codex_home / "config.toml").read_text())
+assert codex["projects"][project]["trust_level"] == "trusted", "codex trust not pre-accepted"
+
+# Seeding is scoped to the mounted project: $HOME and --mount paths, which the
+# operator never pointed devbox at, must stay unanswered.
+for stray in (str(home), mount_source):
+    assert not projects.get(stray, {}).get("hasTrustDialogAccepted"), \
+        f"claude trust leaked to {stray}"
+    assert stray not in codex.get("projects", {}), f"codex trust leaked to {stray}"
+auth = json.loads((codex_home / "auth.json").read_text())
+assert auth["auth_mode"] == "apikey", "codex sign-in picker not pre-answered"
+# Only the dummy routing marker reaches the guest; no OAuth material.
+assert auth["OPENAI_API_KEY"] == os.environ["OPENAI_API_KEY"]
+assert "tokens" not in auth, "codex auth.json unexpectedly carries OAuth tokens"
+print("trust-seeding OK")
+PY
+# shellcheck disable=SC2016 # $HOME and the proxy profile expand inside the guest.
+assert_guest "$manifest_instance" \
+  "python3 '$MANIFEST_PROJECT/.e2e-trust-check.py' '$MANIFEST_PROJECT' '$MOUNT_SOURCE'"
 
 echo "[e2e] -a copies non-secret agent config without copying OAuth credentials"
 run_session approve "$DEVBOX_BIN" "$MANIFEST_PROJECT" -a

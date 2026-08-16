@@ -749,3 +749,204 @@ setup() {
   [ "$status" -ne 0 ]
   [[ "$output" == *"unknown flag"* ]]
 }
+
+# ------------------------------------------------ golden sandbox verification --
+# Ubuntu 24.04 ships passt 0.0~git20240220, which predates
+# `pasta --splice-only`, so requiring it deleted every golden built from the
+# default image. bwrap remains fatal; the passt capability only warns.
+
+@test "golden verification probes bwrap and pasta separately" {
+  source_text="$(<"$DEVBOX")"
+  # A single combined probe cannot report which prerequisite is missing.
+  [[ "$source_text" != *'bwrap --unshare-user --unshare-net --uid 0 --gid 0 --ro-bind / / true
+    pasta --help'* ]]
+  [[ "$source_text" == *"golden cannot run bwrap"* ]]
+  [[ "$source_text" == *"the passt build did not succeed"* ]]
+}
+
+@test "an unusable bwrap still fails the golden" {
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() { case \"\$*\" in *bwrap*) return 1;; *) return 0;; esac; }
+    verify_golden fake-golden
+  "
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"golden cannot run bwrap"* ]]
+}
+
+@test "a passt without --splice-only warns but keeps the golden" {
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() {
+      case \"\$*\" in
+        *pasta*)  return 1;;
+        *known_hosts*) printf 'github.com ssh-rsa A\ngithub.com ssh-ed25519 B\ngithub.com ecdsa-sha2-nistp256 C\n';;
+        *) return 0;;
+      esac
+    }
+    verify_golden fake-golden
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"the passt build did not succeed"* ]]
+  [[ "$output" == *"the golden is kept"* ]]
+}
+
+@test "bwrap AppArmor profile install is not gated on the racy userns sysctl" {
+  source_text="$(<"$DEVBOX")"
+  # The sysctl is applied by apparmor's own units, so reading it during
+  # provisioning races the package upgrade in the same apt run.
+  [[ "$source_text" != *'&& [[ "$(</proc/sys/kernel/apparmor_restrict_unprivileged_userns)" == 1 ]]'* ]]
+  [[ "$source_text" == *"install -D -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict"* ]]
+}
+
+@test "a failed apparmor_parser does not abort golden provisioning" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *"could not load bwrap AppArmor profile; it will load at next boot"* ]]
+}
+
+@test "golden provisioning builds a pinned upstream passt when the distro's is too old" {
+  source_text="$(<"$DEVBOX")"
+  # Ubuntu 24.04's passt predates --splice-only and noble has no backport.
+  [[ "$source_text" == *'if ! pasta --help 2>&1 | grep -q -- "--splice-only"; then'* ]]
+  # Pinned to a tag AND verified against the commit it must resolve to:
+  # passt.top publishes no checksums for its prebuilt binaries.
+  [[ "$source_text" == *"passt_tag=2026_07_28.f8df3f1"* ]]
+  [[ "$source_text" == *"passt_commit=f8df3f1b228fe19a74a269334fdfe6cc7d0605ce"* ]]
+  [[ "$source_text" == *'rev-parse HEAD)" == "$passt_commit"'* ]]
+  [[ "$source_text" == *"https://passt.top/passt"* ]]
+}
+
+@test "a failed passt build does not abort golden provisioning" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *"could not build passt \$passt_tag; keeping the distro version"* ]]
+}
+
+# ------------------------------------------------------- e2e harness limits ----
+
+@test "e2e builds the golden outside the per-session timeout" {
+  suite="$(<"$BATS_TEST_DIRNAME/e2e.sh")"
+  # Folding a 90-minute golden build into a capped session made the suite fail
+  # on any machine without a golden, and orphan a half-provisioned one.
+  [[ "$suite" == *'"$DEVBOX_BIN" build --image ubuntu-24.04 --yes'* ]]
+  build_line="$(grep -n 'build --image ubuntu-24.04 --yes' "$BATS_TEST_DIRNAME/e2e.sh" | cut -d: -f1)"
+  first_session="$(grep -n 'run_session decline' "$BATS_TEST_DIRNAME/e2e.sh" | head -1 | cut -d: -f1)"
+  [ "$build_line" -lt "$first_session" ]
+}
+
+@test "e2e session timeout is overridable and no longer 600s" {
+  suite="$(<"$BATS_TEST_DIRNAME/e2e.sh")"
+  [[ "$suite" == *'DEVBOX_E2E_SESSION_TIMEOUT'* ]]
+  [[ "$suite" != *"time.monotonic() + 600"* ]]
+}
+
+# ------------------------------------------------- agent trust seeding ----
+# Starting a devbox for a directory is the trust decision, so the box
+# pre-answers the AI CLIs' first-run gates. These cover the pure merge
+# functions; the guest-side wiring is exercised by test/e2e.sh.
+
+@test "claude_trust_config trusts only the mounted directory" {
+  run bash -c "printf '' | { source '$DEVBOX'; set +u; claude_trust_config /work/proj ''; }"
+  [ "$status" -eq 0 ]
+  trusted="$(printf '%s' "$output" | python3 -c 'import json,sys; c=json.load(sys.stdin); print(list(c["projects"]))')"
+  [ "$trusted" = "['/work/proj']" ]
+  [[ "$output" == *'"hasTrustDialogAccepted": true'* ]]
+  [[ "$output" == *'"hasCompletedOnboarding": true'* ]]
+}
+
+@test "claude_trust_config preserves unrelated existing config" {
+  existing='{"theme":"dark","projects":{"/other":{"allowedTools":["Bash"]}}}'
+  run bash -c "printf '%s' '$existing' | { source '$DEVBOX'; set +u; claude_trust_config /work/proj ''; }"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"theme": "dark"'* ]]
+  [[ "$output" == *'"/other"'* ]]
+  [[ "$output" == *'"/work/proj"'* ]]
+}
+
+@test "claude_trust_config approves the key by its last 20 characters" {
+  # Claude Code stores an approved custom key as key.trim().slice(-20).
+  run bash -c "printf '' | { source '$DEVBOX'; set +u; claude_trust_config /work/proj 'PREFIX-0123456789abcdefghij'; }"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"0123456789abcdefghij"'* ]]
+  [[ "$output" != *"PREFIX-0123456789abcdefghij"* ]]
+}
+
+@test "claude_trust_config drops a stale rejection for the same key" {
+  existing='{"customApiKeyResponses":{"approved":[],"rejected":["devbox-proxy"]}}'
+  run bash -c "printf '%s' '$existing' | { source '$DEVBOX'; set +u; claude_trust_config /work/proj devbox-proxy; }"
+  [ "$status" -eq 0 ]
+  rejected="$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["customApiKeyResponses"]["rejected"])')"
+  [ "$rejected" = "[]" ]
+  [[ "$output" == *'"devbox-proxy"'* ]]
+}
+
+@test "claude_trust_config records no key approval when none is set" {
+  run bash -c "printf '' | { source '$DEVBOX'; set +u; claude_trust_config /work/proj ''; }"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"customApiKeyResponses"* ]]
+}
+
+@test "claude_trust_config recovers from an unparseable config" {
+  run bash -c "printf 'not json{' | { source '$DEVBOX'; set +u; claude_trust_config /work/proj ''; }"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"hasTrustDialogAccepted": true'* ]]
+}
+
+@test "codex_trust_config appends a trusted project table" {
+  run bash -c "printf 'model = \"x\"' | { source '$DEVBOX'; set +u; codex_trust_config /work/proj; }"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'model = "x"'* ]]
+  [[ "$output" == *'[projects."/work/proj"]'* ]]
+  [[ "$output" == *'trust_level = "trusted"'* ]]
+}
+
+@test "codex_trust_config leaves an answer already on record alone" {
+  # A host config copied in with --with-agent-config, or an earlier run.
+  existing=$'[projects."/work/proj"]\ntrust_level = "untrusted"\n'
+  run bash -c "printf '%s' '$existing' | { source '$DEVBOX'; set +u; codex_trust_config /work/proj; }"
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf '%s' "$existing")" ]
+}
+
+@test "codex_trust_config is idempotent" {
+  once="$(printf '' | bash -c "source '$DEVBOX'; set +u; codex_trust_config /work/proj")"
+  twice="$(printf '%s\n' "$once" | bash -c "source '$DEVBOX'; set +u; codex_trust_config /work/proj")"
+  [ "$once" = "$(printf '%s' "$twice")" ]
+}
+
+@test "codex_trust_config emits parseable TOML for a path needing escapes" {
+  run bash -c "printf '' | { source '$DEVBOX'; set +u; codex_trust_config '/work/my \"repo\"'; }"
+  [ "$status" -eq 0 ]
+  run bash -c "printf '%s' '$output' | python3 -c 'import sys,tomllib; d=tomllib.loads(sys.stdin.read()); print(d[\"projects\"][\"/work/my \\\"repo\\\"\"][\"trust_level\"])'"
+  [ "$status" -eq 0 ]
+  [ "$output" = "trusted" ]
+}
+
+@test "seed_agent_trust runs on every box, with no flag to gate it" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *'seed_agent_trust "$name" "$dir"'* ]]
+  run bash "$DEVBOX" -h
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Agent first-run prompts"* ]]
+}
+
+@test "guest_login_value survives a guest profile that greets on stdout" {
+  # A login shell is needed for /etc/profile.d values, but a chatty profile must
+  # not be mistaken for the value: that used to corrupt the merged config and
+  # produce a garbage CODEX_HOME path.
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() { printf 'Welcome to Ubuntu! 3 updates available.\n<devbox:/home/u/.codex:xobved>'; }
+    guest_login_value fake-box '\${CODEX_HOME:-\$HOME/.codex}'
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "/home/u/.codex" ]
+}
+
+@test "guest_login_value yields empty when the fence never appears" {
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() { echo 'limactl: instance not running'; return 1; }
+    guest_login_value fake-box '\${ANTHROPIC_API_KEY:-}'
+  "
+  [ "$output" = "" ]
+}
