@@ -761,7 +761,7 @@ setup() {
   [[ "$source_text" != *'bwrap --unshare-user --unshare-net --uid 0 --gid 0 --ro-bind / / true
     pasta --help'* ]]
   [[ "$source_text" == *"golden cannot run bwrap"* ]]
-  [[ "$source_text" == *"predates 'pasta --splice-only'"* ]]
+  [[ "$source_text" == *"the passt build did not succeed"* ]]
 }
 
 @test "an unusable bwrap still fails the golden" {
@@ -787,7 +787,7 @@ setup() {
     verify_golden fake-golden
   "
   [ "$status" -eq 0 ]
-  [[ "$output" == *"predates 'pasta --splice-only'"* ]]
+  [[ "$output" == *"the passt build did not succeed"* ]]
   [[ "$output" == *"the golden is kept"* ]]
 }
 
@@ -802,4 +802,39 @@ setup() {
 @test "a failed apparmor_parser does not abort golden provisioning" {
   source_text="$(<"$DEVBOX")"
   [[ "$source_text" == *"could not load bwrap AppArmor profile; it will load at next boot"* ]]
+}
+
+@test "golden provisioning builds a pinned upstream passt when the distro's is too old" {
+  source_text="$(<"$DEVBOX")"
+  # Ubuntu 24.04's passt predates --splice-only and noble has no backport.
+  [[ "$source_text" == *'if ! pasta --help 2>&1 | grep -q -- "--splice-only"; then'* ]]
+  # Pinned to a tag AND verified against the commit it must resolve to:
+  # passt.top publishes no checksums for its prebuilt binaries.
+  [[ "$source_text" == *"passt_tag=2026_07_28.f8df3f1"* ]]
+  [[ "$source_text" == *"passt_commit=f8df3f1b228fe19a74a269334fdfe6cc7d0605ce"* ]]
+  [[ "$source_text" == *'rev-parse HEAD)" == "$passt_commit"'* ]]
+  [[ "$source_text" == *"https://passt.top/passt"* ]]
+}
+
+@test "a failed passt build does not abort golden provisioning" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *"could not build passt \$passt_tag; keeping the distro version"* ]]
+}
+
+# ------------------------------------------------------- e2e harness limits ----
+
+@test "e2e builds the golden outside the per-session timeout" {
+  suite="$(<"$BATS_TEST_DIRNAME/e2e.sh")"
+  # Folding a 90-minute golden build into a capped session made the suite fail
+  # on any machine without a golden, and orphan a half-provisioned one.
+  [[ "$suite" == *'"$DEVBOX_BIN" build --image ubuntu-24.04 --yes'* ]]
+  build_line="$(grep -n 'build --image ubuntu-24.04 --yes' "$BATS_TEST_DIRNAME/e2e.sh" | cut -d: -f1)"
+  first_session="$(grep -n 'run_session decline' "$BATS_TEST_DIRNAME/e2e.sh" | head -1 | cut -d: -f1)"
+  [ "$build_line" -lt "$first_session" ]
+}
+
+@test "e2e session timeout is overridable and no longer 600s" {
+  suite="$(<"$BATS_TEST_DIRNAME/e2e.sh")"
+  [[ "$suite" == *'DEVBOX_E2E_SESSION_TIMEOUT'* ]]
+  [[ "$suite" != *"time.monotonic() + 600"* ]]
 }

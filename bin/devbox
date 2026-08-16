@@ -583,6 +583,32 @@ provision:
       /usr/sbin/apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict \
         || echo "devbox: could not load bwrap AppArmor profile; it will load at next boot" >&2
     fi
+    # Stado's sandbox reaches the host allowlist through `pasta --splice-only`.
+    # That option postdates the passt in some archives — Ubuntu 24.04 carries
+    # 0.0~git20240220 and noble has no backport — so build the pinned upstream
+    # release when the distro's is too old, and leave a new-enough one alone.
+    #
+    # From source at a pinned tag rather than passt.top's prebuilt binaries:
+    # that directory publishes no checksums or signatures, while a tag resolves
+    # to a fixed commit this script names. passt is plain C with no dependencies
+    # beyond the build-essential installed above.
+    if ! pasta --help 2>&1 | grep -q -- "--splice-only"; then
+      passt_tag=2026_07_28.f8df3f1
+      passt_commit=f8df3f1b228fe19a74a269334fdfe6cc7d0605ce
+      passt_src="$(mktemp -d)"
+      # A build failure must not abort provisioning: verify_golden reports the
+      # missing capability afterwards, and the rest of the golden is usable.
+      if git clone --quiet --depth 1 --branch "$passt_tag" \
+           https://passt.top/passt "$passt_src/passt" \
+         && [[ "$(git -C "$passt_src/passt" rev-parse HEAD)" == "$passt_commit" ]] \
+         && make -C "$passt_src/passt" -j"$(nproc)" \
+         && make -C "$passt_src/passt" install prefix=/usr/local; then
+        echo "devbox: installed passt $passt_tag to /usr/local"
+      else
+        echo "devbox: could not build passt $passt_tag; keeping the distro version" >&2
+      fi
+      rm -rf "$passt_src"
+    fi
 - mode: user
   script: |
     #!/bin/bash
@@ -706,17 +732,19 @@ verify_golden() {
     warn "  inspect with: limactl shell $name -- bwrap --unshare-user --unshare-net --uid 0 --gid 0 --ro-bind / / true"
     return 1
   fi
-  # `--splice-only` postdates the passt in some supported archives — Ubuntu
-  # 24.04 carries 0.0~git20240220 with no backport — so requiring it here
-  # deleted every golden built from the default image. Report the missing
-  # capability and keep the golden: only Stado's proxy-only guest networking is
-  # affected, and the rest of the toolchain is verified above.
+  # Provisioning builds the pinned upstream passt whenever the distro's is older
+  # than `--splice-only`, so reaching this warning means that build did not
+  # succeed. Report it and keep the golden rather than deleting it: only Stado's
+  # proxy-only guest networking is affected, the rest of the toolchain is
+  # verified above, and requiring this outright is what deleted every golden
+  # built from the default image.
   if ! limactl shell "$name" -- bash -lc '
     pasta --help 2>&1 | grep -q -- "--splice-only"
   ' </dev/null 2>/dev/null; then
-    warn "golden's passt predates 'pasta --splice-only'"
-    warn "  Stado's proxy-only sandbox networking is unavailable in this image."
-    warn "  Everything else is verified; the golden is kept."
+    warn "golden's pasta has no --splice-only; the passt build did not succeed"
+    warn "  Stado's proxy-only sandbox networking is unavailable in this golden."
+    warn "  Everything else is verified; the golden is kept. Rebuild with:"
+    warn "    devbox build --image <image> --force"
   fi
   # shellcheck disable=SC2016 # $HOME expands in the guest shell.
   host_keys="$(limactl shell "$name" -- bash -lc '
