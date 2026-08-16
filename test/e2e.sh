@@ -7,6 +7,11 @@
 #
 #   DEVBOX_E2E=1 DEVBOX_E2E_WITH_CREDS=1 test/e2e.sh
 #
+# The golden image is built up front, outside the per-session timeout, because a
+# first-time build far outlasts any sane session cap. Override the cap for the
+# individual Devbox sessions with DEVBOX_E2E_SESSION_TIMEOUT (seconds, default
+# 900) on a slow machine.
+#
 set -euo pipefail
 
 [[ "${DEVBOX_E2E:-}" == 1 ]] || {
@@ -70,7 +75,7 @@ pid, fd = pty.fork()
 if pid == 0:
     os.execvp(argv[0], argv)
 
-deadline = time.monotonic() + 600
+deadline = time.monotonic() + float(os.environ.get("DEVBOX_E2E_SESSION_TIMEOUT", "900"))
 transcript = bytearray()
 sent_approval = False
 sent_exit = False
@@ -170,6 +175,15 @@ path.write_text(
     ))
 )
 PY
+
+# Build the golden before any timed session. A first-time golden build downloads
+# a cloud image and a whole toolchain, which Devbox allows 90 minutes for, while
+# each run_session below is capped at DEVBOX_E2E_SESSION_TIMEOUT. Folding the
+# build into the first session made the suite fail on any machine without a
+# golden — and leave a half-provisioned one behind. This is idempotent: an
+# existing, verified golden is reused.
+echo "[e2e] ensure the ubuntu-24.04 golden exists (untimed; may take many minutes)"
+"$DEVBOX_BIN" build --image ubuntu-24.04 --yes
 
 echo "[e2e] reject manifest consent without creating a VM"
 manifest_instance="$(manifest_name "$MANIFEST_PROJECT")"
