@@ -1,5 +1,34 @@
 # Changelog
 
+## v1.3.0 - 2026-08-16
+
+- Pre-accept the AI CLIs' first-run prompts for the mounted directory on every
+  run: Claude Code's onboarding, folder-trust, and custom-API-key dialogs, and
+  Codex's folder-trust and sign-in prompts. Starting a Devbox for a folder is
+  already the trust decision, and the VM is the boundary. Trust is seeded for
+  that directory only — never `$HOME`, never `--mount` paths — answers already
+  on record are kept, and a real Codex `auth.json` from `--with-creds` is never
+  overwritten. A repository's own `.claude/settings.json` and hooks
+  consequently run unprompted; see
+  [agent capability security](docs/agent-capabilities-security.md).
+- Fix `devbox build` deleting the golden it had just built. Verification
+  required `pasta --splice-only`, which Ubuntu 24.04's passt predates with no
+  backport available, so the default image could never produce a usable golden.
+  bwrap and pasta are now probed separately, and bwrap failures name the
+  command to reproduce them.
+- Build the pinned upstream passt (`2026_07_28.f8df3f1`, verified against its
+  commit) in goldens whose distro package is older than `--splice-only`, so
+  Stado's proxy-only sandbox networking works on those images instead of being
+  reported as missing.
+- Install the bwrap AppArmor profile whenever the profile and parser exist,
+  rather than testing `apparmor_restrict_unprivileged_userns` during
+  provisioning. That sysctl is applied by the apparmor package's own units and
+  races the package upgrade in the same apt run, which could leave a golden
+  silently unable to sandbox.
+- The e2e suite builds the golden before its timed sessions instead of folding a
+  90-minute build into a capped one, and its per-session timeout is now 900s and
+  overridable with `DEVBOX_E2E_SESSION_TIMEOUT`.
+
 ## v1.2.1 - 2026-08-15
 
 - Move GitHub proxy-capability renewal into the long-lived host proxy daemon so
