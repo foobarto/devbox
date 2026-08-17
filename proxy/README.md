@@ -48,9 +48,10 @@ chooses, in order:
 
 The proxy reads access tokens fresh on every request. Its background check runs
 every minute, refreshes Claude and Codex OAuth sessions shortly before expiry,
-and retries a request once after a 401 or 403. It uses OAuth refresh grants
-rather than sending empty model prompts, so it does not consume model usage
-just to keep a session alive.
+and retries a request once after a 401 or 403. Claude refreshes through its OAuth
+grant; Codex refreshes through the host CLI's managed-auth `account/read`
+interface, so the proxy never independently consumes Codex's one-time refresh
+token. Refreshing does not send empty model prompts or consume model usage.
 The VM never receives an access or refresh token; the repository also has a
 pre-commit guard against embedding one in production scripts.
 
@@ -115,6 +116,10 @@ For Codex subscriptions, `devbox --proxy` gives the guest an isolated,
 non-secret Codex profile that points its ChatGPT backend and WebSocket traffic
 to the host proxy. The guest only receives the literal routing marker
 `devbox-proxy`; the host replaces it with the refreshed OAuth header.
+The host must have a current `codex` CLI on `PATH`. All Devbox proxy processes
+also serialize refresh requests through an owner-only host lock and re-read
+`auth.json` after taking it, so custom-port or concurrently started proxies
+adopt a token another proxy already rotated instead of refreshing it again.
 
 For OpenAI/Codex platform keys and the other API-key providers, configure
 `api-keys.env` as before. An explicit `proxy.config.json` still takes full
