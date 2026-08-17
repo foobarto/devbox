@@ -48,7 +48,7 @@ brew install foobarto/tap/devbox
 
 Installs `devbox` and `devbox-ai-proxy` on your `PATH`. The current stable
 GitHub release is
-[`v1.3.0`](https://github.com/foobarto/devbox/releases/tag/v1.3.0); source
+[`v1.3.1`](https://github.com/foobarto/devbox/releases/tag/v1.3.1); source
 archives are available from that release. Config lives under `~/.config/devbox/`
 (or `$XDG_CONFIG_HOME/devbox`).
 
@@ -168,6 +168,31 @@ Because the name is deterministic, re-running `devbox` in the same folder finds
 the same box. That's what makes "one box per folder" and re-entering `--keep`
 boxes work.
 
+### Startup time
+
+The first `devbox` run for an image takes longer because it must download the
+base image and build, provision, and verify the golden image before it can make
+the first clone. This is a one-time cost per golden; run `devbox build` ahead of
+time when you do not want the first interactive launch to wait. Normal later
+runs clone the completed golden and should be much faster.
+
+Keep that fast path intact:
+
+- Put slow, deterministic system setup in `[image].provision` and slow
+  user-level setup in `[image].provision_user`. Those actions run while building
+  the golden, not every time a box starts.
+- Keep `start` small, idempotent, and safe to run on every entry. Avoid
+  unconditional package upgrades, dependency downloads, source builds,
+  database migrations, or other network-heavy work there.
+- `packages` is convenient and skips packages already present in a kept box,
+  but a new disposable clone still has to install packages that are absent from
+  its golden. Bake large or slow package sets into the golden instead.
+- Use `--keep` when retaining guest-only compiler caches, package stores, or
+  services matters more than getting a fresh disposable clone. Do not use
+  `devbox build --force` unless you actually need to replace a golden.
+- On filesystems without reflink support, cloning copies more disk data. Keep
+  goldens lean and avoid baking disposable caches or build outputs into them.
+
 ## AI session continuity
 
 Resumable session state is persistent by default even when the VM is not.
@@ -176,6 +201,9 @@ Devbox gives each canonical project path a separate directory under
 read-write, and uses it for Claude Code, Codex (including the isolated
 `--proxy` profile), OpenCode, Pi, and Stado session records. Existing kept
 boxes gain the mount on their next entry and restart once if necessary.
+The directory name is derived only from the canonical project path, not from
+the selected image, golden, or disposable box, so rebuilding or replacing a
+golden reattaches the same project's existing sessions.
 Devbox refuses to attach the same store to two differently named boxes at once,
 which avoids concurrent writers corrupting an agent's session database; destroy
 the retained owner first or make the second box ephemeral.
@@ -335,13 +363,15 @@ box, bake a toolchain into its golden, install Homebrew packages, and run a
 startup command. An explicit CLI flag always wins over the manifest.
 
 ```toml
-packages = ["node", "python@3.12"]
-start = "npm install"
+start = "test -d node_modules || npm ci"
 
 [image]
 location = "ubuntu-24.04"
 provision = '''
 apt-get install -y --no-install-recommends postgresql-client
+'''
+provision_user = '''
+brew install node python@3.12
 '''
 
 [resources]

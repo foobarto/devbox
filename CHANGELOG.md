@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.3.1 - 2026-08-17
+
+- Prevent host Codex and Devbox from racing the same one-time OAuth refresh
+  token. The proxy now asks Codex's managed auth layer to refresh its own
+  credential store, serializes all Devbox proxy refreshes with an owner-only
+  host lock, and adopts a token already rotated by another process before
+  retrying a rejected request.
+- Document the longer first launch while a golden image is built, how to keep
+  per-run startup work small, and that persistent agent sessions follow the
+  canonical project path across golden rebuilds.
+
 ## v1.3.0 - 2026-08-16
 
 - Pre-accept the AI CLIs' first-run prompts for the mounted directory on every

@@ -10,7 +10,7 @@ import sys
 import tempfile
 import threading
 from base64 import b64encode
-from base64 import urlsafe_b64encode
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import TestCase, main
 from unittest.mock import Mock, patch
@@ -113,35 +113,97 @@ class AutoAnthropicAuthTests(TestCase):
             self.assertEqual(data["claudeAiOauth"]["refreshToken"], "new-refresh")
             self.assertGreater(data["claudeAiOauth"]["expiresAt"], 0)
 
-    def test_codex_refresh_rotates_host_credentials_atomically(self):
+    def test_codex_refresh_is_delegated_to_codex_managed_auth(self):
         with tempfile.TemporaryDirectory() as directory:
             credentials_path = Path(directory) / "auth.json"
-            id_token = ".".join((
-                urlsafe_b64encode(b"{}").decode().rstrip("="),
-                urlsafe_b64encode(b'{"aud":"client"}').decode().rstrip("="),
-                "signature",
-            ))
             credentials_path.write_text(json.dumps({
                 "auth_mode": "chatgpt",
                 "tokens": {
                     "access_token": "old-access",
                     "refresh_token": "old-refresh",
-                    "id_token": id_token,
                     "account_id": "account-id",
                 },
             }))
+
+            def managed_refresh():
+                data = json.loads(credentials_path.read_text())
+                data["tokens"]["access_token"] = "new-access"
+                data["tokens"]["refresh_token"] = "new-refresh"
+                credentials_path.write_text(json.dumps(data))
+
             with patch.object(proxy, "CODEX_CREDENTIALS_PATH", str(credentials_path)), \
-                 patch.object(proxy, "refresh_token", return_value={
-                     "access_token": "new-access", "refresh_token": "new-refresh",
-                 }):
+                 patch.object(proxy, "CODEX_REFRESH_LOCK_PATH", str(Path(directory) / "refresh.lock")), \
+                 patch.object(proxy, "request_codex_managed_refresh", side_effect=managed_refresh) as refresh, \
+                 patch.object(proxy, "refresh_token") as direct_refresh:
                 self.assertEqual(
-                    proxy.resolve_codex_oauth(force_refresh=True),
+                    proxy.resolve_codex_oauth(
+                        force_refresh=True, rejected_access="old-access"
+                    ),
                     ("new-access", "account-id", "openai"),
                 )
+            refresh.assert_called_once_with()
+            direct_refresh.assert_not_called()
             data = json.loads(credentials_path.read_text())
             self.assertEqual(data["tokens"]["access_token"], "new-access")
             self.assertEqual(data["tokens"]["refresh_token"], "new-refresh")
-            self.assertIn("last_refresh", data)
+
+    def test_codex_refresh_adopts_token_rotated_by_another_proxy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            credentials_path = Path(directory) / "auth.json"
+            credentials_path.write_text(json.dumps({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "rejected-access",
+                    "refresh_token": "old-refresh",
+                    "account_id": "account-id",
+                },
+            }))
+
+            @contextmanager
+            def competing_proxy_refresh():
+                data = json.loads(credentials_path.read_text())
+                data["tokens"]["access_token"] = "other-proxy-access"
+                data["tokens"]["refresh_token"] = "other-proxy-refresh"
+                credentials_path.write_text(json.dumps(data))
+                yield
+
+            with patch.object(proxy, "CODEX_CREDENTIALS_PATH", str(credentials_path)), \
+                 patch.object(proxy, "codex_refresh_lock", competing_proxy_refresh), \
+                 patch.object(proxy, "request_codex_managed_refresh") as refresh:
+                self.assertEqual(
+                    proxy.resolve_codex_oauth(
+                        force_refresh=True, rejected_access="rejected-access"
+                    ),
+                    ("other-proxy-access", "account-id", "openai"),
+                )
+            refresh.assert_not_called()
+
+    def test_codex_refresh_lock_excludes_a_second_proxy_process(self):
+        contender = (
+            "import fcntl, os, sys; "
+            "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600); "
+            "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = str(Path(directory) / "refresh.lock")
+            with patch.object(proxy, "CODEX_REFRESH_LOCK_PATH", lock_path):
+                with proxy.codex_refresh_lock():
+                    blocked = subprocess.run(
+                        [sys.executable, "-c", contender, lock_path],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                acquired = subprocess.run(
+                    [sys.executable, "-c", contender, lock_path],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                lock_mode = Path(lock_path).stat().st_mode & 0o777
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertEqual(acquired.returncode, 0, acquired.stderr)
+        self.assertEqual(lock_mode, 0o600)
 
 
 class GitHubCliProxyTests(TestCase):

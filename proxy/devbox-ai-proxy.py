@@ -20,6 +20,7 @@ Config: JSON at $DEVBOX_PROXY_CONFIG (defaults to proxy.config.example.json next
 to this file). See that file for the shape.
 """
 import base64
+import fcntl
 import hashlib
 import html
 import hmac
@@ -37,6 +38,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
@@ -47,6 +49,14 @@ CONFIG_PATH = os.environ.get(
 )
 with open(CONFIG_PATH) as _f:
     CONFIG = json.load(_f)
+try:
+    version_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "VERSION"
+    )
+    with open(version_path) as _f:
+        DEVBOX_VERSION = _f.read().strip() or "unknown"
+except OSError:
+    DEVBOX_VERSION = "unknown"
 
 LISTEN = CONFIG.get("listen", "0.0.0.0:4141")
 _HOST, _PORT = LISTEN.rsplit(":", 1)
@@ -89,8 +99,15 @@ CLAUDE_CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
-CODEX_CREDENTIALS_PATH = os.path.expanduser("~/.codex/auth.json")
-CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_HOME = os.path.abspath(
+    os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))
+)
+CODEX_CREDENTIALS_PATH = os.path.join(CODEX_HOME, "auth.json")
+CODEX_REFRESH_LOCK_PATH = os.path.join(
+    os.path.dirname(CODEX_CREDENTIALS_PATH), ".devbox-oauth-refresh.lock"
+)
+CODEX_BIN = os.environ.get("DEVBOX_CODEX_BIN", "codex")
+CODEX_APP_SERVER_TIMEOUT_SECONDS = 45
 REFRESH_SKEW_SECONDS = 300
 REFRESH_POLL_SECONDS = 60
 _REFRESH_LOCKS = {"anthropic": threading.Lock(), "openai": threading.Lock()}
@@ -448,6 +465,121 @@ def refresh_token(token_url: str, client_id: str, refresh: str, json_body: bool 
     return data
 
 
+@contextmanager
+def codex_refresh_lock():
+    """Serialize Codex refreshes across every Devbox proxy on this host."""
+    directory = os.path.dirname(CODEX_REFRESH_LOCK_PATH)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    descriptor = os.open(CODEX_REFRESH_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _codex_app_server_response(process, request_id: int) -> dict:
+    """Read one JSON-RPC response without letting a stuck app-server hang the proxy."""
+    if process.stdout is None:
+        raise RuntimeError("Codex app-server stdout is unavailable")
+    deadline = time.monotonic() + CODEX_APP_SERVER_TIMEOUT_SECONDS
+    buffered = getattr(process, "_devbox_stdout_buffer", b"")
+    while True:
+        if b"\n" in buffered:
+            line, buffered = buffered.split(b"\n", 1)
+            process._devbox_stdout_buffer = buffered
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(message, dict) or message.get("id") != request_id:
+                continue
+            if message.get("error") is not None:
+                raise RuntimeError("Codex app-server rejected the token refresh")
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("Codex app-server returned an invalid token refresh response")
+            return result
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Codex app-server token refresh timed out")
+        ready, _, _ = select.select([process.stdout], [], [], remaining)
+        if not ready:
+            raise RuntimeError("Codex app-server token refresh timed out")
+        chunk = os.read(process.stdout.fileno(), 65536)
+        if not chunk:
+            raise RuntimeError("Codex app-server exited before token refresh completed")
+        buffered += chunk
+        process._devbox_stdout_buffer = buffered
+
+
+def request_codex_managed_refresh() -> None:
+    """Ask Codex's managed auth layer to refresh its own host credential store."""
+    try:
+        process = subprocess.Popen(
+            [
+                CODEX_BIN,
+                "app-server",
+                "--stdio",
+                "-c",
+                'cli_auth_credentials_store="file"',
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=os.path.expanduser("~"),
+        )
+    except OSError as exc:
+        raise RuntimeError("host Codex CLI is unavailable for managed token refresh") from exc
+    try:
+        if process.stdin is None:
+            raise RuntimeError("Codex app-server stdin is unavailable")
+        initialize = {
+            "method": "initialize",
+            "id": 0,
+            "params": {
+                "clientInfo": {
+                    "name": "devbox_credential_proxy",
+                    "title": "Devbox credential proxy",
+                    "version": DEVBOX_VERSION,
+                }
+            },
+        }
+        process.stdin.write((json.dumps(initialize) + "\n").encode())
+        process.stdin.flush()
+        _codex_app_server_response(process, 0)
+        process.stdin.write(
+            (json.dumps({"method": "initialized", "params": {}}) + "\n").encode()
+        )
+        process.stdin.write((json.dumps({
+            "method": "account/read",
+            "id": 1,
+            "params": {"refreshToken": True},
+        }) + "\n").encode())
+        process.stdin.flush()
+        _codex_app_server_response(process, 1)
+    except OSError as exc:
+        raise RuntimeError("could not communicate with the host Codex CLI") from exc
+    finally:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
 def resolve_claude_oauth(force_refresh: bool = False) -> tuple[str, str]:
     with _REFRESH_LOCKS["anthropic"]:
         credentials = read_json(CLAUDE_CREDENTIALS_PATH)
@@ -474,7 +606,9 @@ def resolve_claude_oauth(force_refresh: bool = False) -> tuple[str, str]:
         return (access, "anthropic") if isinstance(access, str) and access else ("", "")
 
 
-def resolve_codex_oauth(force_refresh: bool = False) -> tuple[str, str, str]:
+def resolve_codex_oauth(
+    force_refresh: bool = False, rejected_access: str = ""
+) -> tuple[str, str, str]:
     with _REFRESH_LOCKS["openai"]:
         credentials = read_json(CODEX_CREDENTIALS_PATH)
         tokens = credentials.get("tokens")
@@ -484,21 +618,67 @@ def resolve_codex_oauth(force_refresh: bool = False) -> tuple[str, str, str]:
         refresh = tokens.get("refresh_token", "")
         account = tokens.get("account_id", "")
         expires_at = jwt_payload(access).get("exp") if isinstance(access, str) else None
+        if (
+            force_refresh
+            and rejected_access
+            and isinstance(access, str)
+            and access
+            and access != rejected_access
+            and not token_expiring(expires_at)
+        ):
+            return access, account if isinstance(account, str) else "", "openai"
         if force_refresh or token_expiring(expires_at):
-            audience = jwt_payload(tokens.get("id_token", "")).get("aud")
-            client_id = audience[0] if isinstance(audience, list) and audience else audience
-            if not isinstance(client_id, str) or not client_id or not isinstance(refresh, str) or not refresh:
+            if not isinstance(refresh, str) or not refresh:
                 return "", "", ""
             try:
-                refreshed = refresh_token(CODEX_TOKEN_URL, client_id, refresh)
-                access = refreshed["access_token"]
-                tokens["access_token"] = access
-                tokens["refresh_token"] = refreshed.get("refresh_token", refresh)
-                if isinstance(refreshed.get("id_token"), str):
-                    tokens["id_token"] = refreshed["id_token"]
-                credentials["tokens"] = tokens
-                credentials["last_refresh"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-                write_json_atomic(CODEX_CREDENTIALS_PATH, credentials)
+                with codex_refresh_lock():
+                    # Another proxy may have refreshed while this process was
+                    # waiting. Re-read the authoritative Codex store before
+                    # consuming any one-time refresh token.
+                    credentials = read_json(CODEX_CREDENTIALS_PATH)
+                    tokens = credentials.get("tokens")
+                    if not isinstance(tokens, dict):
+                        return "", "", ""
+                    current_access = tokens.get("access_token", "")
+                    current_expires = (
+                        jwt_payload(current_access).get("exp")
+                        if isinstance(current_access, str)
+                        else None
+                    )
+                    if (
+                        isinstance(current_access, str)
+                        and current_access
+                        and not token_expiring(current_expires)
+                        and (
+                            (rejected_access and current_access != rejected_access)
+                            or (not force_refresh)
+                        )
+                    ):
+                        account = tokens.get("account_id", "")
+                        return (
+                            current_access,
+                            account if isinstance(account, str) else "",
+                            "openai",
+                        )
+
+                    previous_access = current_access
+                    request_codex_managed_refresh()
+                    credentials = read_json(CODEX_CREDENTIALS_PATH)
+                    tokens = credentials.get("tokens")
+                    if not isinstance(tokens, dict):
+                        raise RuntimeError("Codex removed its token data during refresh")
+                    access = tokens.get("access_token", "")
+                    account = tokens.get("account_id", "")
+                    expires_at = (
+                        jwt_payload(access).get("exp") if isinstance(access, str) else None
+                    )
+                    if (
+                        not isinstance(access, str)
+                        or not access
+                        or access == previous_access
+                        or token_expiring(expires_at)
+                    ):
+                        raise RuntimeError("Codex did not publish a fresh access token")
             except Exception as exc:
                 sys.stderr.write(f"[devbox-ai-proxy] Codex OAuth refresh failed: {exc}\n")
                 return "", "", ""
@@ -534,7 +714,7 @@ def resolve_github_token() -> str:
     return completed.stdout.strip() if completed.returncode == 0 else ""
 
 
-def resolve_auth(auth: dict, force_refresh: bool = False):
+def resolve_auth(auth: dict, force_refresh: bool = False, rejected_access: str = ""):
     """Return headers and provider for one route auth block.
 
     The automatic routes prefer a host API key, then use a host OAuth login.
@@ -561,7 +741,9 @@ def resolve_auth(auth: dict, force_refresh: bool = False):
         api_key = os.environ.get("OPENAI_API_KEY", "")
         if api_key and source == "auto:openai":
             return "authorization", "Bearer ", api_key, {}, (), ""
-        oauth_token, account_id, provider = resolve_codex_oauth(force_refresh)
+        oauth_token, account_id, provider = resolve_codex_oauth(
+            force_refresh, rejected_access
+        )
         if oauth_token:
             extra = {"ChatGPT-Account-ID": account_id} if account_id else {}
             return "authorization", "Bearer ", oauth_token, extra, (), provider
@@ -1340,12 +1522,16 @@ class Handler(BaseHTTPRequestHandler):
         auth = route.get("auth")
         conn_cls = http.client.HTTPSConnection if up.scheme == "https" else http.client.HTTPConnection
 
-        def request_headers(force_refresh: bool = False, websocket: bool = False):
+        def request_headers(
+            force_refresh: bool = False,
+            websocket: bool = False,
+            rejected_access: str = "",
+        ):
             headers = dict(websocket_headers if websocket else incoming_headers)
             provider = ""
             if auth:
                 hname, prefix, value, extra_headers, remove_headers, provider = resolve_auth(
-                    auth, force_refresh
+                    auth, force_refresh, rejected_access
                 )
                 if not hname or not value:
                     return None, ""
@@ -1371,7 +1557,12 @@ class Handler(BaseHTTPRequestHandler):
                 conn, status, response = self._open_websocket(up, headers)
                 if status in (401, 403) and provider:
                     conn.close()
-                    headers, _ = request_headers(force_refresh=True, websocket=True)
+                    rejected_access = headers.get("authorization", "").removeprefix("Bearer ")
+                    headers, _ = request_headers(
+                        force_refresh=True,
+                        websocket=True,
+                        rejected_access=rejected_access,
+                    )
                     if headers is None:
                         self.send_error(503, "OAuth refresh failed")
                         audit_outcome(503, provider, "oauth-refresh-failed", attempts=2, websocket=True)
@@ -1422,7 +1613,10 @@ class Handler(BaseHTTPRequestHandler):
             if resp.status in (401, 403) and provider:
                 resp.read()
                 conn.close()
-                headers, _ = request_headers(force_refresh=True)
+                rejected_access = headers.get("authorization", "").removeprefix("Bearer ")
+                headers, _ = request_headers(
+                    force_refresh=True, rejected_access=rejected_access
+                )
                 if headers is None:
                     self.send_error(503, "OAuth refresh failed")
                     audit_outcome(503, provider, "oauth-refresh-failed", attempts=2)
