@@ -650,10 +650,40 @@ setup() {
 
 @test "provisioning scripts reach the guest over stdin, not the argv" {
   # Multi-line scripts with quotes must not be word-split or re-quoted through a
-  # command line; they are piped to `bash -s`.
+  # command line; they are piped to `bash … -s`.
   run declare -f apply_golden_provisioning
   [ "$status" -eq 0 ]
-  [[ "$output" == *"bash -s"* ]]
+  [[ "$output" == *"bash -e -s"* ]]
+  [[ "$output" == *"bash -l -e -s"* ]]
+}
+
+@test "a project script that fails halfway fails the provisioning phase" {
+  # A shell reading from stdin exits with its LAST command's status, so a
+  # manifest whose `brew install` failed still "succeeded" if its closing line
+  # worked — and the golden was baked without the toolchain it asked for.
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() { shift 3; \"\$@\"; }   # drop 'shell NAME --', run the rest locally
+    sudo() { env \"\$@\"; }           # env, so the DEBIAN_FRONTEND prefix applies
+    apply_golden_provisioning fake-golden 'false
+true' ''
+  "
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"project system provisioning failed"* ]]
+}
+
+@test "a golden whose project provisioning failed is deleted, not left to clone" {
+  # Every later run treats an existing golden as a usable clone source, so a
+  # retained half-provisioned one turns one visible build error into boxes that
+  # are quietly missing their toolchain.
+  src="$(<"$DEVBOX")"
+  [[ "$src" == *'if ! apply_golden_provisioning "$golden" "$provision" "$provision_user"; then'* ]]
+  [[ "$src" == *"Removing incomplete \$golden."* ]]
+  # the phase itself must report failure rather than exiting past the cleanup
+  run declare -f apply_golden_provisioning
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"die "* ]]
+  [[ "$output" == *"return 1"* ]]
 }
 
 # ------------------------------------------------------------ build timeout ----
@@ -767,7 +797,14 @@ setup() {
 @test "an unusable bwrap still fails the golden" {
   run bash -c "
     source '$DEVBOX' 2>/dev/null; set +u
-    limactl() { case \"\$*\" in *bwrap*) return 1;; *) return 0;; esac; }
+    limactl() {
+      case \"\$*\" in
+        *'for t in'*)             printf '  ok   brew      /home/linuxbrew/.linuxbrew/bin/brew\n';;
+        *'bwrap --unshare-user'*) return 1;;
+        *known_hosts*) printf 'github.com ssh-rsa A\ngithub.com ssh-ed25519 B\ngithub.com ecdsa-sha2-nistp256 C\n';;
+        *) return 0;;
+      esac
+    }
     verify_golden fake-golden
   "
   [ "$status" -ne 0 ]
@@ -779,7 +816,8 @@ setup() {
     source '$DEVBOX' 2>/dev/null; set +u
     limactl() {
       case \"\$*\" in
-        *pasta*)  return 1;;
+        *'for t in'*)     printf '  ok   brew      /home/linuxbrew/.linuxbrew/bin/brew\n';;
+        *'pasta --help'*) return 1;;
         *known_hosts*) printf 'github.com ssh-rsa A\ngithub.com ssh-ed25519 B\ngithub.com ecdsa-sha2-nistp256 C\n';;
         *) return 0;;
       esac
@@ -789,6 +827,51 @@ setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"the passt build did not succeed"* ]]
   [[ "$output" == *"the golden is kept"* ]]
+}
+
+@test "a golden without Homebrew is rejected, not kept with a warning" {
+  # brew installs gh, every AI CLI, and whatever the manifest's provision_user
+  # asks for, so keeping a brew-less golden hands an empty toolchain to every
+  # box cloned from it long after the build log explaining it has scrolled off.
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() {
+      case \"\$*\" in
+        *'for t in'*) printf '  MISS brew      (not on PATH)\n  ok   claude    /home/u/.local/bin/claude\n';;
+        *cloud-init-output.log*) printf 'curl: (22) The requested URL returned error: 429\n';;
+        *known_hosts*) printf 'github.com ssh-rsa A\ngithub.com ssh-ed25519 B\ngithub.com ecdsa-sha2-nistp256 C\n';;
+        *) return 0;;
+      esac
+    }
+    verify_golden fake-golden
+  "
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"golden has no Homebrew"* ]]
+  # the cause is lifted out of the guest before cmd_build deletes the instance
+  [[ "$output" == *"429"* ]]
+}
+
+@test "an unreachable guest fails verification instead of passing it" {
+  # The probe is keyed on a positive 'ok brew' line, so a shell that returns
+  # nothing at all cannot read as a clean toolchain.
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() { return 1; }
+    verify_golden fake-golden
+  "
+  [ "$status" -ne 0 ]
+}
+
+@test "the Homebrew installer fetch retries and falls back off the raw CDN" {
+  source_text="$(<"$DEVBOX")"
+  # GitHub's raw-content tier fails independently of its API tier — during the
+  # 2026-08-17 partial outage raw answered 429 and then nothing at all, while
+  # api.github.com served the same file — so a single-source fetch there is
+  # what emptied a golden's entire toolchain.
+  [[ "$source_text" != *'/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'* ]]
+  [[ "$source_text" == *'https://api.github.com/repos/Homebrew/install/contents/install.sh'* ]]
+  [[ "$source_text" == *'Accept: application/vnd.github.raw'* ]]
+  [[ "$source_text" == *'devbox: Homebrew is unavailable; the CLI toolchain will be missing'* ]]
 }
 
 @test "bwrap AppArmor profile install is not gated on the racy userns sysctl" {

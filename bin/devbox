@@ -656,11 +656,41 @@ provision:
     done < "$github_hosts"
     rm -f "$github_hosts"
     # --- Homebrew (Linuxbrew): distro-agnostic base for the AI CLIs ---
+    # Every other tool in this golden — gh, the AI CLIs, and whatever a project
+    # manifest's provision_user installs — is installed *by* brew, so this one
+    # fetch decides whether the toolchain exists at all.
+    #
+    # GitHub's raw-content tier fails independently of its API tier, so take
+    # the installer from whichever one is up. During the 2026-08-17 partial
+    # outage GitHub reported ~50% errors on "archive downloads and raw
+    # repository content downloads" against ~20% on API traffic; measured from
+    # here, raw.githubusercontent.com returned 429 and then stopped answering
+    # at all while api.github.com served the same file in ~100ms. A token does
+    # not help: shed requests are shed with or without one. So retry (curl
+    # counts 429 as transient), then re-fetch the identical file through the
+    # REST API. Downloading before running keeps a truncated or error-body
+    # response from being piped into bash.
     if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ] && ! command -v brew >/dev/null 2>&1; then
-      NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
+      brew_installer="$(mktemp)"
+      curl --fail --silent --show-error --location --retry 3 \
+        https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh > "$brew_installer" \
+      || curl --fail --silent --show-error --location --retry 3 \
+        --header 'Accept: application/vnd.github.raw' \
+        --header 'X-GitHub-Api-Version: 2022-11-28' \
+        --user-agent 'devbox-golden-homebrew' \
+        https://api.github.com/repos/Homebrew/install/contents/install.sh > "$brew_installer" \
+      || echo "devbox: could not fetch the Homebrew installer" >&2
+      [ -s "$brew_installer" ] && NONINTERACTIVE=1 /bin/bash "$brew_installer" || true
+      rm -f "$brew_installer"
     fi
     BREW="$(command -v brew || echo /home/linuxbrew/.linuxbrew/bin/brew)"
     [ -x "$BREW" ] && eval "$("$BREW" shellenv)" || true
+    # Every install below ends in `|| true` so one unavailable formula cannot
+    # abort the build. Without brew that leniency turns the whole toolchain into
+    # a silent run of no-ops, so name the cause once here — verify_golden is
+    # what actually fails the build.
+    command -v brew >/dev/null 2>&1 \
+      || echo "devbox: Homebrew is unavailable; the CLI toolchain will be missing" >&2
     export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/.opencode/bin:$PATH"
     # --- AI CLIs, terminal agent multiplexer, and GitHub CLI ---
     brew install codex || true
@@ -696,19 +726,27 @@ YAML
 #
 # Scripts are piped to `bash -s` rather than passed as arguments so that quoting
 # and newlines survive intact.
+#
+# `-e` on top of that, because a shell reading a script from stdin exits with
+# the status of its LAST command: a manifest whose `brew install …` failed
+# halfway through still reported success as long as its closing line worked, so
+# the die below could never fire and the golden was baked missing exactly the
+# toolchain the manifest existed to install. Not `-u` — manifests legitimately
+# test unset variables — and not `-o pipefail`, which would newly fail scripts
+# whose pipelines have always tolerated a failing producer.
 apply_golden_provisioning() { # $1 golden $2 system script $3 user script
   local golden="$1" system="${2:-}" user="${3:-}"
   if [[ -n "$system" ]]; then
     log "Applying project system provisioning to $golden (this can take a while)…"
     printf '%s\n' "$system" \
-      | limactl shell "$golden" -- sudo DEBIAN_FRONTEND=noninteractive bash -s \
-      || die "project system provisioning failed"
+      | limactl shell "$golden" -- sudo DEBIAN_FRONTEND=noninteractive bash -e -s \
+      || { warn "project system provisioning failed"; return 1; }
   fi
   if [[ -n "$user" ]]; then
     log "Applying project user provisioning to $golden…"
     printf '%s\n' "$user" \
-      | limactl shell "$golden" -- bash -l -s \
-      || die "project user provisioning failed"
+      | limactl shell "$golden" -- bash -l -e -s \
+      || { warn "project user provisioning failed"; return 1; }
   fi
 }
 
@@ -723,6 +761,27 @@ verify_golden() {
   printf '%s\n' "$out" >&2
   if printf '%s' "$out" | grep -q MISS; then
     warn "some tools missing in golden — inspect with: limactl shell $name"
+  fi
+  # Homebrew is not one more entry in that list: gh, every AI CLI, and the
+  # project manifest's own provision_user are installed *through* it, so a
+  # golden without brew is an empty toolchain rather than a golden short one
+  # tool. Warning and keeping it is what let a failed installer fetch bake a
+  # golden that every later run cloned, turning a few minutes of upstream
+  # degradation during one build into a mystery `command not found` in every box
+  # afterwards. Keyed on the positive result so an unreachable guest fails too.
+  if ! printf '%s' "$out" | grep -q '^  ok   brew '; then
+    warn "golden has no Homebrew — the CLI toolchain could not be installed"
+    # This golden is deleted as soon as this returns, and its provisioning ran
+    # on the serial console rather than this terminal, so lift the cause out
+    # before the log goes away with the instance.
+    local brew_log line
+    brew_log="$(limactl shell "$name" -- \
+      sudo grep -aiE 'homebrew|curl: \(' /var/log/cloud-init-output.log \
+      </dev/null 2>/dev/null | tail -5 || true)"
+    if [[ -n "$brew_log" ]]; then
+      while IFS= read -r line; do warn "  $line"; done <<<"$brew_log"
+    fi
+    return 1
   fi
   # Stado's Linux sandbox uses bwrap for process/filesystem isolation and
   # `pasta --splice-only` for proxy-only host allowlist networking. Probe them
@@ -1998,7 +2057,18 @@ cmd_build() {
   fi
   log "Building golden $golden from image '$image' — this takes several minutes…"
   limactl start --timeout "$DEFAULT_BUILD_TIMEOUT" --name="$golden" "$gy"
-  apply_golden_provisioning "$golden" "$provision" "$provision_user"
+  # Provisioning that fails must not leave the instance behind: every later
+  # `devbox` run treats an existing golden as a usable clone source, so a
+  # retained half-provisioned one turns a build error the operator saw once into
+  # boxes that are quietly missing their toolchain. Unlike the golden's own
+  # provisioning, this phase streams to the terminal, so its cause is already on
+  # screen by the time the instance goes.
+  if ! apply_golden_provisioning "$golden" "$provision" "$provision_user"; then
+    warn "Removing incomplete $golden."
+    limactl stop -f "$golden" 2>/dev/null || true
+    limactl delete -f "$golden" 2>/dev/null || true
+    die "project provisioning failed"
+  fi
   log "Verifying toolchain in $golden:"
   if ! verify_golden "$golden"; then
     warn "Golden verification failed; removing unusable $golden."

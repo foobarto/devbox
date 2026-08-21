@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.3.2 - 2026-08-21
+
+- Fetch the Homebrew installer resiliently while provisioning a golden: retry
+  the raw.githubusercontent.com download and fall back to the same file via the
+  GitHub REST API, download-then-run instead of piping curl straight into bash,
+  and say plainly when brew could not be installed so the `|| true` tool
+  installs that follow cannot no-op silently. During the 2026-08-17 GitHub
+  incident the raw-content tier answered 429 while the API tier served the
+  same file.
+- Reject a golden without Homebrew at verification instead of keeping it with a
+  warning. brew installs gh, every AI CLI, and the project manifest's own user
+  tooling, so a brew-less golden clones an empty toolchain into every later
+  box. The relevant cloud-init log lines are surfaced before the instance is
+  deleted, and an unreachable guest now fails verification instead of passing
+  it.
+- Run project provisioning manifests under `bash -e`, so a script that fails
+  halfway fails the build instead of reporting whatever its last line returned.
+- Delete a golden whose project provisioning failed rather than leaving it
+  behind as a clone source for boxes quietly missing their toolchain.
+
 ## v1.3.1 - 2026-08-17
 
 - Prevent host Codex and Devbox from racing the same one-time OAuth refresh
