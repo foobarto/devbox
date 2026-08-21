@@ -2,63 +2,26 @@
 
 ## v1.3.3 - 2026-08-21
 
-- Stop goldens and boxes from mounting the host home directory. A golden's
-  `mounts: []` was silently overridden: Lima resolves an image template's
-  `base:` chain at create time and an empty list reads as "unset", so a
-  template-based golden re-inherited `template:_default`'s read-only `~` mount,
-  which then cloned into every box and shadowed the writable project mount that
-  lives under it. Goldens are now created with `--mount-none` and clones with
-  `--mount-only`, so a box has exactly the mounts devbox asked for — and a
-  clone drops an inherited `~` even from a golden built before this fix. Before
-  handover, devbox now refuses a box whose project directory is not mounted
-  writable instead of failing on the session's first write.
+- Create goldens with `--mount-none` and clones with `--mount-only`, so a box
+  mounts the project and session store but never the host home directory.
+- Refuse a box whose project directory is not mounted writable before handover.
 - Fix a `set -e` abort when a stopped, kept box gained or lost persistent
-  session state: the mount helper's trailing `[[ … ]] && limactl start`
-  returned non-zero on the not-running path, and as the final command of a
-  `… || ensure_session_mount` list that aborted devbox before handover.
-- Tests now check effective, resolved behavior rather than generated config
-  text: the golden suite resolves Lima's template merge (`tmpl copy --fill`) and
-  asserts on the config Lima actually boots, the mount/clone/verify paths are
-  driven with a stubbed limactl and asserted on the commands issued, and the
-  e2e suite boots a box to prove the project mount is writable, the host home is
-  not mounted, and the toolchain resolves.
+  session state.
+- Test the resolved and booted behavior of goldens and boxes instead of the
+  generated config text.
 
 ## v1.3.2 - 2026-08-21
 
-- Fetch the Homebrew installer resiliently while provisioning a golden: retry
-  the raw.githubusercontent.com download and fall back to the same file via the
-  GitHub REST API, download-then-run instead of piping curl straight into bash,
-  and say plainly when brew could not be installed so the `|| true` tool
-  installs that follow cannot no-op silently. During the 2026-08-17 GitHub
-  incident the raw-content tier answered 429 while the API tier served the
-  same file.
-- Reject a golden without Homebrew at verification instead of keeping it with a
-  warning. brew installs gh, every AI CLI, and the project manifest's own user
-  tooling, so a brew-less golden clones an empty toolchain into every later
-  box. The relevant cloud-init log lines are surfaced before the instance is
-  deleted, and an unreachable guest now fails verification instead of passing
-  it.
+- Fetch the Homebrew installer with a retry and a GitHub REST API fallback when
+  `raw.githubusercontent.com` fails, and report when brew could not be installed.
+- Reject a golden without Homebrew at verification, surfacing the cloud-init
+  cause, and fail verification when the guest is unreachable.
 - Run project provisioning manifests under `bash -e`, so a script that fails
-  halfway fails the build instead of reporting whatever its last line returned.
-- Delete a golden whose project provisioning failed rather than leaving it
-  behind as a clone source for boxes quietly missing their toolchain.
-- Run on macOS hosts. `#!/usr/bin/env bash` resolves to the bash 3.2 that macOS
-  still ships as `/bin/bash` whenever `/bin` precedes a newer bash in PATH, and
-  3.2 cannot parse this script: it mis-reads a heredoc nested inside command
-  substitution and blames a line hundreds of lines past the real construct. An
-  explicit version guard now names the requirement and the fix, and the two
-  Python heredocs are read outside `$( )` so 3.2 parses the file end to end
-  instead of tripping anything that reads past the guard, `bash -n` included.
-- Replace the two GNU-only invocations on the host side. `stat -c %u` is rejected
-  by BSD stat, so the session-root ownership check compared a real uid against an
-  empty string and refused every directory with "session root is not owned by the
-  current user"; and `chmod --`, which BSD chmod reads as a filename, aborted
-  `prepare_session_dir` under errexit without printing anything. The portable
-  helpers probe GNU before BSD — BSD stat rejects a GNU flag cleanly, while GNU
-  stat reads `-f` as `--file-system` and pollutes the captured output before
-  failing. The unit tests grew the same portability for their mode assertions,
-  where BSD spells the permission bits `%Lp` and reserves `%a` for the access
-  time.
+  partway through fails the build.
+- Delete a golden whose project provisioning failed rather than keeping it as a
+  clone source.
+- Run on macOS hosts: guard against the bash 3.2 shipped as `/bin/bash`, and
+  replace GNU-only `stat`/`chmod` invocations with portable forms.
 
 ## v1.3.1 - 2026-08-17
 
