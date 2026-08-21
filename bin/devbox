@@ -210,8 +210,11 @@ abspath() { readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"; }
 
 # BSD stat (macOS) and GNU stat (Linux) spell their formats differently, and the
 # letters are not interchangeable — BSD's %a is the access time, not the mode.
+# GNU must be probed first: BSD stat rejects `-c` cleanly on stderr, but GNU
+# stat reads `-f` as --file-system and prints a filesystem-info block to stdout
+# before failing on the stray format operand, poisoning the captured output.
 file_owner_uid() { # $1 path
-  stat -f %u "$1" 2>/dev/null || stat -c %u "$1" 2>/dev/null
+  stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null
 }
 
 # ------------------------------------------------------------------ sizes --
@@ -1703,8 +1706,11 @@ claude_trust_config() { # $1 project dir $2 ANTHROPIC_API_KEY (may be empty)
   # silently discard the existing config being piped in.
   local src
   # The heredoc feeds `read` rather than "$(cat <<PY ...)": bash 3.2 mis-parses a
-  # heredoc nested inside command substitution, so the version guard at the top of
-  # this file would never be reached to explain itself.
+  # heredoc nested inside command substitution and blames a line hundreds of
+  # lines away. The version guard still fires first when the script is *run*
+  # (bash executes incrementally), but anything that parses the whole file —
+  # `bash -n`, editors, a future reshuffle that moves code above the guard —
+  # would trip over it, so keep the file parseable by 3.2 outright.
   IFS= read -r -d '' src <<'PY' || true
 import json
 import sys
@@ -1756,8 +1762,8 @@ PY
 # or an earlier devbox run — is left exactly as it is.
 codex_trust_config() { # $1 project dir
   local src
-  # See claude_trust_config: the heredoc must not be nested inside $( ) if bash 3.2
-  # is to parse this file at all.
+  # See claude_trust_config: the heredoc stays outside $( ) so bash 3.2 can
+  # parse this file end to end.
   IFS= read -r -d '' src <<'PY' || true
 import json
 import re

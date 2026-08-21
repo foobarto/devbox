@@ -17,9 +17,11 @@ setup() {
 }
 
 # Permission bits, portably: BSD stat (macOS) spells the mode %Lp, and its %a is
-# the access time — so the GNU format cannot simply be reused.
+# the access time — so the GNU format cannot simply be reused. GNU goes first:
+# BSD stat rejects `-c` cleanly, while GNU stat reads `-f` as --file-system and
+# prints a filesystem-info block to stdout before failing on the format operand.
 file_mode() { # $1 path
-  stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1" 2>/dev/null
+  stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null
 }
 
 # ------------------------------------------------------------------ _slug ----
