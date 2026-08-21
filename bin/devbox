@@ -127,6 +127,15 @@
 #
 set -euo pipefail
 
+# macOS still ships bash 3.2 as /bin/bash, and `#!/usr/bin/env bash` picks it up
+# whenever /bin precedes a newer bash in PATH. 3.2 cannot run this script, so say
+# so plainly instead of failing somewhere deep inside it.
+if [[ -z "${BASH_VERSINFO:-}" || "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+  printf '%s\n' "[devbox] ERROR: bash 4 or newer is required (running ${BASH_VERSION:-unknown})." >&2
+  printf '%s\n' "[devbox] On macOS: brew install bash, then put its bin ahead of /bin in PATH." >&2
+  exit 1
+fi
+
 # ---------------------------------------------------------------- constants --
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
@@ -198,6 +207,15 @@ die()  { _c '1;31'; printf '[devbox] ERROR:' >&2; _c 0; printf ' %s\n' "$*" >&2;
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 
 abspath() { readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"; }
+
+# BSD stat (macOS) and GNU stat (Linux) spell their formats differently, and the
+# letters are not interchangeable — BSD's %a is the access time, not the mode.
+# GNU must be probed first: BSD stat rejects `-c` cleanly on stderr, but GNU
+# stat reads `-f` as --file-system and prints a filesystem-info block to stdout
+# before failing on the stray format operand, poisoning the captured output.
+file_owner_uid() { # $1 path
+  stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null
+}
 
 # ------------------------------------------------------------------ sizes --
 # Lima's --cpus/--memory/--disk flags take GiB numbers, while its YAML and this
@@ -330,15 +348,17 @@ prepare_session_dir() { # $1 exact per-project host directory
   umask 077
   mkdir -p -- "$base"
   [[ -d "$base" && ! -L "$base" ]] || die "session root must be a real directory: $base"
-  owner="$(stat -c %u "$base" 2>/dev/null || true)"
+  owner="$(file_owner_uid "$base" || true)"
   [[ "$owner" == "$(id -u)" ]] || die "session root is not owned by the current user: $base"
-  chmod 700 -- "$base"
+  # No `--`: BSD chmod (macOS) has no option terminator and would take it as a
+  # filename. Both paths are absolute and validated above, so none is needed.
+  chmod 700 "$base"
   if [[ -e "$path" || -L "$path" ]]; then
     [[ -d "$path" && ! -L "$path" ]] || die "project session path must be a real directory: $path"
   else
     mkdir -- "$path"
   fi
-  chmod 700 -- "$path"
+  chmod 700 "$path"
   umask "$old_umask"
 }
 
@@ -1685,7 +1705,13 @@ claude_trust_config() { # $1 project dir $2 ANTHROPIC_API_KEY (may be empty)
   # The script goes to -c, not a heredoc: a heredoc would take over stdin and
   # silently discard the existing config being piped in.
   local src
-  src="$(cat <<'PY'
+  # The heredoc feeds `read` rather than "$(cat <<PY ...)": bash 3.2 mis-parses a
+  # heredoc nested inside command substitution and blames a line hundreds of
+  # lines away. The version guard still fires first when the script is *run*
+  # (bash executes incrementally), but anything that parses the whole file —
+  # `bash -n`, editors, a future reshuffle that moves code above the guard —
+  # would trip over it, so keep the file parseable by 3.2 outright.
+  IFS= read -r -d '' src <<'PY' || true
 import json
 import sys
 
@@ -1728,7 +1754,6 @@ if api_key:
 
 print(json.dumps(config, indent=2))
 PY
-)"
   python3 -c "$src" "$1" "${2:-}"
 }
 
@@ -1737,7 +1762,9 @@ PY
 # or an earlier devbox run — is left exactly as it is.
 codex_trust_config() { # $1 project dir
   local src
-  src="$(cat <<'PY'
+  # See claude_trust_config: the heredoc stays outside $( ) so bash 3.2 can
+  # parse this file end to end.
+  IFS= read -r -d '' src <<'PY' || true
 import json
 import re
 import sys
@@ -1768,7 +1795,6 @@ if out.strip():
 out += f'[projects.{json.dumps(directory)}]\ntrust_level = "trusted"\n'
 sys.stdout.write(out)
 PY
-)"
   python3 -c "$src" "$1"
 }
 

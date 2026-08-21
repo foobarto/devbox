@@ -16,6 +16,14 @@ setup() {
   set +u
 }
 
+# Permission bits, portably: BSD stat (macOS) spells the mode %Lp, and its %a is
+# the access time — so the GNU format cannot simply be reused. GNU goes first:
+# BSD stat rejects `-c` cleanly, while GNU stat reads `-f` as --file-system and
+# prints a filesystem-info block to stdout before failing on the format operand.
+file_mode() { # $1 path
+  stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null
+}
+
 # ------------------------------------------------------------------ _slug ----
 @test "_slug lowercases, replaces non-alnum, collapses and trims" {
   run _slug "Hello  World!!" 30
@@ -92,8 +100,8 @@ setup() {
   path="$(project_session_dir /home/u/proj)"
   prepare_session_dir "$path"
   [ -d "$path" ]
-  [ "$(stat -c %a "$AGENT_SESSION_BASE")" = 700 ]
-  [ "$(stat -c %a "$path")" = 700 ]
+  [ "$(file_mode "$AGENT_SESSION_BASE")" = 700 ]
+  [ "$(file_mode "$path")" = 700 ]
   AGENT_SESSION_BASE="$original"
 }
 
@@ -353,7 +361,7 @@ setup() {
   endpoint="http://host.lima.internal:4141"
   record_gh_proxy_endpoint devbox-test "$endpoint"
   [ "$(stored_gh_proxy_endpoint devbox-test)" = "$endpoint" ]
-  [ "$(stat -c %a "$(gh_proxy_state_path devbox-test)")" = "600" ]
+  [ "$(file_mode "$(gh_proxy_state_path devbox-test)")" = "600" ]
   ! valid_gh_proxy_endpoint "http://capability@host.lima.internal:4141"
   ! valid_gh_proxy_endpoint "https://host.lima.internal:4141"
   CONFIG_DIR="$original_config_dir"
@@ -365,7 +373,7 @@ setup() {
   endpoint="http://host.lima.internal:4141"
   record_traffic_proxy_endpoint devbox-test "$endpoint"
   [ "$(stored_traffic_proxy_endpoint devbox-test)" = "$endpoint" ]
-  [ "$(stat -c %a "$(traffic_proxy_state_path devbox-test)")" = "600" ]
+  [ "$(file_mode "$(traffic_proxy_state_path devbox-test)")" = "600" ]
   ! valid_gh_proxy_endpoint "http://capability@host.lima.internal:4141"
   CONFIG_DIR="$original_config_dir"
 }
