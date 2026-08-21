@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.3.3 - 2026-08-21
 
 - Stop goldens and boxes from mounting the host home directory. A golden's
   `mounts: []` was silently overridden: Lima resolves an image template's
