@@ -19,6 +19,19 @@
   halfway fails the build instead of reporting whatever its last line returned.
 - Delete a golden whose project provisioning failed rather than leaving it
   behind as a clone source for boxes quietly missing their toolchain.
+- Run on macOS hosts. `#!/usr/bin/env bash` resolves to the bash 3.2 that macOS
+  still ships as `/bin/bash` whenever `/bin` precedes a newer bash in PATH, and
+  3.2 cannot even parse this script: it mis-reads a heredoc nested inside command
+  substitution and blames a line thousands of lines past the real construct. The
+  two Python heredocs are now read outside `$( )`, and an explicit version guard
+  names the requirement and the fix instead of leaving a bare syntax error.
+- Replace the two GNU-only invocations on the host side. `stat -c %u` is rejected
+  by BSD stat, so the session-root ownership check compared a real uid against an
+  empty string and refused every directory with "session root is not owned by the
+  current user"; and `chmod --`, which BSD chmod reads as a filename, aborted
+  `prepare_session_dir` under errexit without printing anything. The unit tests
+  grew the same portability for their mode assertions, where BSD spells the
+  permission bits `%Lp` and reserves `%a` for the access time.
 
 ## v1.3.1 - 2026-08-17
 
