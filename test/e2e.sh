@@ -202,6 +202,40 @@ test -s "$MANIFEST_PROJECT/.codex-e2e-output"
 git -C "$MANIFEST_PROJECT" cat-file -p HEAD | grep -q '^gpgsig -----BEGIN SSH SIGNATURE-----'
 curl -fsS http://127.0.0.1:4141/_devbox | grep -q devbox-ai-proxy
 
+echo "[e2e] the booted box mounts the project writable and does NOT mount the host home"
+# The mount regression this proves against: an empty `mounts: []` golden
+# silently re-inherited the base template's read-only ~ mount, which then cloned
+# into every box and shadowed the writable project mount living under it. The
+# unit suite can only resolve the template merge and capture the flags devbox
+# passes; only a booted box proves the actual mount reality, so assert it here.
+# 1. the project directory is genuinely writable from inside the guest.
+assert_guest "$manifest_instance" "touch '$MANIFEST_PROJECT/.e2e-write-probe'"
+test -f "$MANIFEST_PROJECT/.e2e-write-probe"
+rm -f "$MANIFEST_PROJECT/.e2e-write-probe"
+# 2. no mount is the whole host home directory (a session subdir under $HOME is
+#    legitimate; the bug mounted the entire home, read-only). `-c`, not a
+#    heredoc: a heredoc would override the piped JSON on stdin.
+limactl list "$manifest_instance" --json | python3 -c '
+import json, os, sys
+home = os.path.realpath(sys.argv[1])
+item = json.load(sys.stdin)
+if isinstance(item, list):
+    item = item[0] if item else {}
+locs = [m.get("location") for m in item.get("config", {}).get("mounts", [])]
+for loc in locs:
+    if not loc:
+        continue
+    resolved = os.path.realpath(os.path.expanduser(loc))
+    assert loc != "~" and resolved != home, \
+        f"host home is mounted into the box: {loc!r} (all mounts: {locs})"
+print("no host-home mount; box mounts:", locs)
+' "$HOME"
+# 3. the toolchain brew installs actually resolves in the box, not merely that
+#    the golden yaml named it.
+# shellcheck disable=SC2016 # $t expands inside the guest shell, not here.
+assert_guest "$manifest_instance" \
+  'for t in brew gh claude codex opencode pi herdr stado; do command -v "$t" >/dev/null || { echo "missing in guest: $t" >&2; exit 1; }; done'
+
 echo "[e2e] agent first-run prompts are pre-accepted for the mounted directory only"
 cat > "$MANIFEST_PROJECT/.e2e-trust-check.py" <<'PY'
 import json
