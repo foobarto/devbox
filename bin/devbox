@@ -410,7 +410,12 @@ ensure_session_mount() { # $1 existing instance $2 exact host state directory
   fi
   log "Attaching persistent AI session state to $name"
   limactl edit "$name" --mount "$path:w" >/dev/null
-  [[ "$status" == Running ]] && limactl start "$name"
+  # `if`, not `[[ … ]] &&`: a trailing `&&` whose condition is false returns 1,
+  # and this helper is the final command of a `… || ensure_session_mount` list,
+  # so under `set -e` a stopped box gaining the mount would abort devbox before
+  # handover. `if/fi` returns 0 on the not-Running path and still surfaces a
+  # failed restart on the Running one.
+  if [[ "$status" == Running ]]; then limactl start "$name"; fi
 }
 
 remove_session_mount() { # $1 existing instance $2 exact host state directory
@@ -423,7 +428,20 @@ remove_session_mount() { # $1 existing instance $2 exact host state directory
   fi
   quoted="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$path")"
   limactl edit "$name" --set "del(.mounts[] | select(.location == $quoted))" >/dev/null
-  [[ "$status" == Running ]] && limactl start "$name"
+  # if/fi, not `&&`: see ensure_session_mount — a false trailing condition must
+  # not return 1 from the final command of a `set -e` || list.
+  if [[ "$status" == Running ]]; then limactl start "$name"; fi
+}
+
+require_project_writable() { # $1 instance $2 project dir
+  # A box is only usable if its project directory is actually mounted writable.
+  # This used to fail silently: a golden's inherited read-only ~ mount could
+  # shadow the project (which lives under ~), so the first write inside the box
+  # failed long after devbox had handed control over. Check the resolved mount
+  # state and refuse the box up front instead. Keyed on the positive result, so
+  # an unreadable mount list (empty output) also fails.
+  [[ "$(session_mount_enabled "$1" "$2")" == True ]] || die \
+    "project directory is not mounted writable in $1: $2 — the box is unusable; recreate it (destroy and rerun)"
 }
 
 require_ssh_agent() {
@@ -1419,6 +1437,21 @@ _lima_mount_arg() {
     *)    printf '%s'   "$(abspath "$spec")";;
   esac
 }
+# The clone's mount flags, one token per line. Every mount is `--mount-only`,
+# which OVERRIDES the source golden's mounts rather than adding to them: a golden
+# that still carries an inherited ~ mount (see the --mount-none note in
+# cmd_build) cannot leak it into the clone, and the box ends up with exactly the
+# mounts devbox asked for. Verified: cloning a golden that still has ~ with
+# --mount-only yields only the specified mounts. The project dir is always
+# writable; the session store is added unless the run is ephemeral; extra
+# --mount specs keep their requested mode.
+_clone_mount_args() { # $1 project dir  $2 session store ("" to skip)  $3.. extra specs
+  local dir="$1" session_state="$2"; shift 2
+  printf -- '--mount-only\n%s:w\n' "$dir"
+  [[ -n "$session_state" ]] && printf -- '--mount-only\n%s:w\n' "$session_state"
+  local m
+  for m in "$@"; do printf -- '--mount-only\n%s\n' "$(_lima_mount_arg "$m")"; done
+}
 # SRC[:DEST] split for --copy. No colon -> DEST is the basename (lands in $HOME).
 _copy_src()  { local s="$1"; if [[ "$s" == *:* ]]; then printf '%s' "${s%:*}"; else printf '%s' "$s"; fi; }
 _copy_dest() { local s="$1"; if [[ "$s" == *:* ]]; then printf '%s' "${s##*:}"; else basename -- "$s"; fi; }
@@ -2082,7 +2115,15 @@ cmd_build() {
     fi
   fi
   log "Building golden $golden from image '$image' — this takes several minutes…"
-  limactl start --timeout "$DEFAULT_BUILD_TIMEOUT" --name="$golden" "$gy"
+  # --mount-none is not cosmetic: the golden's yaml sets `mounts: []`, but Lima
+  # resolves an image template's `base:` chain at create time and an empty list
+  # reads as "unset" during that merge, so a template-based golden silently
+  # re-inherits template:_default's read-only ~ mount. That inherited mount then
+  # clones into every box and overlaps the writable project mount devbox adds.
+  # --mount-none is an edit-layer override applied after the merge, so the
+  # golden is stored with genuinely zero mounts. Verified: without it the stored
+  # config carries `~`; with it, none.
+  limactl start --timeout "$DEFAULT_BUILD_TIMEOUT" --name="$golden" --mount-none "$gy"
   # Provisioning that fails must not leave the instance behind: every later
   # `devbox` run treats an existing golden as a usable clone source, so a
   # retained half-provisioned one turns a build error the operator saw once into
@@ -2294,9 +2335,9 @@ cmd_run() {
       cmd_build "${build_args[@]}"
     fi
     ensure_golden_stopped "$golden"
-    local clone_args=(--mount "${dir}:w") m
-    [[ $ephemeral_sessions -eq 1 ]] || clone_args+=(--mount "${session_state}:w")
-    for m in "${extra_mounts[@]}"; do clone_args+=(--mount "$(_lima_mount_arg "$m")"); done
+    local clone_args=() sess=""
+    [[ $ephemeral_sessions -eq 1 ]] || sess="$session_state"
+    mapfile -t clone_args < <(_clone_mount_args "$dir" "$sess" "${extra_mounts[@]}")
     # CPU/memory are per-box: applied to the clone so a project can be sized
     # without rebuilding the shared golden.
     clone_args+=(--cpus "$cpus" --memory "$(size_to_gib "$memory")")
@@ -2322,6 +2363,10 @@ cmd_run() {
   fi
   [[ $ephemeral_sessions -eq 1 || $preexisting -eq 0 ]] || ensure_session_mount "$name" "$session_state"
   [[ $ssh_agent -eq 1 && $preexisting -eq 1 ]] && enable_ssh_agent "$name"
+  # Refuse a box whose project mount is missing or read-only before handing it
+  # over, rather than letting the session's first write fail. Covers both a
+  # fresh clone and a pre-existing box whose config predates the mount fix.
+  require_project_writable "$name" "$dir"
 
   _DB_NAME="$name"; _DB_DIR="$dir"; _DB_IMAGE="$image"; _DB_KEEP="$keep"
   _DB_SESSION_DIR=""; [[ $ephemeral_sessions -eq 1 ]] || _DB_SESSION_DIR="$session_state"

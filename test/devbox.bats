@@ -24,6 +24,42 @@ file_mode() { # $1 path
   stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null
 }
 
+# Resolve a golden the way Lima does at create/boot time: emit the yaml, then
+# merge its base-template chain with `tmpl copy --fill`. Assertions on the
+# RESOLVED config — the config Lima actually boots — catch fields the merge
+# silently rewrites, which grepping our own emitted text never can. The
+# canonical trap is mounts: an empty `mounts: []` reads as "unset" during the
+# merge and the golden re-inherits template:_default's ~ mount.
+#
+# Call require_resolver() DIRECTLY in the test body first: `skip` cannot fire
+# from inside the `$(resolved_golden …)` subshell, so the gate must run in the
+# test's own shell before the substitution.
+require_resolver() {
+  command -v limactl >/dev/null 2>&1 || skip "limactl required to resolve the template chain"
+  python3 -c 'import yaml' 2>/dev/null || skip "PyYAML required to read the resolved config"
+}
+resolved_golden() { # $1 image  $2.. optional emit args (cpus memory disk …)
+  local image="$1"; shift
+  local raw="$BATS_TEST_TMPDIR/golden-raw.yaml"
+  emit_golden_yaml "$image" "$raw" "$@"
+  limactl tmpl copy --fill "$raw" - 2>/dev/null
+}
+# Mount locations from a resolved config on stdin, one per line. Reads the
+# `mounts:` list structurally so it never picks up a stray `location:` under
+# `images:`.
+mount_locations() {
+  python3 -c 'import yaml,sys; print("\n".join(m.get("location","") for m in (yaml.safe_load(sys.stdin).get("mounts") or [])))'
+}
+# A dotted scalar (e.g. ssh.forwardAgent) from a resolved config on stdin.
+yaml_get() { # $1 dotted.path
+  python3 -c '
+import yaml, sys
+d = yaml.safe_load(sys.stdin)
+for k in sys.argv[1].split("."):
+    d = d.get(k) if isinstance(d, dict) else None
+print("" if d is None else d)' "$1"
+}
+
 # ------------------------------------------------------------------ _slug ----
 @test "_slug lowercases, replaces non-alnum, collapses and trims" {
   run _slug "Hello  World!!" 30
@@ -118,11 +154,65 @@ file_mode() { # $1 path
   [[ "$output" != *'.local/share/opencode/auth.json'* ]]
 }
 
-@test "new boxes mount persistent session state and kept boxes gain it once" {
+@test "a new box mounts the session store writable unless the run is ephemeral" {
+  # Behavioral: drive the real clone-mount assembly rather than grep for a line
+  # of source. Every mount is --mount-only (see _clone_mount_args), the project
+  # is always writable, and the session store rides along unless ephemeral.
+  local with_state without_state
+  with_state="$(_clone_mount_args /proj /state/sess | tr '\n' ' ')"
+  [[ "$with_state" == *'--mount-only /proj:w'* ]]
+  [[ "$with_state" == *'--mount-only /state/sess:w'* ]]
+  without_state="$(_clone_mount_args /proj '' | tr '\n' ' ')"
+  [[ "$without_state" == *'--mount-only /proj:w'* ]]
+  [[ "$without_state" != *sess* ]]
+}
+
+@test "a kept box gains the session store through an in-place limactl edit" {
+  # ensure_session_mount attaches the store to an existing box. Stub limactl,
+  # run the real helper, and assert the edit it issues. The box here is Stopped,
+  # which also guards the set -e trap this test surfaced: the helper is the
+  # final command of a `… || ensure_session_mount` list, so if it returned 1 on
+  # the not-Running path (a trailing `[[ … ]] &&` does), devbox would abort
+  # before handover. Asserting status 0 keeps that fixed.
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() {
+      case \"\$*\" in
+        *--json*)   printf '[]\n';;          # store not attached yet -> proceed
+        *--format*) printf 'Stopped\n';;     # not Running -> no stop/start dance
+        edit*)      printf 'EDIT: %s\n' \"\$*\" >&2;;  # helper sends edit stdout to /dev/null
+        *)          return 0;;
+      esac
+    }
+    ensure_session_mount box /state/sess
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"EDIT: edit box --mount /state/sess:w"* ]]
+}
+
+@test "clearing session persistence removes only the session mount" {
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() {
+      case \"\$*\" in
+        *--json*)   printf '[{\"config\":{\"mounts\":[{\"location\":\"/state/sess\",\"writable\":true}]}}]\n';;
+        *--format*) printf 'Stopped\n';;
+        edit*)      printf 'EDIT: %s\n' \"\$*\" >&2;;  # helper sends edit stdout to /dev/null
+        *)          return 0;;
+      esac
+    }
+    remove_session_mount box /state/sess
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"EDIT: edit box --set"* ]]
+  [[ "$output" == *'del(.mounts[]'* ]]
+  [[ "$output" == *'/state/sess'* ]]
+}
+
+@test "session-persistence wiring: reuse guard and the ephemeral opt-out exist" {
+  # Pure CLI/guard wiring with no behavior to exercise in isolation — a source
+  # check is the honest level here.
   source_text="$(<"$DEVBOX")"
-  [[ "$source_text" == *'clone_args+=(--mount "${session_state}:w")'* ]]
-  [[ "$source_text" == *'ensure_session_mount "$name" "$session_state"'* ]]
-  [[ "$source_text" == *'remove_session_mount "$name" "$session_state"'* ]]
   [[ "$source_text" == *'session_state_other_instance "$session_state" "$name"'* ]]
   [[ "$source_text" == *'--ephemeral-sessions|-e) ephemeral_sessions=1'* ]]
 }
@@ -156,24 +246,42 @@ file_mode() { # $1 path
 }
 
 # -------------------------------------------------------- emit_golden_yaml ----
-@test "golden yaml has no host mount and does not load host pubkeys" {
-  tmp="$BATS_TEST_TMPDIR/g.yaml"
-  emit_golden_yaml ubuntu-24.04 "$tmp"
-  grep -q '^mounts: \[\]' "$tmp"
-  grep -q 'loadDotSSHPubKeys: false' "$tmp"
+@test "Lima's merge re-adds a mount to a golden that declares mounts: [] (why --mount-none is needed)" {
+  require_resolver
+  # THE trap this suite exists for. We emit `mounts: []`, but Lima resolves the
+  # base-template chain at create time and an empty list reads as "unset", so
+  # the RESOLVED config comes back carrying template:_default's read-only ~
+  # mount — which then clones into every box and shadows the writable project
+  # mount that lives under it. The old `grep '^mounts: \[\]'` test could not see
+  # this because it only read the text we emit. This is why cmd_build creates
+  # the golden with --mount-none (an edit-layer override applied after the
+  # merge). If this list ever comes back empty, Lima's merge changed and the
+  # guard can be revisited.
+  local locations
+  locations="$(resolved_golden ubuntu-24.04 | mount_locations)"
+  [ -n "$locations" ]
 }
 
-@test "a golden leaves SSH-agent forwarding disabled until explicitly requested" {
-  tmp="$BATS_TEST_TMPDIR/g.yaml"
-  emit_golden_yaml ubuntu-24.04 "$tmp"
-  ! grep -q 'forwardAgent: true' "$tmp"
+@test "a resolved golden does not load host pubkeys" {
+  require_resolver
+  [ "$(resolved_golden ubuntu-24.04 | yaml_get ssh.loadDotSSHPubKeys)" = False ]
 }
 
-@test "a golden disables Lima's unused containerd bootstrap" {
-  tmp="$BATS_TEST_TMPDIR/g.yaml"
-  emit_golden_yaml ubuntu-24.04 "$tmp"
-  grep -A2 '^containerd:' "$tmp" | grep -q 'system: false'
-  grep -A2 '^containerd:' "$tmp" | grep -q 'user: false'
+@test "a resolved golden leaves SSH-agent forwarding disabled until explicitly requested" {
+  # Assert on the merged result, not our text: the base template enables
+  # forwarding, so this proves our override actually wins the merge.
+  require_resolver
+  local fwd
+  fwd="$(resolved_golden ubuntu-24.04 | yaml_get ssh.forwardAgent)"
+  [ "$fwd" = False ] || [ -z "$fwd" ]
+}
+
+@test "a resolved golden disables Lima's unused containerd bootstrap" {
+  require_resolver
+  local resolved
+  resolved="$(resolved_golden ubuntu-24.04)"
+  [ "$(printf '%s' "$resolved" | yaml_get containerd.system)" = False ]
+  [ "$(printf '%s' "$resolved" | yaml_get containerd.user)" = False ]
 }
 
 @test "a golden configures systemd-resolved to use Lima's host-aware DNS" {
@@ -278,6 +386,78 @@ file_mode() { # $1 path
 @test "mount arg: :ro is read-only (suffix stripped)" {
   run _lima_mount_arg /data:ro
   [ "$output" = "/data" ]
+}
+
+@test "every clone mount is --mount-only, so no golden mount can leak through" {
+  # --mount-only OVERRIDES the source golden's mounts; --mount would ADD to
+  # them, letting an inherited ~ mount survive into the clone. Assert the
+  # assembled flags: one --mount-only per mount, project writable, extra modes
+  # preserved, and never a bare --mount.
+  local args
+  args="$(_clone_mount_args /proj /state/sess /ro/extra /rw/extra:rw | tr '\n' ' ')"
+  [[ "$args" == *'--mount-only /proj:w'* ]]
+  [[ "$args" == *'--mount-only /state/sess:w'* ]]
+  [[ "$args" == *'--mount-only /ro/extra'* ]]      # bare == read-only
+  [[ "$args" == *'--mount-only /rw/extra:w'* ]]    # :rw -> lima :w
+  # exactly four mounts, and not one plain --mount
+  [ "$(printf '%s\n' "$args" | grep -o -- '--mount-only' | wc -l)" -eq 4 ]
+  [[ "$args" != *' --mount '* ]]
+}
+
+@test "cmd_build creates the golden with --mount-none to defeat the template ~ mount" {
+  # Behavioral: drive the real build with a stubbed limactl that records its
+  # argv, and assert the golden is started with --mount-none. Paired with the
+  # merge trap-guard test, this is the unit-level proof that devbox neutralizes
+  # the inherited mount; the booted proof lives in e2e.
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    export CONFIG_DIR='$BATS_TEST_TMPDIR/cfg'; mkdir -p \"\$CONFIG_DIR\"
+    STARTLOG='$BATS_TEST_TMPDIR/start.log'; : > \"\$STARTLOG\"
+    cd '$BATS_TEST_TMPDIR'   # no project manifest in scope
+    limactl() {
+      case \"\$*\" in
+        start*)     printf '%s\n' \"\$*\" >> \"\$STARTLOG\"; return 0;;
+        'list -q')  return 0;;                      # empty -> golden does not exist yet
+        *--format*) printf 'Stopped\n';;
+        *'for t in'*)     printf '  ok   brew   /home/linuxbrew/.linuxbrew/bin/brew\n';;
+        *known_hosts*)    printf 'github.com ssh-rsa A\ngithub.com ssh-ed25519 B\ngithub.com ecdsa-sha2-nistp256 C\n';;
+        *'pasta --help'*) printf -- '--splice-only\n';;
+        *) return 0;;
+      esac
+    }
+    cmd_build --image ubuntu-24.04 --yes >/dev/null 2>&1
+    cat \"\$STARTLOG\"
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == *start* ]]
+  [[ "$output" == *--mount-none* ]]
+}
+
+@test "require_project_writable refuses a box whose project mount is missing or read-only" {
+  # The guard reads the resolved mount state and refuses before handover, so a
+  # box that cannot write its project fails loudly instead of on first write.
+  # Accepts a writable project mount:
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() { printf '[{\"config\":{\"mounts\":[{\"location\":\"/proj\",\"writable\":true}]}}]\n'; }
+    require_project_writable box /proj
+  "
+  [ "$status" -eq 0 ]
+  # Refuses a read-only project mount:
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() { printf '[{\"config\":{\"mounts\":[{\"location\":\"/proj\",\"writable\":false}]}}]\n'; }
+    require_project_writable box /proj
+  "
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not mounted writable"* ]]
+  # Refuses when the project is not mounted at all (only ~ is):
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() { printf '[{\"config\":{\"mounts\":[{\"location\":\"/home/u\",\"writable\":false}]}}]\n'; }
+    require_project_writable box /proj
+  "
+  [ "$status" -ne 0 ]
 }
 
 @test "copy spec: no colon -> src as-is, dest is basename" {
@@ -615,12 +795,13 @@ file_mode() { # $1 path
 }
 
 # ------------------------------------------- golden yaml with customisation ----
-@test "golden yaml carries resolved resources" {
-  out="$BATS_TEST_TMPDIR/g.yaml"
-  emit_golden_yaml ubuntu-24.04 "$out" 8 "12GiB" "80GiB"
-  grep -q '^cpus: 8$' "$out"
-  grep -q '^memory: "12GiB"$' "$out"
-  grep -q '^disk: "80GiB"$' "$out"
+@test "a resolved golden carries the requested resources through the merge" {
+  require_resolver
+  local resolved
+  resolved="$(resolved_golden ubuntu-24.04 8 "12GiB" "80GiB")"
+  [ "$(printf '%s' "$resolved" | yaml_get cpus)" = 8 ]
+  [ "$(printf '%s' "$resolved" | yaml_get memory)" = 12GiB ]
+  [ "$(printf '%s' "$resolved" | yaml_get disk)" = 80GiB ]
 }
 
 @test "golden yaml embeds a digest when one is supplied" {

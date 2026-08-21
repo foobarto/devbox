@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- Stop goldens and boxes from mounting the host home directory. A golden's
+  `mounts: []` was silently overridden: Lima resolves an image template's
+  `base:` chain at create time and an empty list reads as "unset", so a
+  template-based golden re-inherited `template:_default`'s read-only `~` mount,
+  which then cloned into every box and shadowed the writable project mount that
+  lives under it. Goldens are now created with `--mount-none` and clones with
+  `--mount-only`, so a box has exactly the mounts devbox asked for — and a
+  clone drops an inherited `~` even from a golden built before this fix. Before
+  handover, devbox now refuses a box whose project directory is not mounted
+  writable instead of failing on the session's first write.
+- Fix a `set -e` abort when a stopped, kept box gained or lost persistent
+  session state: the mount helper's trailing `[[ … ]] && limactl start`
+  returned non-zero on the not-running path, and as the final command of a
+  `… || ensure_session_mount` list that aborted devbox before handover.
+- Tests now check effective, resolved behavior rather than generated config
+  text: the golden suite resolves Lima's template merge (`tmpl copy --fill`) and
+  asserts on the config Lima actually boots, the mount/clone/verify paths are
+  driven with a stubbed limactl and asserted on the commands issued, and the
+  e2e suite boots a box to prove the project mount is writable, the host home is
+  not mounted, and the toolchain resolves.
+
 ## v1.3.2 - 2026-08-21
 
 - Fetch the Homebrew installer resiliently while provisioning a golden: retry
