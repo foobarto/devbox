@@ -48,7 +48,7 @@ brew install foobarto/tap/devbox
 
 Installs `devbox` and `devbox-ai-proxy` on your `PATH`. The current stable
 GitHub release is
-[`v1.3.1`](https://github.com/foobarto/devbox/releases/tag/v1.3.1); source
+[`v1.4.0`](https://github.com/foobarto/devbox/releases/tag/v1.4.0); source
 archives are available from that release. Config lives under `~/.config/devbox/`
 (or `$XDG_CONFIG_HOME/devbox`).
 
@@ -398,11 +398,32 @@ silently applied. `cpus` and `memory` are applied per-box at clone time, so
 changing them never requires rebuilding the golden.
 
 The manifest can also declare `ssh_agent`, `keep`, `proxy`, `api_keys`,
-`with_creds`, `with_agent_config`, `mounts`, `copies`, and `no_auth`. Because a project manifest is
-repository-controlled input, Devbox prints every requested host-affecting
-capability and startup command, then requires an explicit `y` before creating
-or attaching to a box. Command-line flags remain explicit user choices and are
-not included in that confirmation. See the complete annotated template:
+`with_creds`, `with_agent_config`, `mounts`, `copies`, and `no_auth`. Because a
+project manifest is repository-controlled input, Devbox groups every declaration
+by type, gives each category a distinct icon, and prints multiline
+provisioning and startup scripts as readable blocks. Relative host paths in
+local images, `api_keys`, `mounts`, and copy sources resolve from the manifest's
+directory, so their meaning does not change with the shell's working directory.
+
+On the first use of a manifest, Devbox offers an optional AI summary and safety
+check. Codex is the default; the picker also supports Claude, Agy, Copilot,
+Cursor, OpenCode, and Pi, or the user can skip the AI review. The evaluator
+receives the manifest inline as untrusted data, runs non-interactively from an
+isolated empty working directory, and is told not to execute or follow anything
+in it. Devbox selects each CLI's native plan/read-only or no-tool controls;
+Codex additionally uses an ephemeral session with local configuration and
+exec-policy rules ignored. Selecting a reviewer sends the manifest contents to
+the service configured for that CLI; the selected host CLI must already be
+installed and authenticated. The AI review is advisory: Devbox still requires
+an explicit `y` before it uses the manifest.
+
+After approval, Devbox stores only the manifest path, its SHA-256 fingerprint,
+the selected reviewer, review outcome, and approval time under
+`${XDG_STATE_HOME:-~/.local/state}/devbox/manifest-approvals/`. Files are mode
+`0600` in a mode-`0700` directory; nothing is written to the project. The
+warning and prompts are skipped on later runs and return after any change to
+the manifest. Command-line flags remain explicit user choices and are not
+included in that confirmation. See the complete annotated template:
 [`examples/.devbox.toml`](examples/.devbox.toml).
 
 The old executable `.devbox` hook is no longer run; Devbox emits a migration
@@ -437,7 +458,9 @@ defaults** (4 CPUs, 6GiB, 100GiB).
 Persistent AI transcripts are state rather than configuration, so they live
 separately under `${XDG_STATE_HOME:-~/.local/state}/devbox/sessions/` (override
 with `$DEVBOX_SESSION_DIR`). `devbox sessions path DIR` resolves the exact
-per-project directory.
+per-project directory. Saved `.devbox.toml` approvals live beside that session
+root under `devbox/manifest-approvals/`; deleting the matching JSON record makes
+Devbox ask again on the next run.
 
 ## Tests
 

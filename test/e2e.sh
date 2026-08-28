@@ -78,6 +78,7 @@ if pid == 0:
 deadline = time.monotonic() + float(os.environ.get("DEVBOX_E2E_SESSION_TIMEOUT", "900"))
 transcript = bytearray()
 sent_approval = False
+sent_ai_choice = False
 sent_exit = False
 status = None
 while time.monotonic() < deadline:
@@ -90,7 +91,11 @@ while time.monotonic() < deadline:
         if data:
             transcript.extend(data)
     view = bytes(transcript)
-    if not sent_approval and b"Do you agree? [y/N]" in view:
+    if not sent_ai_choice and b"Reviewer [1]:" in view:
+        # This suite validates Devbox itself, not the external evaluator.
+        os.write(fd, b"n\n")
+        sent_ai_choice = True
+    if not sent_approval and b"Approve this .devbox.toml? [y/N]" in view:
         os.write(fd, b"y\n" if mode == "approve" else b"n\n")
         sent_approval = True
     if mode == "approve" and not sent_exit and b"Entering " in view:

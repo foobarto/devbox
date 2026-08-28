@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.4.0 - 2026-08-28
+
+- Make `.devbox.toml` consent easier to review with per-category Unicode icons
+  and readable multiline provisioning/startup command blocks.
+- Offer a default-Codex AI summary and safety check before the final human
+  approval, with read-only evaluator adapters for Claude, Agy, Copilot, Cursor,
+  OpenCode, and Pi plus an explicit skip option.
+- Cache explicit manifest approval in owner-only user state, skip repeat
+  warnings while its SHA-256 fingerprint is unchanged, and re-prompt after any
+  edit. Resolve relative host paths from the manifest directory so a cached
+  approval always refers to the same host paths.
+
 ## v1.3.3 - 2026-08-21
 
 - Create goldens with `--mount-none` and clones with `--mount-only`, so a box

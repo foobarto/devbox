@@ -685,6 +685,28 @@ print("" if d is None else d)' "$1"
   [[ "$output" == *'"with_agent_config": true'* ]]
 }
 
+@test "manifest host paths resolve relative to the manifest, not the invocation directory" {
+  project="$BATS_TEST_TMPDIR/project"
+  elsewhere="$BATS_TEST_TMPDIR/elsewhere"
+  mkdir -p "$project" "$elsewhere"
+  manifest="$project/.devbox.toml"
+  printf '%s\n' \
+    'api_keys = "./keys.env"' \
+    'mounts = ["./cache:rw"]' \
+    'copies = ["./tooling:~/tooling", "./script"]' \
+    '[image]' \
+    'location = "./base.yaml"' > "$manifest"
+
+  from_project="$(cd "$project" && project_manifest "$manifest")"
+  from_elsewhere="$(cd "$elsewhere" && project_manifest "$manifest")"
+
+  [ "$from_project" = "$from_elsewhere" ]
+  [ "$(manifest_value "$from_project" image)" = "$project/base.yaml" ]
+  [ "$(manifest_value "$from_project" api_keys)" = "$project/keys.env" ]
+  [ "$(manifest_json_value "$from_project" mounts)" = "[\"$project/cache:rw\"]" ]
+  [ "$(manifest_json_value "$from_project" copies)" = "[\"$project/tooling:~/tooling\", \"$project/script\"]" ]
+}
+
 @test "manifest package transport handles a single package" {
   run manifest_package_lines '["hello"]'
   [ "$status" -eq 0 ]
@@ -695,6 +717,235 @@ print("" if d is None else d)' "$1"
   run manifest_package_lines '["node", "go"]'
   [ "$status" -eq 0 ]
   [ "$output" = $'node\ngo' ]
+}
+
+@test "manifest approval is owner-only host state and content changes invalidate it" {
+  project="$BATS_TEST_TMPDIR/project"
+  mkdir -p "$project"
+  manifest="$project/.devbox.toml"
+  printf 'start = "true"\n' > "$manifest"
+  MANIFEST_APPROVAL_DIR="$BATS_TEST_TMPDIR/home-state/devbox/manifest-approvals"
+
+  first="$(manifest_fingerprint "$manifest")"
+  ! manifest_approval_matches "$manifest" "$first"
+  record_manifest_approval "$manifest" "$first" claude true
+  manifest_approval_matches "$manifest" "$first"
+
+  state="$(manifest_approval_path "$manifest")"
+  [ "$(file_mode "$MANIFEST_APPROVAL_DIR")" = "700" ]
+  [ "$(file_mode "$state")" = "600" ]
+  grep -q '"ai_reviewer": "claude"' "$state"
+  [ ! -e "$project/.devbox-approval" ]
+
+  printf 'start = "false"\n' > "$manifest"
+  second="$(manifest_fingerprint "$manifest")"
+  [ "$first" != "$second" ]
+  ! manifest_approval_matches "$manifest" "$second"
+}
+
+@test "manifest warning uses category icons and preserves multiline startup formatting" {
+  run render_manifest_warning /project/.devbox.toml \
+    "resources|CPUs: 8" \
+    "start|first command"$'\n'"second command" \
+    "mount-rw|Mount /host/cache at the same path inside the box" \
+    "credentials|Copy host AI credential files into the box"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"⚠️  PROJECT MANIFEST REVIEW"* ]]
+  [[ "$output" == *"💻"*"Host resources"* ]]
+  [[ "$output" == *"🚀"*"Startup command"* ]]
+  [[ "$output" == *"│ first command"* ]]
+  [[ "$output" == *"│ second command"* ]]
+  [[ "$output" == *"✍️"*"Read-write host mount"* ]]
+  [[ "$output" == *"🔐"*"Credentials"* ]]
+}
+
+@test "manifest review escapes terminal controls without changing the command data" {
+  dangerous=$'safe\033]2;forged title\a\342\200\256still data'
+
+  run render_manifest_warning $'/project/line\n.devbox.toml' "start|$dangerous"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" != *$'\033'* ]]
+  [[ "$output" != *$'\a'* ]]
+  [[ "$output" != *$'\342\200\256'* ]]
+  [[ "$output" == *'safe\u001b]2;forged title\u0007\u202estill data'* ]]
+  [[ "$output" == *'/project/line\n.devbox.toml'* ]]
+}
+
+@test "manifest review includes every declaration even when a CLI flag could override it" {
+  manifest="$(project_manifest "$BATS_TEST_DIRNAME/fixtures/project.devbox.toml")"
+  records=()
+  while IFS= read -r -d '' record; do records+=("$record"); done \
+    < <(manifest_request_records "$manifest")
+  rendered="$(printf '%s\n' "${records[@]}")"
+
+  [[ "$rendered" == *"image|Declared base image: debian-12"* ]]
+  [[ "$rendered" == *"packages|node"*"go"* ]]
+  [[ "$rendered" == *"start|npm ci"* ]]
+  [[ "$rendered" == *"ssh|Forward the host SSH agent"* ]]
+  [[ "$rendered" == *"proxy|Enable the host-side AI authentication proxy"* ]]
+  [[ "$rendered" == *"credentials|Copy host AI credential files"* ]]
+  [[ "$rendered" == *"agent-config|Copy allowlisted"* ]]
+  [[ "$rendered" == *"mount-ro|Mount /host/data"* ]]
+  [[ "$rendered" == *"copy|Copy /host/.netrc to ~/.netrc"* ]]
+}
+
+@test "startup command is printed as a readable block before execution" {
+  limactl() { printf '%s\n' "$*" > "$BATS_TEST_TMPDIR/limactl-args"; }
+
+  run run_project_start devbox-test /project $'first command\nsecond command'
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Running .devbox.toml startup command:"* ]]
+  [[ "$output" == *"🚀 │ first command"* ]]
+  [[ "$output" == *"🚀 │ second command"* ]]
+  grep -q -- 'shell --workdir /project devbox-test -- bash -lc' "$BATS_TEST_TMPDIR/limactl-args"
+}
+
+@test "Codex manifest evaluator is ephemeral read-only and ignores project configuration" {
+  codex() {
+    local argument output_file="" next_is_output=0
+    printf '%s\n' "$@" > "$BATS_TEST_TMPDIR/codex-args"
+    for argument in "$@"; do
+      if [[ $next_is_output -eq 1 ]]; then
+        output_file="$argument"
+        next_is_output=0
+      elif [[ "$argument" == "--output-last-message" ]]; then
+        next_is_output=1
+      fi
+    done
+    command cat > "$BATS_TEST_TMPDIR/codex-prompt"
+    printf 'Summary: evaluator test passed\n' > "$output_file"
+  }
+
+  run review_manifest_with_ai codex "$BATS_TEST_DIRNAME/fixtures/project.devbox.toml"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"CODEX SUMMARY AND SAFETY CHECK"* ]]
+  [[ "$output" == *"Summary: evaluator test passed"* ]]
+  grep -Fxq -- '--ask-for-approval' "$BATS_TEST_TMPDIR/codex-args"
+  grep -Fxq -- 'never' "$BATS_TEST_TMPDIR/codex-args"
+  grep -Fxq -- '--sandbox' "$BATS_TEST_TMPDIR/codex-args"
+  grep -Fxq -- 'read-only' "$BATS_TEST_TMPDIR/codex-args"
+  grep -Fxq -- '--ephemeral' "$BATS_TEST_TMPDIR/codex-args"
+  grep -Fxq -- '--ignore-user-config' "$BATS_TEST_TMPDIR/codex-args"
+  grep -Fxq -- '--ignore-rules' "$BATS_TEST_TMPDIR/codex-args"
+  grep -Fxq -- '--skip-git-repo-check' "$BATS_TEST_TMPDIR/codex-args"
+  grep -q -- 'Do not execute commands, use tools, inspect other files, make changes' \
+    "$BATS_TEST_TMPDIR/codex-prompt"
+  grep -q -- 'start = "npm ci"' "$BATS_TEST_TMPDIR/codex-prompt"
+}
+
+@test "manifest reviewer picker offers every supported CLI and accepts names" {
+  read_manifest_answer() { printf -v "$1" '%s' 'OpenCode'; }
+  pick_reviewer() {
+    local selected
+    choose_manifest_reviewer selected
+    printf 'selected=%s\n' "$selected"
+  }
+
+  run pick_reviewer
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'Codex (default)'* ]]
+  [[ "$output" == *'Claude'* ]]
+  [[ "$output" == *'Agy'* ]]
+  [[ "$output" == *'Copilot'* ]]
+  [[ "$output" == *'Cursor'* ]]
+  [[ "$output" == *'OpenCode'* ]]
+  [[ "$output" == *'Pi'* ]]
+  [[ "$output" == *'selected=opencode'* ]]
+}
+
+@test "alternate manifest evaluators use their read-only or no-tool controls" {
+  review_dir="$BATS_TEST_TMPDIR/review-dir"
+  output_file="$BATS_TEST_TMPDIR/review-output"
+  args_file="$BATS_TEST_TMPDIR/reviewer-args"
+  env_file="$BATS_TEST_TMPDIR/reviewer-env"
+  mkdir -p "$review_dir"
+  fake_reviewer() {
+    printf '%s\0' "$@" > "$args_file"
+    printf '%s' "${OPENCODE_CONFIG_CONTENT:-}" > "$env_file"
+    printf 'safe summary\n'
+  }
+  has_arg() {
+    python3 - "$args_file" "$1" <<'PY'
+import sys
+arguments = open(sys.argv[1], "rb").read().split(b"\0")
+raise SystemExit(0 if sys.argv[2].encode() in arguments else 1)
+PY
+  }
+  has_arg_after() {
+    python3 - "$args_file" "$1" "$2" <<'PY'
+import sys
+arguments = open(sys.argv[1], "rb").read().split(b"\0")
+expected = [sys.argv[2].encode(), sys.argv[3].encode()]
+raise SystemExit(0 if any(arguments[i:i + 2] == expected for i in range(len(arguments) - 1)) else 1)
+PY
+  }
+
+  run_manifest_reviewer claude fake_reviewer "$review_dir" "$output_file" 'manifest data'
+  has_arg '--permission-mode'; has_arg 'plan'; has_arg '--safe-mode'
+  has_arg_after '--tools' ''; has_arg '--no-session-persistence'; has_arg '--disable-slash-commands'
+
+  run_manifest_reviewer agy fake_reviewer "$review_dir" "$output_file" 'manifest data'
+  has_arg '--mode'; has_arg 'plan'; has_arg '--sandbox'; has_arg '--disable-slash-commands'
+
+  run_manifest_reviewer copilot fake_reviewer "$review_dir" "$output_file" 'manifest data'
+  has_arg '--plan'; has_arg '--available-tools='; has_arg '--disable-builtin-mcps'
+  has_arg '--no-custom-instructions'; has_arg '--no-remote-export'
+
+  run_manifest_reviewer cursor fake_reviewer "$review_dir" "$output_file" 'manifest data'
+  has_arg '--mode'; has_arg 'plan'; has_arg '--sandbox'; has_arg 'enabled'; has_arg '--workspace'
+
+  run_manifest_reviewer opencode fake_reviewer "$review_dir" "$output_file" 'manifest data'
+  has_arg '--pure'; has_arg '--agent'; has_arg 'plan'; has_arg '--dir'
+  grep -Fq '"permission":{"*":"deny"}' "$env_file"
+
+  run_manifest_reviewer pi fake_reviewer "$review_dir" "$output_file" 'manifest data'
+  has_arg '--no-session'; has_arg '--no-tools'; has_arg '--no-extensions'
+  has_arg '--no-skills'; has_arg '--no-context-files'
+  [ "$(<"$output_file")" = "safe summary" ]
+}
+
+@test "a matching saved manifest approval bypasses every prompt and review" {
+  manifest="$BATS_TEST_DIRNAME/fixtures/project.devbox.toml"
+  MANIFEST_APPROVAL_DIR="$BATS_TEST_TMPDIR/manifest-approvals"
+  fingerprint="$(manifest_fingerprint "$manifest")"
+  record_manifest_approval "$manifest" "$fingerprint" none false
+  render_manifest_warning() { return 99; }
+  read_manifest_answer() { return 99; }
+  review_manifest_with_ai() { return 99; }
+
+  run confirm_manifest_permissions "$manifest" "$fingerprint" "start|printf ready"
+
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "an empty reviewer answer selects Codex before explicit manifest approval" {
+  answers=("" "y")
+  answer_index=0
+  read_manifest_answer() {
+    printf -v "$1" '%s' "${answers[$answer_index]}"
+    answer_index=$((answer_index + 1))
+  }
+  render_manifest_warning() { :; }
+  review_manifest_with_ai() {
+    printf '%s\n' "$1" > "$BATS_TEST_TMPDIR/reviewer"
+    touch "$BATS_TEST_TMPDIR/review-ran"
+  }
+  require_manifest_unchanged() { :; }
+  record_manifest_approval() { printf '%s %s\n' "$3" "$4" > "$BATS_TEST_TMPDIR/review-state"; }
+  manifest_approval_matches() { return 1; }
+
+  run confirm_manifest_permissions /project/.devbox.toml fingerprint "start|true"
+
+  [ "$status" -eq 0 ]
+  [ -e "$BATS_TEST_TMPDIR/review-ran" ]
+  [ "$(<"$BATS_TEST_TMPDIR/reviewer")" = "codex" ]
+  [ "$(<"$BATS_TEST_TMPDIR/review-state")" = "codex true" ]
 }
 
 # --------------------------------------------------------------- resources ----

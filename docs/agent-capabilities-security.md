@@ -208,10 +208,23 @@ either.
 
 A project can request startup commands, mounts, copies, credentials, resource
 settings, and provisioning through `.devbox.toml`; Devbox presents those
-host-affecting requests for approval. Read that prompt and decline anything
-unexpected. The manifest cannot enable GUI forwarding, but background processes
-started in a GUI-enabled Devbox should still be treated as able to use the
-capabilities you selected.
+requests in a categorized, icon-labelled review before approval. It can also
+send the manifest to Codex, Claude, Agy, Copilot, Cursor, OpenCode, or Pi for an
+optional summary and safety check; Codex is the default choice. Each adapter is
+non-interactive, uses the CLI's native plan/read-only or no-tool controls, and
+is instructed to treat the manifest as untrusted data rather than executable
+instructions. It runs from an isolated empty working directory. Codex also uses
+an ephemeral session with local configuration and exec-policy rules ignored;
+other CLIs retain their normal provider-side and host-side session behavior.
+The manifest contents still leave the machine for the service configured for
+the selected CLI, and the result does not replace your own decision.
+
+An explicit approval is stored as owner-only user state and reused only while
+the manifest's exact SHA-256 fingerprint is unchanged. Devbox asks again after
+any edit, and rechecks the fingerprint before executing manifest packages or
+startup code. Read the prompt and decline anything unexpected. The manifest
+cannot enable GUI forwarding, but background processes started in a GUI-enabled
+Devbox should still be treated as able to use the capabilities you selected.
 
 ## Operational checklist
 
