@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `MacOS` Start the credential proxy on hosts without `setsid`, and add a GNU `timeout` alternative.
+- `MacOS` Keep session linking alive on a host mount that refuses `chmod` (macOS Lima), resulting in a whole box being taken down.
+- `MacOS` Brace the `$var…` log messages.
+- `MacOS` Read the host Claude login from the macOS login keychain.
+- `MacOS` gracefully handle lack of timeout in the system
+
 ## v1.4.0 - 2026-08-28
 
 - Make `.devbox.toml` consent easier to review with per-category Unicode icons

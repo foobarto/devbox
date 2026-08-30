@@ -113,6 +113,77 @@ class AutoAnthropicAuthTests(TestCase):
             self.assertEqual(data["claudeAiOauth"]["refreshToken"], "new-refresh")
             self.assertGreater(data["claudeAiOauth"]["expiresAt"], 0)
 
+    def test_claude_credentials_come_from_the_keychain_when_there_is_no_file(self):
+        # macOS Claude Code stores its login in the login keychain, so on a Mac
+        # the credentials file does not exist and the proxy had nothing to send.
+        keychain = {"claudeAiOauth": {
+            "accessToken": "keychain-access", "refreshToken": "r", "expiresAt": 1 << 62,
+        }}
+        with tempfile.TemporaryDirectory() as directory:
+            missing = str(Path(directory) / "credentials.json")
+            with patch.object(proxy, "CLAUDE_CREDENTIALS_PATH", missing), \
+                 patch.object(proxy.sys, "platform", "darwin"), \
+                 patch.object(proxy.subprocess, "run", return_value=Mock(
+                     returncode=0, stdout=json.dumps(keychain) + "\n")) as run:
+                self.assertEqual(
+                    proxy.resolve_claude_oauth(), ("keychain-access", "anthropic")
+                )
+            self.assertEqual(
+                run.call_args.args[0],
+                ["security", "find-generic-password", "-s",
+                 proxy.CLAUDE_KEYCHAIN_SERVICE, "-w"],
+            )
+
+    def test_a_credentials_file_still_wins_over_the_keychain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            credentials_path = Path(directory) / "credentials.json"
+            credentials_path.write_text(json.dumps({"claudeAiOauth": {
+                "accessToken": "file-access", "refreshToken": "r", "expiresAt": 1 << 62,
+            }}))
+            with patch.object(proxy, "CLAUDE_CREDENTIALS_PATH", str(credentials_path)), \
+                 patch.object(proxy.sys, "platform", "darwin"), \
+                 patch.object(proxy.subprocess, "run") as run:
+                self.assertEqual(
+                    proxy.resolve_claude_oauth(), ("file-access", "anthropic")
+                )
+            run.assert_not_called()
+
+    def test_a_refresh_read_from_the_keychain_is_written_back_to_it(self):
+        # Writing the file instead would shadow the keychain for the proxy while
+        # the host's own Claude Code kept reading the keychain, and the two would
+        # diverge on the next refresh.
+        keychain = {"claudeAiOauth": {
+            "accessToken": "old-access", "refreshToken": "old-refresh", "expiresAt": 0,
+        }}
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "credentials.json"
+            reads = Mock(returncode=0, stdout=json.dumps(keychain))
+            writes = Mock(returncode=0, stdout="", stderr="")
+            with patch.object(proxy, "CLAUDE_CREDENTIALS_PATH", str(missing)), \
+                 patch.object(proxy.sys, "platform", "darwin"), \
+                 patch.object(proxy, "refresh_token", return_value={
+                     "access_token": "new-access", "refresh_token": "new-refresh",
+                     "expires_in": 3600,
+                 }), \
+                 patch.object(proxy.subprocess, "run", side_effect=[reads, writes]) as run:
+                self.assertEqual(
+                    proxy.resolve_claude_oauth(), ("new-access", "anthropic")
+                )
+            self.assertFalse(missing.exists())
+            stored = run.call_args.args[0]
+            self.assertEqual(stored[:3], ["security", "add-generic-password", "-U"])
+            self.assertEqual(json.loads(stored[-1])["claudeAiOauth"]["accessToken"],
+                             "new-access")
+
+    def test_an_unusable_keychain_yields_no_credential_rather_than_a_crash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = str(Path(directory) / "credentials.json")
+            with patch.object(proxy, "CLAUDE_CREDENTIALS_PATH", missing), \
+                 patch.object(proxy.sys, "platform", "darwin"), \
+                 patch.object(proxy.subprocess, "run", return_value=Mock(
+                     returncode=44, stdout="")):
+                self.assertEqual(proxy.resolve_claude_oauth(), ("", ""))
+
     def test_codex_refresh_is_delegated_to_codex_managed_auth(self):
         with tempfile.TemporaryDirectory() as directory:
             credentials_path = Path(directory) / "auth.json"

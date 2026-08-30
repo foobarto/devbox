@@ -94,6 +94,10 @@ _AUDIT_LOCK = threading.Lock()
 CLAUDE_OAUTH_SOURCE = "token-file:~/.claude/.credentials.json#claudeAiOauth.accessToken"
 CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
 CLAUDE_CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
+# macOS Claude Code keeps this credential in the login keychain rather than in a
+# file, so on a Mac host the path above simply does not exist and the proxy had
+# no Anthropic credential to forward — every guest call came back 503.
+CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 # Claude Code's current public OAuth client identifier. This identifies the
 # CLI, not the user, and is the same value shipped by the official client.
 CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
@@ -417,6 +421,54 @@ def write_json_atomic(path: str, data: dict) -> None:
         raise
 
 
+def read_claude_credentials() -> dict:
+    """The host's Claude credential, from wherever Claude Code put it."""
+    credentials = read_json(CLAUDE_CREDENTIALS_PATH)
+    if credentials or sys.platform != "darwin":
+        return credentials
+    try:
+        found = subprocess.run(
+            ["security", "find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if found.returncode != 0:
+        return {}
+    try:
+        data = json.loads(found.stdout.strip())
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_claude_credentials(credentials: dict) -> None:
+    """Store a refreshed credential where this host's Claude Code will read it.
+
+    A file on the host takes precedence, so a Linux host is unchanged. On a Mac
+    without that file the update goes back to the keychain item: writing the file
+    instead would shadow the keychain for this proxy while the host's own Claude
+    Code kept using the keychain, and the two would diverge on the next refresh.
+    `-U` updates the existing item rather than replacing it, so its access
+    control survives; the secret is passed as an argument, which is visible to
+    this user's own `ps` for the moment the update runs.
+    """
+    if os.path.exists(CLAUDE_CREDENTIALS_PATH) or sys.platform != "darwin":
+        write_json_atomic(CLAUDE_CREDENTIALS_PATH, credentials)
+        return
+    account = os.environ.get("USER") or ""
+    command = ["security", "add-generic-password", "-U",
+               "-s", CLAUDE_KEYCHAIN_SERVICE, "-w", json.dumps(credentials)]
+    if account:
+        command[3:3] = ["-a", account]
+    stored = subprocess.run(command, capture_output=True, text=True, timeout=15)
+    if stored.returncode != 0:
+        raise RuntimeError(
+            "could not update keychain item %r: %s"
+            % (CLAUDE_KEYCHAIN_SERVICE, stored.stderr.strip() or stored.returncode)
+        )
+
+
 def jwt_payload(token: str) -> dict:
     """Decode only the unsigned payload needed to find a JWT expiry/client ID."""
     try:
@@ -582,7 +634,7 @@ def request_codex_managed_refresh() -> None:
 
 def resolve_claude_oauth(force_refresh: bool = False) -> tuple[str, str]:
     with _REFRESH_LOCKS["anthropic"]:
-        credentials = read_json(CLAUDE_CREDENTIALS_PATH)
+        credentials = read_claude_credentials()
         oauth = credentials.get("claudeAiOauth")
         if not isinstance(oauth, dict):
             return "", ""
@@ -599,7 +651,7 @@ def resolve_claude_oauth(force_refresh: bool = False) -> tuple[str, str]:
                 if isinstance(refreshed.get("expires_in"), (int, float)):
                     oauth["expiresAt"] = int((time.time() + refreshed["expires_in"]) * 1000)
                 credentials["claudeAiOauth"] = oauth
-                write_json_atomic(CLAUDE_CREDENTIALS_PATH, credentials)
+                write_claude_credentials(credentials)
             except Exception as exc:
                 sys.stderr.write(f"[devbox-ai-proxy] Claude OAuth refresh failed: {exc}\n")
                 return "", ""
