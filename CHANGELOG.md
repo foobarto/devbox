@@ -2,10 +2,10 @@
 
 ## Unreleased
 
-- `MacOS` Start the credential proxy on hosts without `setsid`, and add a GNU `timeout` alternative.
+- `MacOS` Start the credential proxy on hosts without `setsid`, and allow pass when GNU `timeout` is not available.
 - `MacOS` Keep session linking alive on a host mount that refuses `chmod` (macOS Lima), resulting in a whole box being taken down.
 - `MacOS` Brace the `$var…` log messages.
-- `MacOS` Read the host Claude login from the macOS login keychain.
+- `MacOS` Read the host Claude login from the macOS login keychain, allow credentials to be written back regardless of their source.
 - `MacOS` gracefully handle lack of timeout in the system
 
 ## v1.4.0 - 2026-08-28

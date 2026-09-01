@@ -368,7 +368,7 @@ instance_exists() { limactl list -q 2>/dev/null | grep -qx "$1"; }
 instance_status() { limactl list "$1" --format '{{.Status}}' 2>/dev/null || echo Unknown; }
 ensure_golden_stopped() {
   [[ "$(instance_status "$1")" == "Running" ]] || return 0
-  log "Stopping golden $1 before clone"; limactl stop "$1"
+  log "Stopping golden ${1} before clone"; limactl stop "$1"
 }
 
 session_mount_enabled() { # $1 instance $2 exact host state directory
@@ -406,10 +406,10 @@ ensure_session_mount() { # $1 existing instance $2 exact host state directory
   [[ "$(session_mount_enabled "$name" "$path")" == True ]] && return 0
   status="$(instance_status "$name")"
   if [[ "$status" == Running ]]; then
-    log "Restarting $name once to attach persistent AI session state"
+    log "Restarting ${name} once to attach persistent AI session state"
     limactl stop "$name"
   fi
-  log "Attaching persistent AI session state to $name"
+  log "Attaching persistent AI session state to ${name}"
   limactl edit "$name" --mount "$path:w" >/dev/null
   # `if`, not `[[ … ]] &&`: a trailing `&&` whose condition is false returns 1,
   # and this helper is the final command of a `… || ensure_session_mount` list,
@@ -467,7 +467,7 @@ enable_ssh_agent() { # $1 instance; restart only when its persisted config chang
 
   status="$(instance_status "$name")"
   if [[ "$status" == "Running" ]]; then
-    log "Restarting $name to enable host SSH-agent forwarding"
+    log "Restarting ${name} to enable host SSH-agent forwarding"
     limactl stop "$name"
   fi
   log "Enabling host SSH-agent forwarding"
@@ -776,7 +776,7 @@ YAML
 apply_golden_provisioning() { # $1 golden $2 system script $3 user script
   local golden="$1" system="${2:-}" user="${3:-}"
   if [[ -n "$system" ]]; then
-    log "Applying project system provisioning to $golden (this can take a while)…"
+    log "Applying project system provisioning to ${golden} (this can take a while)…"
     printf '%s\n' "$system" \
       | limactl shell "$golden" -- sudo DEBIAN_FRONTEND=noninteractive bash -e -s \
       || { warn "project system provisioning failed"; return 1; }
@@ -1086,7 +1086,7 @@ proxy_ensure() {
   port="$(proxy_port "$url")"
   if proxy_health "$port"; then
     if proxy_self_renewal_health "$port"; then
-      log "credential proxy already running on 127.0.0.1:$port"
+      log "credential proxy already running on 127.0.0.1:${port}"
       return 0
     fi
     log "Restarting host credential proxy once to enable persistent GitHub capability renewal"
@@ -1102,17 +1102,17 @@ proxy_ensure() {
   mkdir -p "$CONFIG_DIR"; logf="$CONFIG_DIR/proxy.log"
   [[ -f "$CONFIG_DIR/api-keys.env" || -f "$CONFIG_DIR/proxy.config.json" ]] || host_claude_login \
     || warn "no Anthropic key or host Claude login found — configure ~/.config/devbox/api-keys.env or run 'claude login'"
-  log "Starting credential proxy on :$port  ($launcher)"
+  log "Starting credential proxy on :${port}  (${launcher})"
   spawn_detached "$logf" "$launcher"
   echo $! > "$CONFIG_DIR/proxy.pid"
   for i in $(seq 1 20); do proxy_health "$port" && break; sleep 0.2; done
-  if proxy_health "$port"; then log "credential proxy up (pid $(cat "$CONFIG_DIR/proxy.pid" 2>/dev/null), log: $logf)"
+  if proxy_health "$port"; then log "credential proxy up (pid $(cat "$CONFIG_DIR/proxy.pid" 2>/dev/null), log: ${logf})"
   else warn "proxy did not come up — see $logf"; return 1; fi
 }
 
 apply_proxy() {
   local name="$1" url="$2" tmpl="$CONFIG_DIR/proxy-env" launcher gh_wrapper ca_path
-  log "Wiring AI and GitHub CLIs → proxy $url"
+  log "Wiring AI and GitHub CLIs → proxy ${url}"
   if [[ -f "$tmpl" ]]; then
     sed "s|__PROXY_URL__|$url|g" "$tmpl" \
       | limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-10-proxy.sh >/dev/null'
@@ -1209,13 +1209,13 @@ EOF
 apply_api_keys() {
   local name="$1" file="$2"
   [[ -f "$file" ]] || { warn "api-keys file not found: $file (skipping)"; return 0; }
-  log "Injecting API keys from $file"
+  log "Injecting API keys from ${file}"
   limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-20-keys.sh >/dev/null' < "$file"
 }
 
 clear_auth() {
   local name="$1"
-  log "Disabling devbox-managed auth in $name"
+  log "Disabling devbox-managed auth in ${name}"
   clear_gh_proxy_endpoint "$name"
   # Restore Homebrew's public gh link only when it still points at our wrapper.
   # shellcheck disable=SC2016 # All variables expand in the guest.
@@ -1318,7 +1318,7 @@ EOF
 
 clear_connect_traffic_audit() { # $1 Lima instance
   local name="$1"
-  log "Removing proxy-or-fail traffic audit from $name"
+  log "Removing proxy-or-fail traffic audit from ${name}"
   clear_traffic_proxy_endpoint "$name"
   limactl shell "$name" -- bash -c \
     'sudo rm -f /etc/profile.d/zz-devbox-30-traffic-audit.sh; command -v nft >/dev/null 2>&1 && sudo nft delete table inet devbox_traffic_audit 2>/dev/null || true'
@@ -1336,7 +1336,7 @@ apply_connect_traffic_audit() { # $1 Lima instance $2 bare host proxy URL
   parts="$(traffic_proxy_endpoint_parts "$url")" || die "could not parse traffic proxy URL"
   IFS=$'\t' read -r proxy_host proxy_port <<< "$parts"
 
-  log "Enabling proxy-or-fail web traffic audit in $name"
+  log "Enabling proxy-or-fail web traffic audit in ${name}"
   ensure_guest_nftables "$name" || die "could not install nftables in $name"
   apply_connect_traffic_firewall "$name" "$proxy_host" "$proxy_port" || \
     die "could not block direct web egress in $name"
@@ -1428,7 +1428,7 @@ run_gui_remote() { # $1 Lima instance $2 remote bash command $3 shell|app
   require_host_gui
   ensure_guest_waypipe "$name" || die "could not install waypipe in $name"
   ssh_config="$(lima_ssh_config "$name")"
-  log "Opening $kind from $name on the host Wayland session"
+  log "Opening ${kind} from ${name} on the host Wayland session"
   # QEMU guests do not have host DRM/render-node passthrough. Blocking DMABUF
   # protocols makes Waypipe use its safe, software-backed transport instead.
   waypipe --no-gpu --title-prefix 'Devbox: ' ssh -F "$ssh_config" "lima-$name" \
@@ -1451,7 +1451,7 @@ run_gui_shell() { # $1 Lima instance $2 guest workdir
   ssh_config="$(lima_ssh_config "$name")"
   remote_command="$(gui_remote_shell "$directory")" || \
     die "could not prepare the guest GUI shell"
-  log "Opening GUI-ready shell from $name on the host Wayland session"
+  log "Opening GUI-ready shell from ${name} on the host Wayland session"
   # A pseudo-terminal makes the replacement login shell interactive while its
   # inherited Waypipe display lets every GUI app it launches reach the host.
   waypipe --no-gpu --title-prefix 'Devbox: ' ssh -F "$ssh_config" -tt "lima-$name" \
@@ -1492,7 +1492,7 @@ apply_copy() {
   [[ -e "$src" ]] || { warn "--copy source not found: $src"; return 0; }
   src="$(abspath "$src")"; parent="$(dirname "$dest")"
   [[ -d "$src" ]] && rflag=(-r)   # -r only for dirs; on a file it makes dest a dir
-  log "Copying $src → $name:$dest"
+  log "Copying ${src} → ${name}:${dest}"
   if [[ "$dest" == /* ]]; then
     limactl shell "$name" -- bash -c "sudo install -d -o \"\$(id -un)\" -g \"\$(id -gn)\" '$parent'" </dev/null 2>/dev/null || true
   else
@@ -1503,7 +1503,7 @@ apply_copy() {
 
 apply_creds() {
   local name="$1" p rel copied=0 rflag=()
-  log "Copying host AI credentials into $name (best-effort)…"
+  log "Copying host AI credentials into ${name} (best-effort)…"
   for p in "${CRED_PATHS[@]}"; do
     [[ -e "$p" ]] || continue
     case "$p" in "$HOME/"*) rel="${p#"$HOME"/}";; *) continue;; esac
@@ -1514,7 +1514,7 @@ apply_creds() {
     [[ -d "$p" ]] && rflag=(-r)
     if limactl copy "${rflag[@]}" "$p" "$name:$rel" 2>/dev/null; then copied=$((copied+1)); else warn "could not copy $p"; fi
   done
-  log "Copied $copied credential path(s)."
+  log "Copied ${copied} credential path(s)."
 }
 
 agent_config_files() { # paths -> NUL-delimited regular files
@@ -1564,12 +1564,12 @@ apply_agent_config() {
       warn "could not copy agent config: $rel"
     fi
   done < <(agent_config_files "${AGENT_CONFIG_PATHS[@]}")
-  log "Copied $copied non-secret agent config file(s); skipped $skipped possible credential(s)."
+  log "Copied ${copied} non-secret agent config file(s); skipped ${skipped} possible credential(s)."
 }
 
 apply_session_persistence() { # $1 instance $2 mounted per-project host directory
   local name="$1" state="$2"
-  log "Linking resumable AI sessions to host state: $state"
+  log "Linking resumable AI sessions to host state: ${state}"
 
   # OpenCode keeps current session records in one SQLite database. Point only
   # that database at persistent state; auth.json and the rest of its data home
@@ -1713,7 +1713,7 @@ GUEST
 
 disable_session_persistence() { # $1 instance $2 state path previously used by this project
   local name="$1" state="$2"
-  log "Using ephemeral AI sessions in $name"
+  log "Using ephemeral AI sessions in ${name}"
   limactl shell "$name" -- bash -s -- "$state" <<'GUEST'
 set -euo pipefail
 state="$1"
@@ -1884,7 +1884,7 @@ guest_login_value() { # $1 Lima instance $2 shell expression
 seed_agent_trust() { # $1 Lima instance $2 mounted project dir
   local name="$1" dir="$2" api_key openai_key codex_home quoted_home
   local claude_config quoted_config
-  log "Pre-accepting agent first-run prompts for $dir"
+  log "Pre-accepting agent first-run prompts for ${dir}"
 
   # Read what the guest login shell actually resolves rather than assuming the
   # default profile: --api-keys and a custom proxy-env template both land here.
@@ -2518,7 +2518,7 @@ review_manifest_with_ai() { # $1 reviewer ID $2 .devbox.toml
 apply_project_packages() { # $1 box name $2 normalized packages JSON
   local name="$1" packages="$2"
   [[ "$packages" != "[]" ]] || return 0
-  log "Installing project packages from $PROJECT_MANIFEST_NAME"
+  log "Installing project packages from ${PROJECT_MANIFEST_NAME}"
   # shellcheck disable=SC2016 # the guest shell consumes package names on stdin.
   manifest_package_lines "$packages" | limactl shell "$name" -- bash -lc '
     while IFS= read -r package; do
@@ -2531,7 +2531,7 @@ run_project_start() { # $1 box name $2 workdir $3 command
   local name="$1" dir="$2" command="$3"
   [[ -n "$command" ]] || return 0
   local line
-  log "Running $PROJECT_MANIFEST_NAME startup command:"
+  log "Running ${PROJECT_MANIFEST_NAME} startup command:"
   while IFS= read -r line || [[ -n "$line" ]]; do
     printf '  🚀 │ %s\n' "$line" >&2
   done < <(terminal_safe_text <<< "$command")
@@ -2637,11 +2637,11 @@ cmd_build() {
       log "Rebuilding golden ${golden}…"
       limactl stop -f "$golden" 2>/dev/null || true; limactl delete -f "$golden"
     else
-      log "Golden $golden already exists (use 'devbox build --image $image --force' to rebuild)."
+      log "Golden ${golden} already exists (use 'devbox build --image ${image} --force' to rebuild)."
       return 0
     fi
   fi
-  log "Building golden $golden from image '$image' — this takes several minutes…"
+  log "Building golden ${golden} from image '${image}' — this takes several minutes…"
   # --mount-none is not cosmetic: the golden's yaml sets `mounts: []`, but Lima
   # resolves an image template's `base:` chain at create time and an empty list
   # reads as "unset" during that merge, so a template-based golden silently
@@ -2663,7 +2663,7 @@ cmd_build() {
     limactl delete -f "$golden" 2>/dev/null || true
     die "project provisioning failed"
   fi
-  log "Verifying toolchain in $golden:"
+  log "Verifying toolchain in ${golden}:"
   if ! verify_golden "$golden"; then
     warn "Golden verification failed; removing unusable $golden."
     limactl stop -f "$golden" 2>/dev/null || true
@@ -2672,7 +2672,7 @@ cmd_build() {
   fi
   log "Stopping golden (retained as clone source)."
   limactl stop "$golden"
-  log "Golden ready: $golden"
+  log "Golden ready: ${golden}"
 }
 
 # Teardown runs from an EXIT/INT/TERM trap, which fires after cmd_run has
@@ -2848,11 +2848,11 @@ cmd_run() {
   local preexisting=0
   if instance_exists "$name"; then
     preexisting=1
-    log "Attaching to existing box for this path: $name"
+    log "Attaching to existing box for this path: ${name}"
     [[ ${#extra_mounts[@]} -gt 0 ]] && warn "--mount only applies at box creation; destroy+recreate to change mounts (--copy still works)"
   else
     if ! instance_exists "$golden"; then
-      log "No golden for image '$image' yet — building it first."
+      log "No golden for image '${image}' yet — building it first."
       local build_args=(--image "$image" --cpus "$cpus" --memory "$memory" --disk "$disk")
       [[ -f "$manifest_path" ]] && build_args+=(--manifest "$manifest_path")
       cmd_build "${build_args[@]}"
@@ -2881,7 +2881,7 @@ cmd_run() {
     # the very first boot already has the agent socket. Existing VMs still use
     # enable_ssh_agent below and restart only if their persisted config changes.
     [[ $ssh_agent -eq 1 ]] && clone_args+=(--set '.ssh.forwardAgent = true')
-    log "Cloning $golden → $name (mount: $dir${extra_mounts:+, +${#extra_mounts[@]} extra mount(s)})"
+    log "Cloning ${golden} → ${name} (mount: $dir${extra_mounts:+, +${#extra_mounts[@]} extra mount(s)})"
     limactl --tty=false clone "$golden" "$name" "${clone_args[@]}"
   fi
   [[ $ephemeral_sessions -eq 1 || $preexisting -eq 0 ]] || ensure_session_mount "$name" "$session_state"
@@ -2907,7 +2907,7 @@ cmd_run() {
     managed_proxy="$proxy"
     if [[ -z "$managed_proxy" && $preexisting -eq 1 ]]; then
       managed_proxy="$(stored_gh_proxy_endpoint "$name" || true)"
-      [[ -z "$managed_proxy" ]] || log "Refreshing remembered GitHub CLI proxy for $name"
+      [[ -z "$managed_proxy" ]] || log "Refreshing remembered GitHub CLI proxy for ${name}"
     fi
     [[ -z "$managed_proxy" ]] || {
       proxy_ensure "$managed_proxy"
@@ -2922,7 +2922,7 @@ cmd_run() {
     traffic_proxy_endpoint="$(stored_traffic_proxy_endpoint "$name" || true)"
     if [[ -n "$traffic_proxy_endpoint" ]]; then
       managed_traffic_audit=connect
-      log "Refreshing remembered proxy-or-fail traffic audit for $name"
+      log "Refreshing remembered proxy-or-fail traffic audit for ${name}"
     fi
   fi
   case "$managed_traffic_audit" in
@@ -2969,7 +2969,7 @@ cmd_run() {
 
   local fate="destroy it"
   [[ $keep -eq 1 ]] && fate="leave it running"
-  log "Entering $name — exit the shell to $fate."
+  log "Entering ${name} — exit the shell to ${fate}."
   limactl shell --workdir "$dir" "$name" || true
 }
 
@@ -2990,12 +2990,12 @@ cmd_proxy() {
              "$launcher" --refresh-gh-proxy-boxes;;
     status) if proxy_health "$port"; then
               if proxy_self_renewal_health "$port"; then
-                log "AI proxy: RUNNING on 127.0.0.1:$port (GitHub capability self-renewal enabled)"
+                log "AI proxy: RUNNING on 127.0.0.1:${port} (GitHub capability self-renewal enabled)"
               else
-                warn "AI proxy: RUNNING on 127.0.0.1:$port (restart required for GitHub capability self-renewal)"
+                warn "AI proxy: RUNNING on 127.0.0.1:${port} (restart required for GitHub capability self-renewal)"
               fi
-            elif proxy_port_open "$port"; then warn "port $port held by another (non-devbox) service"
-            else log "AI proxy: not running (port $port)"; fi;;
+            elif proxy_port_open "$port"; then warn "port ${port} held by another (non-devbox) service"
+            else log "AI proxy: not running (port ${port})"; fi;;
     audit) shift
            audit_sub="${1:-show}"
            launcher="$(proxy_launcher)" || die "proxy launcher not found"
@@ -3063,7 +3063,7 @@ cmd_sessions() {
     path) printf '%s\n' "$state";;
     clear)
       if [[ ! -e "$state" && ! -L "$state" ]]; then
-        log "no persistent AI sessions for $dir"
+        log "no persistent AI sessions for ${dir}"
         return 0
       fi
       [[ -d "$state" && ! -L "$state" ]] || die "refusing unexpected session path: $state"
@@ -3081,7 +3081,7 @@ cmd_sessions() {
         [[ "$answer" == y || "$answer" == Y ]] || { log "cancelled."; return 0; }
       fi
       rm -rf -- "$state"
-      log "deleted persistent AI sessions for $dir"
+      log "deleted persistent AI sessions for ${dir}"
       ;;
     *) die "usage: devbox sessions [path|clear [--yes]] [DIR]";;
   esac
@@ -3098,7 +3098,7 @@ cmd_destroy() {
   [[ -n "$list" ]] || { log "nothing to destroy."; return 0; }
   while IFS= read -r i; do
     [[ -n "$i" ]] || continue
-    log "destroying $i"
+    log "destroying ${i}"
     limactl stop -f "$i" 2>/dev/null || true
     limactl delete -f "$i"
     clear_gh_proxy_endpoint "$i"
