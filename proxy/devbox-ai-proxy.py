@@ -421,39 +421,45 @@ def write_json_atomic(path: str, data: dict) -> None:
         raise
 
 
-def read_claude_credentials() -> dict:
-    """The host's Claude credential, from wherever Claude Code put it."""
+def read_claude_credentials() -> tuple[dict, bool]:
+    """The host's Claude credential, and whether the file — not the keychain — held it.
+
+    The caller must hand that flag back to write_claude_credentials so a refresh
+    returns to the store it came from. Deciding the write separately, on whether
+    the file merely exists, sends the refresh to an empty or corrupt file while
+    the host's own Claude Code keeps reading the keychain the value came from.
+    """
     credentials = read_json(CLAUDE_CREDENTIALS_PATH)
     if credentials or sys.platform != "darwin":
-        return credentials
+        return credentials, True
     try:
         found = subprocess.run(
             ["security", "find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"],
             capture_output=True, text=True, timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
-        return {}
+        return {}, False
     if found.returncode != 0:
-        return {}
+        return {}, False
     try:
         data = json.loads(found.stdout.strip())
     except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
+        return {}, False
+    return (data if isinstance(data, dict) else {}), False
 
 
-def write_claude_credentials(credentials: dict) -> None:
-    """Store a refreshed credential where this host's Claude Code will read it.
+def write_claude_credentials(credentials: dict, to_file: bool) -> None:
+    """Store a refreshed credential back in the store read_claude_credentials used.
 
     A file on the host takes precedence, so a Linux host is unchanged. On a Mac
-    without that file the update goes back to the keychain item: writing the file
-    instead would shadow the keychain for this proxy while the host's own Claude
-    Code kept using the keychain, and the two would diverge on the next refresh.
-    `-U` updates the existing item rather than replacing it, so its access
-    control survives; the secret is passed as an argument, which is visible to
-    this user's own `ps` for the moment the update runs.
+    without a usable file the update goes back to the keychain item: writing the
+    file instead would shadow the keychain for this proxy while the host's own
+    Claude Code kept using the keychain, and the two would diverge on the next
+    refresh. `-U` updates the existing item rather than replacing it, so its
+    access control survives; the secret is passed as an argument, which is
+    visible to this user's own `ps` for the moment the update runs.
     """
-    if os.path.exists(CLAUDE_CREDENTIALS_PATH) or sys.platform != "darwin":
+    if to_file:
         write_json_atomic(CLAUDE_CREDENTIALS_PATH, credentials)
         return
     account = os.environ.get("USER") or ""
@@ -634,7 +640,7 @@ def request_codex_managed_refresh() -> None:
 
 def resolve_claude_oauth(force_refresh: bool = False) -> tuple[str, str]:
     with _REFRESH_LOCKS["anthropic"]:
-        credentials = read_claude_credentials()
+        credentials, credentials_in_file = read_claude_credentials()
         oauth = credentials.get("claudeAiOauth")
         if not isinstance(oauth, dict):
             return "", ""
@@ -651,7 +657,7 @@ def resolve_claude_oauth(force_refresh: bool = False) -> tuple[str, str]:
                 if isinstance(refreshed.get("expires_in"), (int, float)):
                     oauth["expiresAt"] = int((time.time() + refreshed["expires_in"]) * 1000)
                 credentials["claudeAiOauth"] = oauth
-                write_claude_credentials(credentials)
+                write_claude_credentials(credentials, credentials_in_file)
             except Exception as exc:
                 sys.stderr.write(f"[devbox-ai-proxy] Claude OAuth refresh failed: {exc}\n")
                 return "", ""

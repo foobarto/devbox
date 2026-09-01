@@ -1014,8 +1014,12 @@ proxy_self_renewal_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbo
 # is anything at all listening on the port?
 # BSD hosts ship no `timeout`, and a missing one made this always false: the
 # port-conflict warning below never fired. A loopback connect either completes or is refused at once — so
-# `env`, a transparent prefix, stands in where `timeout` is absent.
-if command -v timeout >/dev/null 2>&1; then _PORT_PROBE=(timeout 1); else _PORT_PROBE=(env); fi
+# `env`, a transparent prefix, stands in where `timeout` is absent. A function,
+# not a bare `if`, so the choice itself is reachable from a test on either host.
+select_port_probe() {
+  if command -v timeout >/dev/null 2>&1; then _PORT_PROBE=(timeout 1); else _PORT_PROBE=(env); fi
+}
+select_port_probe
 proxy_port_open() { "${_PORT_PROBE[@]}" bash -c ">/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
 # locate a proxy asset across source (../proxy) and brew (../libexec/proxy)
 # layouts. This keeps the guest-side gh wrapper versioned with the host proxy.
@@ -1065,6 +1069,17 @@ except OSError:
     pass  # already a session leader; the redirects still detach us
 os.execvp(sys.argv[1], sys.argv[1:])' "$@" >"$logf" 2>&1 </dev/null &
 }
+
+# macOS Claude Code stores its login in the login keychain, not in
+# ~/.claude/.credentials.json, so check there too before claiming there is no
+# credential to forward. Top level, not nested in proxy_ensure, so a test can
+# reach it without starting a proxy.
+host_claude_login() {
+  [[ -f "$HOME/.claude/.credentials.json" ]] && return 0
+  [[ "$(uname -s)" == Darwin ]] || return 1
+  security find-generic-password -s 'Claude Code-credentials' >/dev/null 2>&1
+}
+
 # start the host proxy if it isn't already up (idempotent). Shared across boxes.
 proxy_ensure() {
   local url="$1" port launcher logf i
@@ -1085,14 +1100,6 @@ proxy_ensure() {
   fi
   launcher="$(proxy_launcher)" || { warn "proxy launcher not found — start it manually (devbox-ai-proxy)"; return 0; }
   mkdir -p "$CONFIG_DIR"; logf="$CONFIG_DIR/proxy.log"
-  # macOS Claude Code stores its login in the login keychain, not in
-  # ~/.claude/.credentials.json, so check there too before claiming there is no
-  # credential to forward.
-  host_claude_login() {
-    [[ -f "$HOME/.claude/.credentials.json" ]] && return 0
-    [[ "$(uname -s)" == Darwin ]] || return 1
-    security find-generic-password -s 'Claude Code-credentials' >/dev/null 2>&1
-  }
   [[ -f "$CONFIG_DIR/api-keys.env" || -f "$CONFIG_DIR/proxy.config.json" ]] || host_claude_login \
     || warn "no Anthropic key or host Claude login found — configure ~/.config/devbox/api-keys.env or run 'claude login'"
   log "Starting credential proxy on :$port  ($launcher)"
@@ -1541,7 +1548,7 @@ agent_config_contains_credential() { # $1 config file; never prints its content
 
 apply_agent_config() {
   local name="$1" file rel parent copied=0 skipped=0
-  log "Copying non-secret host AI agent configuration into $name…"
+  log "Copying non-secret host AI agent configuration into ${name}…"
   while IFS= read -r -d '' file; do
     case "$file" in "$HOME/"*) rel="${file#"$HOME"/}";; *) continue;; esac
     if agent_config_contains_credential "$file"; then

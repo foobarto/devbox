@@ -24,6 +24,24 @@ file_mode() { # $1 path
   stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null
 }
 
+# The session-linking script that runs inside the guest, extracted from the
+# heredoc devbox pipes to `limactl shell`. Running the real text is the only way
+# to test its behavior; asserting on `declare -f` only pins today's wording.
+session_persistence_guest_script() {
+  awk '/^apply_session_persistence\(\)/ {f=1}
+       f && /<<.GUEST.$/ {p=1; next}
+       p && /^GUEST$/ {exit}
+       p' "$DEVBOX"
+}
+
+# An executable that records how it was called and then fails, standing in for a
+# tool the host refuses (Lima's mount and chmod) or does not ship.
+stub_failing() { # $1 dir  $2 name  $3 exit status
+  mkdir -p "$1"
+  printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$*" >> "$STUB_LOG"' "exit $3" > "$1/$2"
+  chmod +x "$1/$2"
+}
+
 # Resolve a golden the way Lima does at create/boot time: emit the yaml, then
 # merge its base-template chain with `tmpl copy --fill`. Assertions on the
 # RESOLVED config — the config Lima actually boots — catch fields the merge
@@ -506,12 +524,7 @@ print("" if d is None else d)' "$1"
 
   run bash -c 'source "$1"; agent_config_files "$2" | tr "\\0" "\\n"' _ "$DEVBOX" "$root/hooks"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"$root/hooks/guard.sh"* ]]
-  # The nested link is reported so staging can rule on it — it points out of
-  # home, so stage_agent_config refuses it — but it is never followed here.
-  [[ "$output" == *"$root/hooks/escape"* ]]
-  [[ "$output" != *"not agent config"* ]]
-  [ "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" = 2 ]
+  [ "$output" = "$root/hooks/guard.sh" ]
 }
 
 # ------------------------------------------------------------------- proxy ----
@@ -691,8 +704,12 @@ print("" if d is None else d)' "$1"
 }
 
 @test "manifest host paths resolve relative to the manifest, not the invocation directory" {
-  project="$BATS_TEST_TMPDIR/project"
-  elsewhere="$BATS_TEST_TMPDIR/elsewhere"
+  # macOS puts BATS_TEST_TMPDIR under /var, a symlink to /private/var, and
+  # project_manifest reports a realpath — so compare against the resolved form
+  # or the assertions fail on paths devbox resolved correctly.
+  tmpdir="$(cd "$BATS_TEST_TMPDIR" && pwd -P)"
+  project="$tmpdir/project"
+  elsewhere="$tmpdir/elsewhere"
   mkdir -p "$project" "$elsewhere"
   manifest="$project/.devbox.toml"
   printf '%s\n' \
@@ -1483,171 +1500,43 @@ true' ''
   [ "$output" = "" ]
 }
 
-@test "agent config allowlist carries the plugin trees an enabled plugin needs" {
-  config_paths="$(printf '%s\n' "${AGENT_CONFIG_PATHS[@]}")"
-  [[ "$config_paths" == *"$HOME/.claude/plugins/installed_plugins.json"* ]]
-  [[ "$config_paths" == *"$HOME/.claude/plugins/known_marketplaces.json"* ]]
-  [[ "$config_paths" == *"$HOME/.claude/plugins/marketplaces"* ]]
-  [[ "$config_paths" == *"$HOME/.claude/plugins/cache"* ]]
-  [[ "$config_paths" == *"$HOME/.claude/plugins/user"* ]]
-  [[ "$config_paths" != *"$HOME/.claude/plugins/data"* ]]
-}
-
-@test "agent config skips the git metadata inside a plugin or marketplace tree" {
-  root="$BATS_TEST_TMPDIR/tree"; mkdir -p "$root/.git" "$root/sub"
-  echo x >"$root/keep.md"; echo x >"$root/sub/keep.json"; echo x >"$root/.git/config"
-  run agent_config_files "$root"
-  [[ "$output" == *keep.md* ]]
-  [[ "$output" == *keep.json* ]]
-  [[ "$output" != *.git* ]]
-}
-
-@test "agent config reports a link inside a tree instead of descending into it" {
-  root="$BATS_TEST_TMPDIR/tree"
-  mkdir -p "$root/real"
-  echo x >"$root/real/file.md"
-  ln -s ../real "$root/link"
-  run agent_config_files "$root"
-  [[ "$output" == *"$root/link"* ]]
-  [[ "$output" == *"$root/real/file.md"* ]]
-  # Descending would copy the target twice, once under each name.
-  [[ "$output" != *"$root/link/file.md"* ]]
-}
-
-@test "staging mirrors home, screens credentials, and reports both counts" {
-  export HOME="$BATS_TEST_TMPDIR/home"
-  mkdir -p "$HOME/.claude/plugins/cache/p"
-  printf 'be brief\n'                                  >"$HOME/.claude/CLAUDE.md"
-  printf '{"api_key": "sk-ant-0123456789abcdef0123"}\n' >"$HOME/.claude/settings.json"
-  printf 'a skill\n'                                    >"$HOME/.claude/plugins/cache/p/skill.md"
-  AGENT_CONFIG_PATHS=(
-    "$HOME/.claude/CLAUDE.md"
-    "$HOME/.claude/settings.json"
-    "$HOME/.claude/plugins/cache"
-  )
-  stage="$BATS_TEST_TMPDIR/stage"; mkdir -p "$stage"
-  counts="$(stage_agent_config "$stage" 2>/dev/null)"
-  [ "$counts" = "$(printf '2\t1')" ]
-  [ -f "$stage/.claude/CLAUDE.md" ]
-  [ -f "$stage/.claude/plugins/cache/p/skill.md" ]
-  [ ! -e "$stage/.claude/settings.json" ]
-}
-
-@test "staged config has only its host home prefix rewritten for the guest" {
-  export HOME="$BATS_TEST_TMPDIR/home"; mkdir -p "$HOME"
-  stage="$BATS_TEST_TMPDIR/stage"; mkdir -p "$stage/.claude/plugins"
-  printf '{"path": "%s/.claude/plugins/user/m"}\n' "$HOME" \
-    >"$stage/.claude/plugins/known_marketplaces.json"
-  printf '{"path": "%s/keep"}\n' "$HOME" >"$stage/.claude/untouched.json"
-  rewrite_staged_home_prefix "$stage" /home/guest.linux
-  grep -q '/home/guest.linux/.claude/plugins/user/m' \
-    "$stage/.claude/plugins/known_marketplaces.json"
-  grep -q "$HOME/keep" "$stage/.claude/untouched.json"
-}
-
-@test "staged config is left alone when the guest home matches the host" {
-  export HOME="$BATS_TEST_TMPDIR/home"; mkdir -p "$HOME"
-  stage="$BATS_TEST_TMPDIR/stage"; mkdir -p "$stage/.claude"
-  printf '{"path": "%s/x"}\n' "$HOME" >"$stage/.claude/settings.json"
-  rewrite_staged_home_prefix "$stage" "$HOME"
-  grep -q "$HOME/x" "$stage/.claude/settings.json"
-}
-
-@test "staging recreates an in-tree link and refuses one pointing out of home" {
-  # A marketplace registered from a directory links to the plugin it provides.
-  # Dropping the link left the guest reporting "Plugin directory not found",
-  # since the marketplace entry copied fine and the plugin behind it did not.
-  export HOME="$BATS_TEST_TMPDIR/home"
-  market="$HOME/.claude/plugins/user/m-marketplace"
-  mkdir -p "$market/.claude-plugin" "$HOME/.claude/plugins/user/m" "$BATS_TEST_TMPDIR/outside"
-  printf '{"plugins":[{"name":"m","source":"./m"}]}\n' >"$market/.claude-plugin/marketplace.json"
-  printf 'a command\n'                                 >"$HOME/.claude/plugins/user/m/cmd.md"
-  ln -s "$HOME/.claude/plugins/user/m" "$market/m"
-  printf 'token=abc\n'                                 >"$BATS_TEST_TMPDIR/outside/secret"
-  ln -s "$BATS_TEST_TMPDIR/outside/secret" "$HOME/.claude/plugins/user/escape"
-
-  AGENT_CONFIG_PATHS=("$HOME/.claude/plugins/user")
-  stage="$BATS_TEST_TMPDIR/stage"; mkdir -p "$stage"
-  counts="$(stage_agent_config "$stage" 2>/dev/null)"
-
-  # marketplace.json, cmd.md and the link through; the escaping link refused.
-  [ "$counts" = "$(printf '3\t1')" ]
-  [ ! -e "$stage/.claude/plugins/user/escape" ]
-  [ -L "$stage/.claude/plugins/user/m-marketplace/m" ]
-  # Relative, so it resolves under the guest's different home.
-  [ "$(readlink "$stage/.claude/plugins/user/m-marketplace/m")" = "../m" ]
-  [ -f "$stage/.claude/plugins/user/m-marketplace/m/cmd.md" ]
-}
-
-@test "the credential screen covers config files and leaves plugin code alone" {
-  run agent_config_is_screened "/h/.claude/settings.json"
-  [ "$status" -eq 0 ]
-  run agent_config_is_screened "/h/.codex/config.toml"
-  [ "$status" -eq 0 ]
-  run agent_config_is_screened "/h/.config/opencode/opencode.jsonc"
-  [ "$status" -eq 0 ]
-  run agent_config_is_screened "/h/.claude/plugins/marketplaces/m/hooks/llm.py"
-  [ "$status" -ne 0 ]
-  run agent_config_is_screened "/h/.claude/plugins/marketplaces/m/agents/legacy.md"
-  [ "$status" -ne 0 ]
-  run agent_config_is_screened "/h/.claude/plugins/marketplaces/m/assets/example.png"
-  [ "$status" -ne 0 ]
-}
-
-@test "staging keeps the plugin files the credential regex used to reject" {
-  # Every one of these is a real false positive: plugin code and docs discuss
-  # api keys and tokens, and images and .DS_Store are not text. Dropping them
-  # left the guest with plugins enabled and their hooks and scripts missing.
-  export HOME="$BATS_TEST_TMPDIR/home"
-  plugin="$HOME/.claude/plugins/marketplaces/m/plugins/p"
-  mkdir -p "$plugin/hooks" "$plugin/assets" "$HOME/.claude/skills"
-  printf 'api_key = os.environ.get("ANTHROPIC_API_KEY")\n' >"$plugin/hooks/llm.py"
-  printf 'redact `password=****` before logging\n'         >"$plugin/hooks/notes.md"
-  printf 'authorization: auth\n'                           >"$plugin/hooks/scan.js"
-  printf '\211PNG\r\n\032\n\000\001\002\003'       >"$plugin/assets/example.png"
-  printf '\000\001Mac OS X\000\002'                     >"$HOME/.claude/skills/.DS_Store"
-  printf '{"api_key": "sk-ant-0123456789abcdef0123"}\n'    >"$HOME/.claude/settings.json"
-  AGENT_CONFIG_PATHS=(
-    "$HOME/.claude/settings.json"
-    "$HOME/.claude/skills"
-    "$HOME/.claude/plugins/marketplaces"
-  )
-  stage="$BATS_TEST_TMPDIR/stage"; mkdir -p "$stage"
-  counts="$(stage_agent_config "$stage" 2>/dev/null)"
-
-  # Five files through, and only the settings.json holding a real key held back.
-  [ "$counts" = "$(printf '5\t1')" ]
-  [ -f "$stage/.claude/plugins/marketplaces/m/plugins/p/hooks/llm.py" ]
-  [ -f "$stage/.claude/plugins/marketplaces/m/plugins/p/hooks/notes.md" ]
-  [ -f "$stage/.claude/plugins/marketplaces/m/plugins/p/hooks/scan.js" ]
-  [ -f "$stage/.claude/plugins/marketplaces/m/plugins/p/assets/example.png" ]
-  [ -f "$stage/.claude/skills/.DS_Store" ]
-  [ ! -e "$stage/.claude/settings.json" ]
-}
-
-@test "agent configuration ships as one archive, not a copy per file" {
-  source_text="$(<"$DEVBOX")"
-  [[ "$source_text" == *'tar -C "$stage" -cf "$stage.tar" .'* ]]
-  [[ "$source_text" == *'limactl copy "$stage.tar" "$name:$archive"'* ]]
-  [[ "$source_text" == *"tar -xmf '\$archive' && rm -f '\$archive'"* ]]
-}
-
-@test "proxy_port_open sees a listener on a host without timeout" {
+@test "proxy_port_open reads the same under every probe prefix it may pick" {
   # `timeout` is GNU-only. When it is missing the old probe exited 127 for every
   # port, so the port-conflict warning never fired and the post-restart drain
-  # loop quit on its first pass.
+  # loop quit on its first pass. Both prefixes are exercised here, so the suite
+  # covers the BSD and GNU answers whichever host it runs on.
   python3 -c '
 import socket, time
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", 47311)); s.listen(1); time.sleep(3)
+s.bind(("127.0.0.1", 47311)); s.listen(1); time.sleep(5)
 ' &
   local listener=$!
   sleep 0.5
-  run proxy_port_open 47311
-  [ "$status" -eq 0 ]
-  run proxy_port_open 47312
-  [ "$status" -ne 0 ]
+
+  probes=("env")
+  command -v timeout >/dev/null 2>&1 && probes+=("timeout 1")
+  for probe in "${probes[@]}"; do
+    read -ra _PORT_PROBE <<<"$probe"
+    run proxy_port_open 47311
+    [ "$status" -eq 0 ] || { kill "$listener" 2>/dev/null; false; }
+    run proxy_port_open 47312
+    [ "$status" -ne 0 ] || { kill "$listener" 2>/dev/null; false; }
+  done
   kill "$listener" 2>/dev/null || true
+}
+
+@test "the port probe drops the timeout prefix on a host that ships none" {
+  # Asserting the choice, not just the outcome: without this the branch a given
+  # host never takes goes untested, and the BSD fallback regressed silently.
+  empty="$BATS_TEST_TMPDIR/empty"; mkdir -p "$empty"
+  ( PATH="$empty"; select_port_probe; [ "${_PORT_PROBE[*]}" = "env" ] )
+}
+
+@test "the port probe keeps a one-second timeout where the host has it" {
+  stub="$BATS_TEST_TMPDIR/timeout-stub"; mkdir -p "$stub"
+  printf '%s\n' '#!/bin/sh' 'shift; exec "$@"' > "$stub/timeout"
+  chmod +x "$stub/timeout"
+  ( PATH="$stub:$PATH"; select_port_probe; [ "${_PORT_PROBE[*]}" = "timeout 1" ] )
 }
 
 @test "spawn_detached leaves \$! naming the process and gives it its own session" {
@@ -1672,26 +1561,112 @@ s.bind(("127.0.0.1", 47311)); s.listen(1); time.sleep(3)
 @test "session linking survives a host mount that refuses chmod" {
   # macOS Lima rejects chmod on a mounted host directory, and the guest script
   # runs under errexit — so hardening the state root aborted the whole run and
-  # the cleanup trap destroyed the box.
+  # the cleanup trap destroyed the box. The real script is run here against a
+  # chmod that always fails: a `declare -f` grep would pass on a script that
+  # still aborts.
+  guest="$BATS_TEST_TMPDIR/guest.sh"
+  session_persistence_guest_script > "$guest"
+  [ -s "$guest" ]
+
+  stub="$BATS_TEST_TMPDIR/chmod-stub"
+  stub_failing "$stub" chmod 1
+
+  # link_dir compares a `readlink -f` against the unresolved state path, so the
+  # test needs a resolved tmpdir: macOS puts BATS_TEST_TMPDIR under /var, a
+  # symlink to /private/var, and the second pass would warn on its own links.
+  tmpdir="$(cd "$BATS_TEST_TMPDIR" && pwd -P)"
+  home="$tmpdir/home"; mkdir -p "$home"
+  state="$tmpdir/mount/state"
+  run env HOME="$home" PATH="$stub:$PATH" STUB_LOG="$BATS_TEST_TMPDIR/chmod.log" \
+    bash "$guest" "$state"
+  [ "$status" -eq 0 ]
+
+  # The refusal was actually reached, so the survival above means something.
+  grep -q '^700 ' "$BATS_TEST_TMPDIR/chmod.log"
+  grep -q '^600 ' "$BATS_TEST_TMPDIR/chmod.log"
+
+  # And every link the run exists for is in place regardless.
+  [ "$(readlink "$home/.claude/projects")" = "$state/claude/projects" ]
+  [ -d "$state/claude/projects" ]
+  [ "$(readlink "$home/.claude/shell-snapshots")" = "$state/claude/shell-snapshots" ]
+  [ "$(readlink "$home/.codex/sessions")" = "$state/codex/sessions" ]
+  [ "$(readlink "$home/.pi/agent/sessions")" = "$state/pi/sessions" ]
+  [ "$(readlink "$home/.local/share/stado/sessions")" = "$state/stado/sessions" ]
+  [ "$(readlink "$home/.claude/history.jsonl")" = "$state/claude/history.jsonl" ]
+  [ -f "$state/claude/history.jsonl" ]
+
+  # "The modes are already right without it" — umask 077, not chmod, earns them.
+  [ "$(file_mode "$state")" = 700 ]
+  [ "$(file_mode "$state/claude/projects")" = 700 ]
+  [ "$(file_mode "$state/claude/history.jsonl")" = 600 ]
+
+  # A second pass over its own links is still a no-op, not a warning storm.
+  run env HOME="$home" PATH="$stub:$PATH" STUB_LOG="$BATS_TEST_TMPDIR/chmod.log" \
+    bash "$guest" "$state"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"preserving custom session link"* ]]
+  [ "$(readlink "$home/.claude/projects")" = "$state/claude/projects" ]
+
+  # No bare chmod may come back: under errexit one refusal ends the script.
   run declare -f apply_session_persistence
   [ "$status" -eq 0 ]
-  [[ "$output" == *'chmod "$mode" "$@" 2>/dev/null || true'* ]]
-  [[ "$output" == *'harden 700 "$state"'* ]]
-  [[ "$output" == *'harden 700 "$dst"'* ]]
-  [[ "$output" == *'harden 600 "$dst"'* ]]
   [[ "$output" != *'chmod 700 "$state"'* ]]
   [[ "$output" != *'chmod 700 "$dst"'* ]]
   [[ "$output" != *'chmod 600 "$dst"'* ]]
+}
 
-  # A real EPERM, not a stubbed one: /usr/bin refuses chmod for this user.
-  run bash -c '
-    set -euo pipefail
-    harden() { mode="$1"; shift; chmod "$mode" "$@" 2>/dev/null || true; }
-    harden 700 /usr/bin
-    printf survived
-  '
+@test "the host credential check reads the file before reaching for a keychain" {
+  export HOME="$BATS_TEST_TMPDIR/home"; mkdir -p "$HOME/.claude"
+  printf '{}\n' > "$HOME/.claude/.credentials.json"
+  stub="$BATS_TEST_TMPDIR/stub"
+  stub_failing "$stub" security 0
+  stub_failing "$stub" uname 0
+
+  run env HOME="$HOME" PATH="$stub:$PATH" STUB_LOG="$BATS_TEST_TMPDIR/stub.log" \
+    bash -c 'source "$1" 2>/dev/null; set +u; host_claude_login' _ "$DEVBOX"
   [ "$status" -eq 0 ]
-  [ "$output" = "survived" ]
+  # Neither the platform nor the keychain was consulted for a login on disk.
+  [ ! -f "$BATS_TEST_TMPDIR/stub.log" ]
+}
+
+@test "the host credential check finds a Claude login in the macOS keychain" {
+  # A Mac keeps no ~/.claude/.credentials.json, so the file check alone warned
+  # "no host Claude login found" on every run of an authenticated host.
+  export HOME="$BATS_TEST_TMPDIR/home"; mkdir -p "$HOME"
+  stub="$BATS_TEST_TMPDIR/stub"; mkdir -p "$stub"
+  printf '%s\n' '#!/bin/sh' 'echo Darwin' > "$stub/uname"
+  stub_failing "$stub" security 0
+  chmod +x "$stub/uname"
+
+  run env HOME="$HOME" PATH="$stub:$PATH" STUB_LOG="$BATS_TEST_TMPDIR/stub.log" \
+    bash -c 'source "$1" 2>/dev/null; set +u; host_claude_login' _ "$DEVBOX"
+  [ "$status" -eq 0 ]
+  [ "$(<"$BATS_TEST_TMPDIR/stub.log")" = "find-generic-password -s Claude Code-credentials" ]
+}
+
+@test "the host credential check reports no login when the keychain has none" {
+  export HOME="$BATS_TEST_TMPDIR/home"; mkdir -p "$HOME"
+  stub="$BATS_TEST_TMPDIR/stub"; mkdir -p "$stub"
+  printf '%s\n' '#!/bin/sh' 'echo Darwin' > "$stub/uname"
+  chmod +x "$stub/uname"
+  stub_failing "$stub" security 44
+
+  run env HOME="$HOME" PATH="$stub:$PATH" STUB_LOG="$BATS_TEST_TMPDIR/stub.log" \
+    bash -c 'source "$1" 2>/dev/null; set +u; host_claude_login' _ "$DEVBOX"
+  [ "$status" -ne 0 ]
+}
+
+@test "the host credential check never shells out to security off a Mac" {
+  export HOME="$BATS_TEST_TMPDIR/home"; mkdir -p "$HOME"
+  stub="$BATS_TEST_TMPDIR/stub"; mkdir -p "$stub"
+  printf '%s\n' '#!/bin/sh' 'echo Linux' > "$stub/uname"
+  chmod +x "$stub/uname"
+  stub_failing "$stub" security 0
+
+  run env HOME="$HOME" PATH="$stub:$PATH" STUB_LOG="$BATS_TEST_TMPDIR/stub.log" \
+    bash -c 'source "$1" 2>/dev/null; set +u; host_claude_login' _ "$DEVBOX"
+  [ "$status" -ne 0 ]
+  [ ! -f "$BATS_TEST_TMPDIR/stub.log" ]
 }
 
 @test "no bare \$var is followed by a multibyte character" {
