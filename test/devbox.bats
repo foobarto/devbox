@@ -24,6 +24,24 @@ file_mode() { # $1 path
   stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null
 }
 
+# The session-linking script that runs inside the guest, extracted from the
+# heredoc devbox pipes to `limactl shell`. Running the real text is the only way
+# to test its behavior; asserting on `declare -f` only pins today's wording.
+session_persistence_guest_script() {
+  awk '/^apply_session_persistence\(\)/ {f=1}
+       f && /<<.GUEST.$/ {p=1; next}
+       p && /^GUEST$/ {exit}
+       p' "$DEVBOX"
+}
+
+# An executable that records how it was called and then fails, standing in for a
+# tool the host refuses (Lima's mount and chmod) or does not ship.
+stub_failing() { # $1 dir  $2 name  $3 exit status
+  mkdir -p "$1"
+  printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$*" >> "$STUB_LOG"' "exit $3" > "$1/$2"
+  chmod +x "$1/$2"
+}
+
 # Resolve a golden the way Lima does at create/boot time: emit the yaml, then
 # merge its base-template chain with `tmpl copy --fill`. Assertions on the
 # RESOLVED config — the config Lima actually boots — catch fields the merge
@@ -686,8 +704,12 @@ print("" if d is None else d)' "$1"
 }
 
 @test "manifest host paths resolve relative to the manifest, not the invocation directory" {
-  project="$BATS_TEST_TMPDIR/project"
-  elsewhere="$BATS_TEST_TMPDIR/elsewhere"
+  # macOS puts BATS_TEST_TMPDIR under /var, a symlink to /private/var, and
+  # project_manifest reports a realpath — so compare against the resolved form
+  # or the assertions fail on paths devbox resolved correctly.
+  tmpdir="$(cd "$BATS_TEST_TMPDIR" && pwd -P)"
+  project="$tmpdir/project"
+  elsewhere="$tmpdir/elsewhere"
   mkdir -p "$project" "$elsewhere"
   manifest="$project/.devbox.toml"
   printf '%s\n' \
@@ -1179,8 +1201,12 @@ true' ''
 }
 
 @test "sessions path works without Lima and clear has an explicit destructive path" {
-  project="$BATS_TEST_TMPDIR/project"
-  session_base="$BATS_TEST_TMPDIR/session-root"
+  # macOS puts BATS_TEST_TMPDIR under /var, a symlink to /private/var, and
+  # agent_session_base reports a realpath — so compare against the resolved
+  # form or the prefix check fails on a path devbox handled correctly.
+  tmpdir="$(cd "$BATS_TEST_TMPDIR" && pwd -P)"
+  project="$tmpdir/project"
+  session_base="$tmpdir/session-root"
   mkdir -p "$project"
   run env DEVBOX_SESSION_DIR="$session_base" bash "$DEVBOX" sessions path "$project"
   [ "$status" -eq 0 ]
@@ -1471,5 +1497,184 @@ true' ''
     limactl() { echo 'limactl: instance not running'; return 1; }
     guest_login_value fake-box '\${ANTHROPIC_API_KEY:-}'
   "
+  [ "$output" = "" ]
+}
+
+@test "proxy_port_open reads the same under every probe prefix it may pick" {
+  # `timeout` is GNU-only. When it is missing the old probe exited 127 for every
+  # port, so the port-conflict warning never fired and the post-restart drain
+  # loop quit on its first pass. Both prefixes are exercised here, so the suite
+  # covers the BSD and GNU answers whichever host it runs on.
+  python3 -c '
+import socket, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 47311)); s.listen(1); time.sleep(5)
+' &
+  local listener=$!
+  sleep 0.5
+
+  probes=("env")
+  command -v timeout >/dev/null 2>&1 && probes+=("timeout 1")
+  for probe in "${probes[@]}"; do
+    read -ra _PORT_PROBE <<<"$probe"
+    run proxy_port_open 47311
+    [ "$status" -eq 0 ] || { kill "$listener" 2>/dev/null; false; }
+    run proxy_port_open 47312
+    [ "$status" -ne 0 ] || { kill "$listener" 2>/dev/null; false; }
+  done
+  kill "$listener" 2>/dev/null || true
+}
+
+@test "the port probe drops the timeout prefix on a host that ships none" {
+  # Asserting the choice, not just the outcome: without this the branch a given
+  # host never takes goes untested, and the BSD fallback regressed silently.
+  empty="$BATS_TEST_TMPDIR/empty"; mkdir -p "$empty"
+  ( PATH="$empty"; select_port_probe; [ "${_PORT_PROBE[*]}" = "env" ] )
+}
+
+@test "the port probe keeps a one-second timeout where the host has it" {
+  stub="$BATS_TEST_TMPDIR/timeout-stub"; mkdir -p "$stub"
+  printf '%s\n' '#!/bin/sh' 'shift; exec "$@"' > "$stub/timeout"
+  chmod +x "$stub/timeout"
+  ( PATH="$stub:$PATH"; select_port_probe; [ "${_PORT_PROBE[*]}" = "timeout 1" ] )
+}
+
+@test "spawn_detached leaves \$! naming the process and gives it its own session" {
+  # The proxy is shared across boxes and outlives the run that started it, so it
+  # needs a session of its own. macOS has no setsid; the python3 fallback must
+  # exec in place, or $! stops naming the proxy and proxy.pid goes stale.
+  printf '%s\n' '#!/bin/bash' 'python3 -c "import os; print(os.getsid(0))"' 'sleep 3' \
+    > "$BATS_TEST_TMPDIR/launcher"
+  chmod +x "$BATS_TEST_TMPDIR/launcher"
+
+  spawn_detached "$BATS_TEST_TMPDIR/log" "$BATS_TEST_TMPDIR/launcher"
+  pid=$!
+  sleep 1
+  session="$(<"$BATS_TEST_TMPDIR/log")"
+  kill "$pid" 2>/dev/null || true
+
+  # The launcher leads the session it reports, and devbox's own session is not it.
+  [ "$session" = "$pid" ]
+  [ "$session" != "$(python3 -c 'import os; print(os.getsid(0))')" ]
+}
+
+@test "session linking survives a host mount that refuses chmod" {
+  # macOS Lima rejects chmod on a mounted host directory, and the guest script
+  # runs under errexit — so hardening the state root aborted the whole run and
+  # the cleanup trap destroyed the box. The real script is run here against a
+  # chmod that always fails: a `declare -f` grep would pass on a script that
+  # still aborts.
+  guest="$BATS_TEST_TMPDIR/guest.sh"
+  session_persistence_guest_script > "$guest"
+  [ -s "$guest" ]
+
+  stub="$BATS_TEST_TMPDIR/chmod-stub"
+  stub_failing "$stub" chmod 1
+
+  # link_dir compares a `readlink -f` against the unresolved state path, so the
+  # test needs a resolved tmpdir: macOS puts BATS_TEST_TMPDIR under /var, a
+  # symlink to /private/var, and the second pass would warn on its own links.
+  tmpdir="$(cd "$BATS_TEST_TMPDIR" && pwd -P)"
+  home="$tmpdir/home"; mkdir -p "$home"
+  state="$tmpdir/mount/state"
+  run env HOME="$home" PATH="$stub:$PATH" STUB_LOG="$BATS_TEST_TMPDIR/chmod.log" \
+    bash "$guest" "$state"
+  [ "$status" -eq 0 ]
+
+  # The refusal was actually reached, so the survival above means something.
+  grep -q '^700 ' "$BATS_TEST_TMPDIR/chmod.log"
+  grep -q '^600 ' "$BATS_TEST_TMPDIR/chmod.log"
+
+  # And every link the run exists for is in place regardless.
+  [ "$(readlink "$home/.claude/projects")" = "$state/claude/projects" ]
+  [ -d "$state/claude/projects" ]
+  [ "$(readlink "$home/.claude/shell-snapshots")" = "$state/claude/shell-snapshots" ]
+  [ "$(readlink "$home/.codex/sessions")" = "$state/codex/sessions" ]
+  [ "$(readlink "$home/.pi/agent/sessions")" = "$state/pi/sessions" ]
+  [ "$(readlink "$home/.local/share/stado/sessions")" = "$state/stado/sessions" ]
+  [ "$(readlink "$home/.claude/history.jsonl")" = "$state/claude/history.jsonl" ]
+  [ -f "$state/claude/history.jsonl" ]
+
+  # "The modes are already right without it" — umask 077, not chmod, earns them.
+  [ "$(file_mode "$state")" = 700 ]
+  [ "$(file_mode "$state/claude/projects")" = 700 ]
+  [ "$(file_mode "$state/claude/history.jsonl")" = 600 ]
+
+  # A second pass over its own links is still a no-op, not a warning storm.
+  run env HOME="$home" PATH="$stub:$PATH" STUB_LOG="$BATS_TEST_TMPDIR/chmod.log" \
+    bash "$guest" "$state"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"preserving custom session link"* ]]
+  [ "$(readlink "$home/.claude/projects")" = "$state/claude/projects" ]
+
+  # No bare chmod may come back: under errexit one refusal ends the script.
+  run declare -f apply_session_persistence
+  [ "$status" -eq 0 ]
+  [[ "$output" != *'chmod 700 "$state"'* ]]
+  [[ "$output" != *'chmod 700 "$dst"'* ]]
+  [[ "$output" != *'chmod 600 "$dst"'* ]]
+}
+
+@test "the host credential check reads the file before reaching for a keychain" {
+  export HOME="$BATS_TEST_TMPDIR/home"; mkdir -p "$HOME/.claude"
+  printf '{}\n' > "$HOME/.claude/.credentials.json"
+  stub="$BATS_TEST_TMPDIR/stub"
+  stub_failing "$stub" security 0
+  stub_failing "$stub" uname 0
+
+  run env HOME="$HOME" PATH="$stub:$PATH" STUB_LOG="$BATS_TEST_TMPDIR/stub.log" \
+    bash -c 'source "$1" 2>/dev/null; set +u; host_claude_login' _ "$DEVBOX"
+  [ "$status" -eq 0 ]
+  # Neither the platform nor the keychain was consulted for a login on disk.
+  [ ! -f "$BATS_TEST_TMPDIR/stub.log" ]
+}
+
+@test "the host credential check finds a Claude login in the macOS keychain" {
+  # A Mac keeps no ~/.claude/.credentials.json, so the file check alone warned
+  # "no host Claude login found" on every run of an authenticated host.
+  export HOME="$BATS_TEST_TMPDIR/home"; mkdir -p "$HOME"
+  stub="$BATS_TEST_TMPDIR/stub"; mkdir -p "$stub"
+  printf '%s\n' '#!/bin/sh' 'echo Darwin' > "$stub/uname"
+  stub_failing "$stub" security 0
+  chmod +x "$stub/uname"
+
+  run env HOME="$HOME" PATH="$stub:$PATH" STUB_LOG="$BATS_TEST_TMPDIR/stub.log" \
+    bash -c 'source "$1" 2>/dev/null; set +u; host_claude_login' _ "$DEVBOX"
+  [ "$status" -eq 0 ]
+  [ "$(<"$BATS_TEST_TMPDIR/stub.log")" = "find-generic-password -s Claude Code-credentials" ]
+}
+
+@test "the host credential check reports no login when the keychain has none" {
+  export HOME="$BATS_TEST_TMPDIR/home"; mkdir -p "$HOME"
+  stub="$BATS_TEST_TMPDIR/stub"; mkdir -p "$stub"
+  printf '%s\n' '#!/bin/sh' 'echo Darwin' > "$stub/uname"
+  chmod +x "$stub/uname"
+  stub_failing "$stub" security 44
+
+  run env HOME="$HOME" PATH="$stub:$PATH" STUB_LOG="$BATS_TEST_TMPDIR/stub.log" \
+    bash -c 'source "$1" 2>/dev/null; set +u; host_claude_login' _ "$DEVBOX"
+  [ "$status" -ne 0 ]
+}
+
+@test "the host credential check never shells out to security off a Mac" {
+  export HOME="$BATS_TEST_TMPDIR/home"; mkdir -p "$HOME"
+  stub="$BATS_TEST_TMPDIR/stub"; mkdir -p "$stub"
+  printf '%s\n' '#!/bin/sh' 'echo Linux' > "$stub/uname"
+  chmod +x "$stub/uname"
+  stub_failing "$stub" security 0
+
+  run env HOME="$HOME" PATH="$stub:$PATH" STUB_LOG="$BATS_TEST_TMPDIR/stub.log" \
+    bash -c 'source "$1" 2>/dev/null; set +u; host_claude_login' _ "$DEVBOX"
+  [ "$status" -ne 0 ]
+  [ ! -f "$BATS_TEST_TMPDIR/stub.log" ]
+}
+
+@test "no bare \$var is followed by a multibyte character" {
+  # In a UTF-8 locale bash's identifier scan swallows the lead byte of a
+  # following multibyte character, so `log "Booting $name…"` dies with
+  # `name?: unbound variable` under set -u. Braces are the only fix, and the
+  # bug hides until that specific line runs. C-locale CI never sees it.
+  run env LC_ALL=C grep -nE '\$[A-Za-z_][A-Za-z0-9_]*[^[:print:][:space:]]' "$DEVBOX"
+  [ "$status" -ne 0 ]
   [ "$output" = "" ]
 }
