@@ -56,12 +56,14 @@ proxy configuration, before starting the proxy to disable future collection.
 ## Opt-in web egress audit
 
 This audit normally covers only requests Devbox's authenticated proxy forwards;
-it does not claim to see arbitrary guest networking. Add
-`--traffic-audit=connect` (or `-T`) when ordinary web tools must use the same
-host proxy or fail. Devbox writes a guest login profile with standard
-`HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` settings, and an nftables output
-rule rejects direct TCP and UDP connections to ports 80 and 443. Use
-`--traffic-audit=off` to remove both from a kept box.
+it does not claim to see arbitrary guest networking. Grant `egress = "audit"`
+in a policy or `[grants]` (the deprecated flag is `--traffic-audit`, `-T`) when
+ordinary web tools must use the same host proxy or fail. Devbox writes a guest
+login profile with standard `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`
+settings — with `NO_PROXY` exempting only guest loopback and the Devbox proxy
+host — and an nftables output rule rejects direct TCP and UDP connections to
+ports 80 and 443. A policy without it, or `--traffic-audit=off`, removes both
+from a kept box.
 
 The traffic capability is distinct from the AI/GitHub credential capability,
 expires after eight hours, and is refreshed when a kept audited box is

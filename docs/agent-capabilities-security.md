@@ -9,7 +9,10 @@ Use these features for code you trust. A compromised or malicious in-VM agent
 can exercise every capability you grant it, even when it cannot extract the
 underlying host credential.
 
-For `--proxy`, preventing credential exfiltration is the primary security goal:
+Each capability below is a **grant**, declared in a [grant policy](policies.md)
+or a project's `[grants]` table; the per-grant flags named alongside are
+deprecated shorthands. For the `ai_proxy` and `github` grants, preventing
+credential exfiltration is the primary security goal:
 the guest never receives the host's real API keys or OAuth tokens. The proxy is
 not, by itself, a least-authority policy for requests made while the Devbox is
 allowed to use it.
@@ -34,13 +37,13 @@ read-write so resumable transcripts survive clone deletion; use
 | feature | what an agent in the Devbox can do | what remains outside the Devbox |
 |---|---|---|
 | Persistent AI sessions (default) | Read and modify this project's Devbox-managed Claude, Codex, OpenCode, Pi, and Stado session records across VM lifecycles. This enables native resume commands but also carries transcript instructions and tool output into future clones. | Other projects' Devbox stores, existing host agent histories, auth files, provider tokens, caches, and general host state remain unmounted. `--ephemeral-sessions` / `-e` disconnects the native session paths for that run. |
-| `--ssh-agent` / `-s` | Request authentication and signatures using identities currently loaded in the host SSH agent. This includes SSH/Git access accepted by those identities and Devbox's SSH-format Git commit signing. | It cannot read or copy the private-key material from the agent. It does not gain access to unmounted host files or a host shell. |
-| `--proxy` / `-p` | Make requests through Devbox's configured AI routes using the host's AI-provider logins. It can consume quotas and send prompts, code, and files to those providers. | It does not receive the underlying API keys or OAuth tokens, and it gets no GitHub access. The guest runs its own CLIs; it cannot run host commands through the proxy. |
-| `--gh-proxy` / `-H` | Use `gh` as the host's GitHub login: read, create, modify, delete, or upload anything that account can reach through `api.github.com`. | It does not receive the host `gh` token. It is never implied by `--proxy` or `-a`. |
-| `--traffic-audit` / `-T` | Send proxy-aware public web traffic through a short-lived generic CONNECT capability. Direct TCP/UDP 80/443 fails under the guest firewall; CONNECT audit records reveal destination, timing, and byte counts, while plaintext HTTP can be recorded in detail. | It grants no AI, GitHub, SSH, or host-login credential. HTTPS remains encrypted after CONNECT, and non-web ports remain outside the rule. The generic proxy refuses host/private/LAN destinations. |
-| `--gui` / `-G` | Become a Wayland client of the host session through Waypipe. | It does not receive the raw host Wayland socket or host GPU/render-device nodes. This is still a host-desktop capability, not an isolation boundary; see [GUI forwarding security](gui-security.md). |
-| `--with-agent-config` / `-g` | Read selected non-secret rules, prompts, settings, and custom agents copied into the guest. Those instructions can affect agent behavior. | Authentication state, histories, caches, key directories, and files detected as credentials are excluded. |
-| `--api-keys` / `-K` or `--with-creds` / `-c` | Read actual keys or copied OAuth credentials in the guest. | These deliberately weaken the host-only credential boundary. Prefer `--proxy` when the provider workflow supports it. |
+| `ssh_agent` (`--ssh-agent`) | Request authentication and signatures using identities currently loaded in the host SSH agent. This includes SSH/Git access accepted by those identities and Devbox's SSH-format Git commit signing. | It cannot read or copy the private-key material from the agent. It does not gain access to unmounted host files or a host shell. |
+| `ai_proxy` (`--proxy`) | Make requests through Devbox's configured AI routes using the host's AI-provider logins. It can consume quotas and send prompts, code, and files to those providers. | It does not receive the underlying API keys or OAuth tokens, and it gets no GitHub access. The guest runs its own CLIs; it cannot run host commands through the proxy. |
+| `github` (`--gh-proxy`) | Use `gh` as the host's GitHub login: read, create, modify, delete, or upload anything that account can reach through `api.github.com`. | It does not receive the host `gh` token. It is never implied by `ai_proxy` or `-a`. |
+| `egress = "audit"` (`--traffic-audit`) | Send proxy-aware public web traffic through a short-lived generic CONNECT capability. Direct TCP/UDP 80/443 fails under the guest firewall; CONNECT audit records reveal destination, timing, and byte counts, while plaintext HTTP can be recorded in detail. | It grants no AI, GitHub, SSH, or host-login credential. HTTPS remains encrypted after CONNECT, and non-web ports remain outside the rule. The generic proxy refuses host/private/LAN destinations. |
+| `--gui` / `-G` (not a grant; command-line only) | Become a Wayland client of the host session through Waypipe. | It does not receive the raw host Wayland socket or host GPU/render-device nodes. This is still a host-desktop capability, not an isolation boundary; see [GUI forwarding security](gui-security.md). |
+| `agent_config` (`--with-agent-config`) | Read selected non-secret rules, prompts, settings, and custom agents copied into the guest. Those instructions can affect agent behavior. | Authentication state, histories, caches, key directories, and files detected as credentials are excluded. |
+| `api_keys` (`--api-keys`) or `host_credentials` (`--with-creds`) | Read actual keys or copied OAuth credentials in the guest. | These deliberately weaken the host-only credential boundary. Prefer `ai_proxy` when the provider workflow supports it. |
 | pre-accepted agent prompts *(always on, no flag)* | Start work in the mounted directory without a trust dialog, which also means the repository's own `.claude/settings.json` and hooks run unprompted. See [pre-accepted agent first-run prompts](#pre-accepted-agent-first-run-prompts). | It gains no capability the flags above do not already grant, and trust is never seeded for `$HOME` or for `--mount` paths. |
 
 ## SSH-agent forwarding
@@ -125,8 +128,8 @@ default; Lima delivers guest connections to `host.lima.internal` there. AI
 routes add host credentials only to requests that carry a registered per-box
 capability (`dbx-ai.<box>.<secret>`, exported as the guest's
 `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`). The secret exists only in an owner-only
-host file; destroying the box or `--no-auth` deletes it and revokes the
-capability. A configuration that sets `"listen"` beyond loopback or
+host file; destroying the box, `--no-auth`, or entering a kept box under a
+policy without `ai_proxy` deletes it and revokes the capability. A configuration that sets `"listen"` beyond loopback or
 `"ai_client_auth": "none"` widens this boundary; the proxy warns at startup.
 
 Without `--proxy`, an in-Devbox agent has no Devbox-managed access to host AI
@@ -161,20 +164,25 @@ audit logging](proxy-audit.md) for the retained data and limitations.
 
 ## Combining capabilities
 
-Capabilities compose. For example, `devbox --gui -a -T` grants non-secret agent
+Capabilities compose. For example, `devbox --gui --policy agent` with
+`egress = "audit"` in the policy grants non-secret agent
 configuration, provider request capability, SSH-agent operations, host GUI
 access, and generic proxy-or-fail web egress. A malicious project process can
 use every enabled capability; granting one does not make the others safer.
 
-`-a` intentionally remains `--with-agent-config --proxy --ssh-agent` only; it
-grants AI requests but never the host GitHub login.
-GUI forwarding must be added explicitly with `--gui` or `-G`.
+The built-in `agent` policy (and the `-a` shorthand) is `agent_config`,
+`ai_proxy`, and `ssh_agent` only; it grants AI requests but never the host
+GitHub login. GUI forwarding is not a grant and must be added explicitly with
+`--gui` or `-G`.
 
-Avoid using `-a`, `--ssh-agent`, `--proxy`, `--gh-proxy`, or `--gui` for unknown code unless
-you have consciously accepted their separate risks. For the narrowest
-untrusted-code environment, begin with
-`devbox --no-auth --ephemeral-sessions` and no extra mounts, copies, agent
-forwarding, proxy, or GUI forwarding.
+Avoid granting `ssh_agent`, `ai_proxy`, `github`, or using `--gui` for unknown
+code unless you have consciously accepted their separate risks. For the
+narrowest untrusted-code environment, begin with a new box:
+`devbox --policy none --ephemeral-sessions` grants nothing and overrides any
+project or machine-default grants. On a kept box it removes only the proxy,
+API-key, and audited-egress state; SSH-agent forwarding, copied files and
+credentials, and mounts stay until the box is destroyed, so destroy a box that
+held them before reusing it for unknown code.
 
 ## Pre-accepted agent first-run prompts
 
@@ -208,14 +216,16 @@ willing to lose, with one caveat worth naming: the box is disposable but the
 [session store](#persistent-ai-session-state) is not, so anything that reaches a
 transcript outlives the clone. Use `--ephemeral-sessions` for a repository you
 would not want resumed. It is *not* a reason to relax the guidance below. Treat
-`--ssh-agent`, `--proxy`, `--gui`, and extra writable mounts as the controls
+the `ssh_agent`, `ai_proxy`, and `github` grants, `--gui`, and extra writable mounts as the controls
 that actually matter, because none of them are gated by an agent-side dialog
 either.
 
 ## Reviewing repository-controlled requests
 
-A project can request startup commands, mounts, copies, credentials, resource
-settings, and provisioning through `.devbox.toml`; Devbox presents those
+A project can request startup commands, resource settings, provisioning, and —
+through a `policy` and a `[grants]` table — host grants such as the AI and
+GitHub proxies, the SSH agent, mounts, copies, and credentials, all through
+`.devbox.toml`; Devbox presents those
 requests in a categorized, icon-labelled review before approval. It can also
 send the manifest to Codex, Claude, Agy, Copilot, Cursor, OpenCode, or Pi for an
 optional summary and safety check; Codex is the default choice. Each adapter is
@@ -228,24 +238,27 @@ The manifest contents still leave the machine for the service configured for
 the selected CLI, and the result does not replace your own decision.
 
 An explicit approval is stored as owner-only user state and reused only while
-the manifest's exact SHA-256 fingerprint is unchanged. Devbox asks again after
-any edit, and rechecks the fingerprint before executing manifest packages or
-startup code. Read the prompt and decline anything unexpected. The manifest
+both the manifest's exact SHA-256 fingerprint and the fingerprint of its
+resolved meaning are unchanged — symlinked host paths, effective defaults, the
+machine-default policy, and any host policy file it names. Devbox asks again
+after any such change, and rechecks both before host-affecting steps and before
+executing manifest packages or startup code. Read the prompt and decline anything unexpected. The manifest
 cannot enable GUI forwarding, but background processes started in a GUI-enabled
 Devbox should still be treated as able to use the capabilities you selected.
 
 ## Operational checklist
 
-1. Start with no optional capability; add only the one required for the task.
-2. For `--ssh-agent`, load only a restricted key and use confirmation or a
+1. Start with no optional capability (`--policy none`); add only the grant
+   required for the task.
+2. For `ssh_agent`, load only a restricted key and use confirmation or a
    short key lifetime where practical.
-3. For `--proxy`, trust the code that can send requests, and keep the host
+3. For `ai_proxy` and `github`, trust the code that can send requests, and keep the host
    listener on loopback (the default).
 4. For `--gui`, trust the application with host-desktop access; see the
    [GUI forwarding security guide](gui-security.md).
 5. Remove a capability when finished: exit and destroy the disposable box, or
-   re-enter a kept box with `--no-auth` to remove credential-proxy state and
-   `--traffic-audit=off` to remove proxy-or-fail traffic auditing.
+   re-enter a kept box under a policy without it (e.g. `--policy none`), which
+   removes proxy state, API-key profiles, and audited-egress rules it lacks.
 6. Treat resumed transcripts as untrusted input when the previous session read
    untrusted material. Use `--ephemeral-sessions` or `devbox sessions clear`
    when cross-lifecycle state is not appropriate.

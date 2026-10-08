@@ -61,7 +61,9 @@ per-guest-credential design:
   explicit custom route configuration, including a broader `listen` address or
   `"ai_client_auth": "none"`; the proxy warns when either is in effect.
 
-`--no-auth` remains the clean removal path for Devbox-managed authentication.
+Entering a kept box under a policy without `ai_proxy` (for example
+`--policy none`), or with `--no-auth`, removes Devbox-managed authentication and
+revokes the box's capability.
 
 ## Provider terms and documentation
 

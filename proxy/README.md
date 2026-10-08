@@ -25,11 +25,11 @@ the proxy injects them and forwards to the provider.
 
 The alternatives put secrets *inside* the throwaway VM:
 
-| strategy | flag | secret location |
+| strategy | grant (flag) | secret location |
 |---|---|---|
-| **proxy** | `devbox --proxy` | host only — VM sees a revocable per-box capability |
-| API keys in VM | `devbox --api-keys` | copied into the VM |
-| OAuth creds in VM | `devbox --with-creds` | copied into the VM |
+| **proxy** | `ai_proxy` / `github` (`--proxy` / `--gh-proxy`) | host only — VM sees a revocable per-box capability |
+| API keys in VM | `api_keys` (`--api-keys`) | copied into the VM |
+| OAuth creds in VM | `host_credentials` (`--with-creds`) | copied into the VM |
 
 For a *disposable* box, keeping secrets on the host is the safer default: a
 leaky or compromised box can't exfiltrate what it never had.
@@ -101,10 +101,13 @@ capture.
 
 ## Opt-in CONNECT web egress audit
 
-`devbox --traffic-audit` (or `-T`) is separate from `--proxy` and from `-a`.
-It issues a different eight-hour capability for generic public web traffic,
-sets the guest's standard `HTTP(S)_PROXY` and `ALL_PROXY` variables, and blocks
-direct guest TCP/UDP ports 80 and 443 with nftables. Normal proxy-aware tools
+The `egress = "audit"` grant (deprecated flag `--traffic-audit`, `-T`) is
+separate from the AI and GitHub grants and from the `agent` policy. It issues a
+different eight-hour capability for generic public web traffic, sets the guest's
+standard `HTTP(S)_PROXY` and `ALL_PROXY` variables (with `NO_PROXY` exempting
+only guest loopback and this proxy's host, so AI clients still reach the
+credential proxy directly), and blocks direct guest TCP/UDP ports 80 and 443
+with nftables. Normal proxy-aware tools
 therefore use this host proxy or fail visibly instead of bypassing its log.
 
 HTTPS CONNECT records are intentionally metadata-only: destination host/port,
@@ -159,10 +162,11 @@ both and delivers the new CA certificate to running boxes with their next
 renewal check.
 GitHub-owned download hosts are tunnelled without TLS interception.
 
-`--gh-proxy` is a grant of its own: `--proxy` and `-a` never include it, so a
-box can use the host's AI logins while staying sealed off from the host's
-GitHub identity. A kept box keeps the grant until `devbox --gh-proxy=off` or
-`--no-auth` removes it.
+The `github` grant (`--gh-proxy`) is separate: `ai_proxy`, the `agent` policy,
+and `-a` never include it, so a box can use the host's AI logins while staying
+sealed off from the host's GitHub identity. A kept box loses the grant when
+entered under a policy without `github`, or with `--gh-proxy=off` or
+`--no-auth`.
 
 `--gh-proxy` also moves the usable Homebrew `gh` binary into the wrapper's managed
 private directory and replaces Homebrew's public `bin/gh` link with the wrapper.
@@ -208,7 +212,7 @@ the golden and recreate only that box:
 devbox build --force
 devbox ls                         # identify the kept box name
 devbox destroy <box-name>
-devbox --keep --gh-proxy
+devbox --keep --policy agent-github     # or [grants] github = true
 ```
 
 ## Quick start
@@ -221,11 +225,12 @@ cp proxy/api-keys.env.example       ~/.config/devbox/api-keys.env      # fill in
 cp proxy/proxy.config.example.json  ~/.config/devbox/proxy.config.json # optional route overrides
 ```
 
-Then just use `--proxy` — **devbox auto-starts the host proxy** (once, shared
-across boxes) if it isn't already running:
+Then grant `ai_proxy` — for example with `--policy agent` or `ai_proxy = true`
+in `[grants]` — and **devbox auto-starts the host proxy** (once, shared across
+boxes) if it isn't already running:
 
 ```sh
-devbox --proxy          # starts the proxy on the host, wires the box's env to it
+devbox --policy agent   # starts the proxy on the host, wires the box's env to it
 ```
 
 Manage the shared proxy directly if you want:
