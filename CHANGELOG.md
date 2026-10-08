@@ -13,6 +13,8 @@
 - Stop with an error when `--proxy` cannot start the credential proxy.
 - Reject NUL bytes, newlines, and non-hex `image.digest` values in
   `.devbox.toml` that could alter the generated golden config.
+- Fix `devbox --ssh-agent` exiting silently on a stopped kept box, and a
+  silent exit when the guest login environment could not be read.
 
 ## v1.4.0 - 2026-08-28
 
