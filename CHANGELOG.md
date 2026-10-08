@@ -19,6 +19,9 @@
   X.509 clients accept them, and replace them before they expire.
 - Restart a running older credential proxy once after an upgrade, so running
   boxes receive a replaced CA.
+- The credential proxy listens on `127.0.0.1` by default, and its AI routes
+  require a per-box capability, revoked when the box is destroyed or run with
+  `--no-auth`. Custom `proxy-env` templates get it as `__PROXY_TOKEN__`.
 
 ## v1.4.0 - 2026-08-28
 

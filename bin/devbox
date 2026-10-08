@@ -893,9 +893,15 @@ print(urlunsplit((source.scheme, f"{quote(token)}@{source.netloc}", "", "", ""))
 github_proxy_url() { capability_proxy_url "$@"; }
 traffic_proxy_url() { capability_proxy_url "$@"; }
 
+# The proxy's state directory, resolved exactly as proxy/run.sh resolves it, so
+# registrations written or revoked here are the ones the proxy reads.
+proxy_state_dir() {
+  printf '%s' "${DEVBOX_PROXY_STATE_DIR:-$CONFIG_DIR}"
+}
+
 gh_proxy_state_path() { # $1 Lima instance name
   [[ "$1" =~ ^[[:alnum:]_.-]+$ ]] || die "invalid Devbox instance name for GitHub proxy state"
-  printf '%s/gh-proxy-boxes/%s.url' "$CONFIG_DIR" "$1"
+  printf '%s/gh-proxy-boxes/%s.url' "$(proxy_state_dir)" "$1"
 }
 
 # A proxy endpoint is matched as a whole, ASCII-only string rather than through
@@ -919,7 +925,7 @@ proxy_endpoint() { # $1 bare http proxy URL -> URL with an explicit port
 
 traffic_proxy_state_path() { # $1 Lima instance name
   [[ "$1" =~ ^[[:alnum:]_.-]+$ ]] || die "invalid Devbox instance name for traffic proxy state"
-  printf '%s/traffic-proxy-boxes/%s.url' "$CONFIG_DIR" "$1"
+  printf '%s/traffic-proxy-boxes/%s.url' "$(proxy_state_dir)" "$1"
 }
 
 record_traffic_proxy_endpoint() { # $1 Lima instance $2 bare http proxy URL
@@ -982,6 +988,17 @@ clear_gh_proxy_endpoint() { # $1 Lima instance
   rm -f -- "$(gh_proxy_state_path "$1")"
 }
 
+# The per-box AI-route capability lives only in this owner-only host file;
+# removing it revokes every copy the guest holds (see issue_ai_proxy_token).
+ai_proxy_token_path() { # $1 Lima instance name
+  [[ "$1" =~ ^[[:alnum:]_.-]+$ ]] || die "invalid Devbox instance name for AI proxy state"
+  printf '%s/ai-proxy-boxes/%s.key' "$(proxy_state_dir)" "$1"
+}
+
+revoke_ai_proxy_token() { # $1 Lima instance
+  rm -f -- "$(ai_proxy_token_path "$1")"
+}
+
 write_gh_proxy_url() { # $1 Lima instance $2 full capability-bearing proxy URL
   local name="$1" url="$2"
   # Pass the capability on stdin, never as a guest command argument or env var.
@@ -1028,7 +1045,7 @@ proxy_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/nul
 # long-lived daemon, so an upgrade leaves the old one serving until something
 # restarts it; bump this marker whenever an older daemon would be unsafe or
 # incompatible with this devbox (e.g. a CA it can no longer deliver).
-PROXY_REQUIRED_FEATURE="gh-ca-renewal"
+PROXY_REQUIRED_FEATURE="ai-client-auth"
 proxy_current_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -qw -- "$PROXY_REQUIRED_FEATURE"; }
 # is anything at all listening on the port?
 proxy_port_open() {
@@ -1107,31 +1124,42 @@ proxy_ensure() {
 }
 
 apply_proxy() {
-  local name="$1" url="$2" tmpl="$CONFIG_DIR/proxy-env" launcher gh_wrapper ca_path
+  local name="$1" url="$2" tmpl="$CONFIG_DIR/proxy-env" launcher gh_wrapper ca_path ai_token
   valid_gh_proxy_endpoint "$url" || die "proxy must be a bare http://host:port URL with a numeric port"
   log "Wiring AI and GitHub CLIs → proxy $url"
+  launcher="$(proxy_launcher)" || die "credential proxy launcher not found"
+  # The guest's API keys are this box's revocable proxy capability, not a host
+  # credential: the proxy refuses AI routes without it, so reaching the
+  # listener alone is not enough to spend the host account.
+  ai_token="$("$launcher" --ai-proxy-token "$name")" \
+    && [[ "$ai_token" =~ ^dbx-ai\.[[:alnum:]_.-]+\.[A-Za-z0-9_-]+$ ]] \
+    || die "could not issue the AI proxy capability for $name"
   if [[ -f "$tmpl" ]]; then
     # Plain string substitution: the URL must never become part of a sed
     # program, where a crafted value could run a host command.
     local template
     template="$(<"$tmpl")"
-    # Unquoted replacement on purpose: bash 4.0-4.2 would keep inner quotes
-    # literally, and the validated URL cannot contain `&` for 5.2's patsub.
-    printf '%s\n' "${template//__PROXY_URL__/$url}" \
+    [[ "$template" == *__PROXY_TOKEN__* ]] \
+      || warn "$tmpl has no __PROXY_TOKEN__; Devbox's proxy rejects AI requests without the box capability"
+    # Unquoted replacements on purpose: bash 4.0-4.2 would keep inner quotes
+    # literally, and neither validated value can contain `&` for 5.2's patsub.
+    template="${template//__PROXY_URL__/$url}"
+    printf '%s\n' "${template//__PROXY_TOKEN__/$ai_token}" \
       | limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-10-proxy.sh >/dev/null'
   else
     limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-10-proxy.sh >/dev/null' <<EOF
-# devbox --proxy: keep real credentials on the host proxy.
+# devbox --proxy: keep real credentials on the host proxy. The API keys below
+# are this box's revocable Devbox proxy capability, not provider credentials.
 export ANTHROPIC_BASE_URL="$url"
-export ANTHROPIC_API_KEY="\${ANTHROPIC_API_KEY:-devbox-proxy}"
+export ANTHROPIC_API_KEY="$ai_token"
 export OPENAI_BASE_URL="$url/v1"
-export OPENAI_API_KEY="\${OPENAI_API_KEY:-devbox-proxy}"
+export OPENAI_API_KEY="$ai_token"
 EOF
   fi
   # Codex's ChatGPT subscription flow uses a different backend than the public
   # OpenAI API. Give it an isolated, devbox-owned config pointing at the host
-  # proxy. The dummy API key above is only a routing marker; no OAuth material
-  # is written to the guest.
+  # proxy. The API key above is only the box's proxy capability; no OAuth
+  # material is written to the guest.
   limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-11-codex-proxy.sh >/dev/null' <<'EOF'
 # devbox --proxy: keep Codex's isolated proxy profile separate from user config.
 export CODEX_HOME="$HOME/.devbox/codex-proxy"
@@ -1151,9 +1179,8 @@ PY
   # gh cannot choose a custom API base URL, so its wrapper uses an HTTPS CONNECT
   # proxy. It receives a dummy token only; the host proxy replaces that marker
   # after TLS termination with the token from the host's `gh auth login`.
-  launcher="$(proxy_launcher)" || die "GitHub CLI proxy launcher not found"
   "$launcher" --init-gh-ca >/dev/null || die "could not initialise GitHub CLI proxy certificate"
-  ca_path="$CONFIG_DIR/gh-proxy-ca.pem"
+  ca_path="$(proxy_state_dir)/gh-proxy-ca.pem"
   [[ -r "$ca_path" ]] || die "GitHub CLI proxy CA was not created: $ca_path"
   gh_wrapper="$(proxy_asset gh-wrapper.py)" || die "GitHub CLI proxy wrapper not found"
   # shellcheck disable=SC2016 # $HOME expands inside the guest shell.
@@ -1220,6 +1247,7 @@ clear_auth() {
   local name="$1"
   log "Disabling devbox-managed auth in $name"
   clear_gh_proxy_endpoint "$name"
+  revoke_ai_proxy_token "$name"
   # Restore Homebrew's public gh link only when it still points at our wrapper.
   # shellcheck disable=SC2016 # All variables expand in the guest.
   limactl shell "$name" -- bash -s <<'GUEST'
@@ -1793,7 +1821,8 @@ claude_trust_config() { # $1 project dir $2 ANTHROPIC_API_KEY (may be empty)
 import json
 import sys
 
-directory, api_key = sys.argv[1], sys.argv[2].strip()
+import os
+directory, api_key = sys.argv[1], os.environ.get("DEVBOX_SEED_API_KEY", "").strip()
 raw = sys.stdin.read().strip()
 try:
     config = json.loads(raw) if raw else {}
@@ -1832,7 +1861,9 @@ if api_key:
 
 print(json.dumps(config, indent=2))
 PY
-  python3 -c "$src" "$1" "${2:-}"
+  # The key travels in the environment, never argv: other local users can read
+  # a process's arguments, while its environment is private to its owner.
+  DEVBOX_SEED_API_KEY="${2:-}" python3 -c "$src" "$1"
 }
 
 # Merge Codex's directory trust into an existing config.toml read on stdin.
@@ -1928,12 +1959,12 @@ seed_agent_trust() { # $1 Lima instance $2 mounted project dir
 
   # Codex shows its sign-in picker whenever auth.json is missing, which is the
   # normal state under --proxy (apply_proxy removes it so no OAuth material
-  # reaches the guest). Seed the same dummy routing marker that is already
-  # exported as OPENAI_API_KEY — it is not a credential, and the host proxy
-  # replaces it after TLS termination. A real auth.json copied in with
+  # reaches the guest). Seed the value already exported as OPENAI_API_KEY —
+  # under --proxy the box's revocable proxy capability, never a host
+  # credential; the host proxy replaces it. A real auth.json copied in with
   # --with-creds is never overwritten.
   [[ -n "$openai_key" ]] || return 0
-  python3 -c 'import json, sys; print(json.dumps({"OPENAI_API_KEY": sys.argv[1], "auth_mode": "apikey"}))' "$openai_key" \
+  DEVBOX_SEED_API_KEY="$openai_key" python3 -c 'import json, os; print(json.dumps({"OPENAI_API_KEY": os.environ["DEVBOX_SEED_API_KEY"], "auth_mode": "apikey"}))' \
     | limactl shell "$name" -- bash -c "umask 077; if [ -s $quoted_home/auth.json ]; then cat >/dev/null; else cat > $quoted_home/auth.json && chmod 600 $quoted_home/auth.json; fi" \
     || warn "could not pre-accept the Codex sign-in prompt"
 }
@@ -2784,6 +2815,7 @@ run_cleanup() {
     limactl delete -f "$_DB_NAME" 2>/dev/null || true
     clear_gh_proxy_endpoint "$_DB_NAME"
     clear_traffic_proxy_endpoint "$_DB_NAME"
+    revoke_ai_proxy_token "$_DB_NAME"
   fi
   if [[ -n "${_DB_SESSION_DIR:-}" ]]; then
     log "AI sessions retained: ${_DB_SESSION_DIR}"
@@ -2999,6 +3031,11 @@ cmd_run() {
     log "Cloning $golden → $name (mount: $dir${extra_mounts:+, +${#extra_mounts[@]} extra mount(s)})"
     [[ -z "$manifest" ]] || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
     limactl --tty=false clone "$golden" "$name" "${clone_args[@]}"
+    # A new box never inherits proxy registrations left by an earlier box of
+    # the same name that was deleted outside devbox.
+    revoke_ai_proxy_token "$name"
+    clear_gh_proxy_endpoint "$name"
+    clear_traffic_proxy_endpoint "$name"
   fi
   [[ $ephemeral_sessions -eq 1 || $preexisting -eq 0 ]] || ensure_session_mount "$name" "$session_state"
   [[ $ssh_agent -eq 1 && $preexisting -eq 1 ]] && enable_ssh_agent "$name"
@@ -3034,6 +3071,10 @@ cmd_run() {
     }
     if [[ -n "$api_keys" ]]; then
       [[ -z "$manifest" ]] || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
+      if [[ -n "$managed_proxy" && -f "$api_keys" ]] \
+         && grep -Eq '^[[:space:]]*(export[[:space:]]+)?(ANTHROPIC|OPENAI)_API_KEY=' "$api_keys"; then
+        warn "$api_keys sets ANTHROPIC_API_KEY/OPENAI_API_KEY, overriding the box's proxy capability; Devbox's proxy will refuse those AI requests"
+      fi
       apply_api_keys "$name" "$api_keys"
     fi
     [[ $with_creds -eq 1 ]] && apply_creds  "$name"
@@ -3229,6 +3270,7 @@ cmd_destroy() {
     limactl delete -f "$i"
     clear_gh_proxy_endpoint "$i"
     clear_traffic_proxy_endpoint "$i"
+    revoke_ai_proxy_token "$i"
   done <<< "$list"
 }
 

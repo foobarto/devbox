@@ -27,7 +27,7 @@ The alternatives put secrets *inside* the throwaway VM:
 
 | strategy | flag | secret location |
 |---|---|---|
-| **proxy** | `devbox --proxy` | host only — VM sees a dummy token |
+| **proxy** | `devbox --proxy` | host only — VM sees a revocable per-box capability |
 | API keys in VM | `devbox --api-keys` | copied into the VM |
 | OAuth creds in VM | `devbox --with-creds` | copied into the VM |
 
@@ -114,8 +114,8 @@ covered. Remove it from a kept box with `devbox --traffic-audit=off`. See the
 
 For Codex subscriptions, `devbox --proxy` gives the guest an isolated,
 non-secret Codex profile that points its ChatGPT backend and WebSocket traffic
-to the host proxy. The guest only receives the literal routing marker
-`devbox-proxy`; the host replaces it with the refreshed OAuth header.
+to the host proxy. As its API key the guest only receives the box's proxy
+capability; the host replaces it with the refreshed OAuth header.
 The host must have a current `codex` CLI on `PATH`. All Devbox proxy processes
 also serialize refresh requests through an owner-only host lock and re-read
 `auth.json` after taking it, so custom-port or concurrently started proxies
@@ -224,9 +224,36 @@ The guest reaches the host at `host.lima.internal`, so the default proxy URL is
 collisions — `4000` is often taken). If the port is already held by a
 non-devbox service, devbox refuses to start rather than clobber it; set
 `DEVBOX_PROXY_URL` to a free port. Because the guest reaches the host over
-Lima's user-network gateway, the proxy binds `0.0.0.0` by default — restrict
-with a firewall if you want it tighter, or set `"listen"` to a specific
-interface. Logs go to `~/.config/devbox/proxy.log`.
+Lima's user-mode network, which delivers `host.lima.internal` (192.168.5.2)
+connections on the host's loopback interface, the proxy listens on
+`127.0.0.1` by default and nothing beyond this machine can reach it. Logs go to
+`~/.config/devbox/proxy.log`.
+
+### Per-box capability on AI routes
+
+`devbox --proxy` sets the guest's `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` to a
+per-box capability, `dbx-ai.<box>.<secret>`, rather than a shared marker. The
+proxy adds host AI credentials only when a request's `x-api-key` or bearer
+`Authorization` header carries a registered capability, then removes it before
+forwarding. The secret lives only in the owner-only host file
+`~/.config/devbox/ai-proxy-boxes/<box>.key`; re-entering a kept box reuses it,
+and destroying the box or `--no-auth` deletes it, revoking the capability
+immediately. Audit records name the box.
+
+A custom `~/.config/devbox/proxy-env` template receives the capability through
+the `__PROXY_TOKEN__` placeholder, alongside `__PROXY_URL__`. An existing
+`proxy.config.json` copied from an older example may still say
+`"listen": "0.0.0.0:4141"`; change it to `127.0.0.1:4141`. Setting
+`"ai_client_auth": "none"` accepts any client that reaches the listener, and the
+proxy warns at startup when either setting widens access.
+
+Two combinations change with this: an `api-keys.env` passed with `--api-keys`
+that sets `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` overrides the capability in
+the guest, so the proxy refuses those AI requests (Devbox warns); and a
+`DEVBOX_PROXY_URL` naming a host address other than `host.lima.internal` needs a
+matching `"listen"` address. A gateway that authenticates guest-supplied keys
+(LiteLLM and similar) should keep its own keys in a `proxy-env` template rather
+than the box capability.
 
 ## Heavier off-the-shelf alternatives
 

@@ -52,19 +52,16 @@ argument concerns only access through Devbox's configured proxy routes.
 The current implementation boundary is deliberately narrower than a
 per-guest-credential design:
 
-- The host proxy is shared across locally started Devboxes and its listener may
-  bind broadly so Lima guests can reach it.
-- AI routes do not currently require a short-lived, per-guest capability. The
-  separate GitHub and generic traffic-audit routes have their own capability
-  mechanisms, but those do not protect AI routes.
+- The host proxy is shared across locally started Devboxes. It listens on host
+  loopback by default, which Lima guests reach as `host.lima.internal`.
+- AI routes require a per-box capability that the host can revoke by deleting
+  its registration (destroying the box, or `--no-auth`). The separate GitHub
+  and generic traffic-audit routes keep their own short-lived capabilities.
 - The built-in route table is constrained, while a host operator can choose an
-  explicit custom route configuration.
+  explicit custom route configuration, including a broader `listen` address or
+  `"ai_client_auth": "none"`; the proxy warns when either is in effect.
 
-Keep the listener on the intended host/guest boundary; use a host firewall or a
-narrower `listen` setting when the surrounding network is not fully trusted.
-Adding a short-lived, per-guest capability to AI routes would strengthen the
-same single-user boundary. `--no-auth` remains the clean removal path for
-Devbox-managed authentication.
+`--no-auth` remains the clean removal path for Devbox-managed authentication.
 
 ## Provider terms and documentation
 

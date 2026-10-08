@@ -695,7 +695,9 @@ class ProxyAuditTests(TestCase):
             def log_message(self, *_):
                 pass
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(proxy, "STATE_DIR", directory):
+            capability = proxy.issue_ai_proxy_token("devbox-audit-1234")
             audit_path = Path(directory) / "proxy-audit.jsonl"
             upstream = proxy.ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
             upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
@@ -715,7 +717,8 @@ class ProxyAuditTests(TestCase):
                      patch.object(proxy.Handler, "log_message"):
                     connection = http.client.HTTPConnection(*server.server_address, timeout=5)
                     connection.request("POST", "/v1/messages?credential=hidden", body=body,
-                                       headers={"Content-Type": "application/json"})
+                                       headers={"Content-Type": "application/json",
+                                                "x-api-key": capability})
                     response = connection.getresponse()
                     self.assertEqual(response.status, 201)
                     self.assertEqual(response.read(), b"ok")
@@ -738,6 +741,127 @@ class ProxyAuditTests(TestCase):
             self.assertEqual(event["request"]["body"]["json"]["token"], "[redacted]")
             self.assertEqual(event["response"]["status"], 201)
             self.assertEqual(event["response"]["bytes"], 2)
+            self.assertEqual(event["box"], "devbox-audit-1234")
+
+
+class AiClientAuthTests(TestCase):
+    """AI routes add host credentials only for a registered per-box capability."""
+
+    def _serve(self, directory, headers, route_auth=None):
+        seen = {}
+
+        class UpstreamHandler(proxy.BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen["headers"] = {k.lower(): v for k, v in self.headers.items()}
+                self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_):
+                pass
+
+        upstream = proxy.ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        route = {"match": "/v1/", "upstream": f"http://127.0.0.1:{upstream.server_address[1]}"}
+        if route_auth:
+            route["auth"] = route_auth
+        server = proxy.ThreadingHTTPServer(("127.0.0.1", 0), proxy.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with patch.object(proxy, "ROUTES", [route]), \
+                 patch.object(proxy, "AUDIT_PATH", str(Path(directory) / "audit.jsonl")), \
+                 patch.object(proxy.Handler, "log_message"):
+                connection = http.client.HTTPConnection(*server.server_address, timeout=5)
+                connection.request("POST", "/v1/chat", body=b"{}", headers=headers)
+                response = connection.getresponse()
+                status, body = response.status, response.read()
+                connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            upstream.shutdown()
+            upstream.server_close()
+        return status, body, seen.get("headers")
+
+    def test_requests_without_a_capability_never_reach_upstream(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(proxy, "STATE_DIR", directory):
+            proxy.issue_ai_proxy_token("devbox-x")
+            for headers in ({}, {"x-api-key": "devbox-proxy"},
+                            {"Authorization": "Bearer dbx-ai.devbox-x.forged"},
+                            {"x-api-key": "dbx-ai.../etc/passwd.x"}):
+                status, body, upstream_headers = self._serve(directory, headers)
+                self.assertEqual(status, 401, headers)
+                self.assertIn(b"capability", body)
+                self.assertIsNone(upstream_headers)
+
+    def test_x_api_key_and_bearer_capabilities_are_accepted_and_never_forwarded(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(proxy, "STATE_DIR", directory):
+            capability = proxy.issue_ai_proxy_token("devbox-proj-1234")
+            for headers in ({"x-api-key": capability}, {"Authorization": f"Bearer {capability}"}):
+                status, _, upstream_headers = self._serve(directory, headers)
+                self.assertEqual(status, 200)
+                self.assertNotIn("x-api-key", upstream_headers)
+                self.assertNotIn("authorization", upstream_headers)
+            with patch.object(proxy, "resolve_github_token", return_value="host-token"):
+                status, _, upstream_headers = self._serve(
+                    directory, {"x-api-key": capability}, {"source": "auto:github"})
+            self.assertEqual(status, 200)
+            self.assertEqual(upstream_headers["authorization"], "Bearer host-token")
+            self.assertNotIn("x-api-key", upstream_headers)
+
+    def test_mixed_duplicate_or_foreign_capabilities_are_refused(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(proxy, "STATE_DIR", directory):
+            box_a = proxy.issue_ai_proxy_token("devbox-a")
+            box_b = proxy.issue_ai_proxy_token("devbox-b")
+            for headers in ({"x-api-key": box_a, "Authorization": f"Bearer {box_b}"},
+                            {"x-api-key": box_a, "Authorization": "Bearer dbx-ai.devbox-a.forged"},
+                            {"x-api-key": box_a, "X-Other": box_b}):
+                status, _, upstream_headers = self._serve(directory, headers)
+                self.assertEqual(status, 401, headers)
+                self.assertIsNone(upstream_headers)
+            # Both copies of one box's capability authenticate and neither is forwarded.
+            status, _, upstream_headers = self._serve(
+                directory, {"x-api-key": box_a, "Authorization": f"Bearer {box_a}"})
+            self.assertEqual(status, 200)
+            self.assertFalse(any("dbx-ai." in value for value in upstream_headers.values()))
+
+    def test_websocket_upgrade_without_a_capability_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(proxy, "STATE_DIR", directory):
+            status, _, upstream_headers = self._serve(
+                directory, {"Upgrade": "websocket", "Connection": "Upgrade"})
+        self.assertEqual(status, 401)
+        self.assertIsNone(upstream_headers)
+
+    def test_revocation_and_reissue(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(proxy, "STATE_DIR", directory):
+            first = proxy.issue_ai_proxy_token("devbox-proj-1234")
+            # Re-entering a kept box must not invalidate its running agents.
+            self.assertEqual(proxy.issue_ai_proxy_token("devbox-proj-1234"), first)
+            registration = Path(proxy.ai_proxy_registration_path("devbox-proj-1234"))
+            self.assertEqual(registration.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(registration.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(proxy.ai_proxy_token_box(first), "devbox-proj-1234")
+            # Another box's secret does not authenticate this box.
+            other_secret = proxy.issue_ai_proxy_token("devbox-other").rsplit(".", 1)[1]
+            self.assertIsNone(proxy.ai_proxy_token_box(f"dbx-ai.devbox-proj-1234.{other_secret}"))
+            proxy.revoke_ai_proxy_token("devbox-proj-1234")
+            self.assertIsNone(proxy.ai_proxy_token_box(first))
+            second = proxy.issue_ai_proxy_token("devbox-proj-1234")
+            self.assertNotEqual(second, first)
+            self.assertIsNone(proxy.ai_proxy_token_box(first))
+            with self.assertRaises(ValueError):
+                proxy.issue_ai_proxy_token("../escape")
+
+    def test_open_mode_is_explicit_and_loopback_is_the_default(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(proxy, "STATE_DIR", directory), \
+             patch.object(proxy, "AI_CLIENT_AUTH", "none"):
+            status, _, _ = self._serve(directory, {})
+        self.assertEqual(status, 200)
+        self.assertEqual(proxy.CONFIG.get("listen"), "127.0.0.1:4141")
+        self.assertEqual(proxy.AI_CLIENT_AUTH, "devbox")
 
 
 class TrafficProxyTests(TestCase):
