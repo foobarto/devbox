@@ -92,9 +92,9 @@ agent paths and restarts once to remove the host mount completely.
 ## Credential proxy
 
 `--proxy` is a **request capability** whose primary security goal is preventing
-credential exfiltration. The guest is configured with routing markers and a
-host proxy endpoint; the host proxy reads or refreshes the real credentials and
-injects them per request. For the built-in Claude, Codex, and GitHub paths, the
+credential exfiltration. The guest is configured with a host proxy endpoint and
+a per-box Devbox capability in place of provider API keys; the host proxy reads
+or refreshes the real credentials and injects them per request. For the built-in Claude, Codex, and GitHub paths, the
 guest does not receive an access or refresh token. The GitHub wrapper also
 rejects guest-side token-changing `gh auth` commands. See the [proxy
 design](../proxy/README.md).
@@ -119,10 +119,14 @@ allowed API calls while the capability is active. Treat prompt text, source
 code, files uploaded by a CLI, and remote mutations as data/actions the agent
 may send or perform under the host account's provider permissions.
 
-The host proxy is shared across Devboxes. Its default listener is reachable by
-guests through Lima's host gateway and may bind broadly so that routing works.
-Use a host firewall or a narrower configured `listen` interface when the host
-network is not fully trusted. Do not expose the proxy to untrusted networks.
+The host proxy is shared across Devboxes. It listens on host loopback by
+default; Lima delivers guest connections to `host.lima.internal` there. AI
+routes add host credentials only to requests that carry a registered per-box
+capability (`dbx-ai.<box>.<secret>`, exported as the guest's
+`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`). The secret exists only in an owner-only
+host file; destroying the box or `--no-auth` deletes it and revokes the
+capability. A configuration that sets `"listen"` beyond loopback or
+`"ai_client_auth": "none"` widens this boundary; the proxy warns at startup.
 
 Without `--proxy`, an in-Devbox agent has no Devbox-managed access to host AI
 or GitHub credentials. An agent running on the host can invoke the authenticated
@@ -178,7 +182,7 @@ Devbox answers the AI CLIs' own first-run gates for you, on every run:
 | Claude Code folder trust | `projects."DIR".hasTrustDialogAccepted` |
 | Claude Code custom API key | the approval for whatever `ANTHROPIC_API_KEY` the guest resolves |
 | Codex folder trust | `[projects."DIR"] trust_level = "trusted"` in `$CODEX_HOME/config.toml` |
-| Codex sign-in picker | an api-key-mode `auth.json` holding the same dummy routing marker already exported as `OPENAI_API_KEY` |
+| Codex sign-in picker | an api-key-mode `auth.json` holding the value already exported as `OPENAI_API_KEY` (the box's proxy capability under `--proxy`) |
 
 The reasoning is that these dialogs ask a question the operator has already
 answered. Choosing to start a Devbox for a directory *is* the decision to run an
@@ -231,8 +235,8 @@ Devbox should still be treated as able to use the capabilities you selected.
 1. Start with no optional capability; add only the one required for the task.
 2. For `--ssh-agent`, load only a restricted key and use confirmation or a
    short key lifetime where practical.
-3. For `--proxy`, trust the code that can send requests and firewall the host
-   listener to the intended guest/network boundary.
+3. For `--proxy`, trust the code that can send requests, and keep the host
+   listener on loopback (the default).
 4. For `--gui`, trust the application with host-desktop access; see the
    [GUI forwarding security guide](gui-security.md).
 5. Remove a capability when finished: exit and destroy the disposable box, or

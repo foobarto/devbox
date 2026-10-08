@@ -1,5 +1,6 @@
 {
-  "listen": "0.0.0.0:4141",
+  "listen": "127.0.0.1:4141",
+  "ai_client_auth": "devbox",
 
   "_notes": [
     "Routes are matched top-to-bottom by URL-path prefix; list the most",
@@ -12,7 +13,11 @@
     "  auto:github                   host GH_TOKEN or `gh auth token`",
     "Point the box's env at this proxy (devbox --proxy handles it):",
     "  ANTHROPIC_BASE_URL=http://host.lima.internal:4141",
-    "  OPENAI_BASE_URL=http://host.lima.internal:4141/v1"
+    "  OPENAI_BASE_URL=http://host.lima.internal:4141/v1",
+    "  ANTHROPIC_API_KEY / OPENAI_API_KEY = the box's dbx-ai.* capability",
+    "'listen' stays on loopback: Lima delivers host.lima.internal there.",
+    "'ai_client_auth': 'devbox' requires that per-box capability on AI",
+    "routes; 'none' accepts any client that can reach the listener."
   ],
 
   "audit": {

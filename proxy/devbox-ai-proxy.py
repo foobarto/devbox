@@ -58,11 +58,20 @@ try:
 except OSError:
     DEVBOX_VERSION = "unknown"
 
-LISTEN = CONFIG.get("listen", "0.0.0.0:4141")
+# Loopback by default: Lima's user-mode network delivers guest connections to
+# host.lima.internal (192.168.5.2) on the host's loopback interface, so nothing
+# beyond this machine needs to reach the proxy.
+LISTEN = CONFIG.get("listen", "127.0.0.1:4141")
 _HOST, _PORT = LISTEN.rsplit(":", 1)
 BIND_HOST = "" if _HOST in ("0.0.0.0", "*") else _HOST
 BIND_PORT = int(_PORT)
 ROUTES = CONFIG.get("routes", [])
+# "devbox" (default): an AI route adds host credentials only to a request that
+# carries a registered per-box capability in its API-key header. "none" restores
+# the old open behaviour for a proxy that only trusted clients can reach.
+AI_CLIENT_AUTH = CONFIG.get("ai_client_auth", "devbox")
+if AI_CLIENT_AUTH not in ("devbox", "none"):
+    raise SystemExit('proxy config "ai_client_auth" must be "devbox" or "none"')
 STATE_DIR = os.path.expanduser(
     os.environ.get("DEVBOX_PROXY_STATE_DIR", os.path.join("~", ".config", "devbox"))
 )
@@ -251,6 +260,7 @@ def build_audit_event(
     *, method: str, target: str, upstream, body: bytes | None, content_type: str,
     source: str, provider: str, client: str, status: int, duration_ms: int,
     response_bytes: int = 0, attempts: int = 1, error: str = "", websocket: bool = False,
+    box: str = "",
 ) -> dict:
     path, query_keys = audit_request_target(target)
     action, mutating = audit_action(method, path, body)
@@ -267,6 +277,7 @@ def build_audit_event(
         "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "source": source,
         "client": client,
+        "box": box or None,
         "upstream": {"scheme": upstream.scheme, "host": upstream.hostname, "port": upstream.port},
         "provider": provider or None,
         "request": request,
@@ -1043,6 +1054,109 @@ def github_proxy_registration_dir() -> str:
     return os.path.join(STATE_DIR, "gh-proxy-boxes")
 
 
+AI_PROXY_TOKEN_PREFIX = "dbx-ai."
+
+
+def ai_proxy_registration_path(name: str) -> str:
+    if not _LIMA_INSTANCE_NAME.fullmatch(name):
+        raise ValueError(f"invalid Lima instance name: {name!r}")
+    return os.path.join(STATE_DIR, "ai-proxy-boxes", f"{name}.key")
+
+
+def issue_ai_proxy_token(name: str) -> str:
+    """Return the box's AI-route capability, registering one if it has none.
+
+    The capability names the box and carries a random secret that exists only
+    in its owner-only host registration. Re-issuing for a registered box returns
+    the same value, so re-entering a kept box never invalidates the agents
+    already running in its other shells; deleting the registration (destroy,
+    --no-auth) revokes it at once.
+    """
+    path = ai_proxy_registration_path(name)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    existing = _read_ai_proxy_secret(path)
+    if existing:
+        return f"{AI_PROXY_TOKEN_PREFIX}{name}.{existing}"
+    # Write a complete file, then link it into place: link() fails rather than
+    # replacing a registration a concurrent devbox run created first, and no
+    # reader can ever observe a half-written secret.
+    secret = _base64url(secrets.token_bytes(32))
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as registration:
+            registration.write(secret + "\n")
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            existing = _read_ai_proxy_secret(path)
+            if not existing:
+                raise OSError(f"unreadable AI proxy registration: {path}")
+            return f"{AI_PROXY_TOKEN_PREFIX}{name}.{existing}"
+    finally:
+        os.unlink(temporary)
+    return f"{AI_PROXY_TOKEN_PREFIX}{name}.{secret}"
+
+
+def _read_ai_proxy_secret(path: str) -> str:
+    try:
+        with open(path, encoding="ascii") as registration:
+            return registration.read(256).strip()
+    except (OSError, UnicodeError):
+        return ""
+
+
+def revoke_ai_proxy_token(name: str) -> None:
+    try:
+        os.unlink(ai_proxy_registration_path(name))
+    except FileNotFoundError:
+        pass
+
+
+def ai_proxy_token_box(token: str) -> str | None:
+    """Return the registered box a presented AI capability belongs to."""
+    if not token.startswith(AI_PROXY_TOKEN_PREFIX):
+        return None
+    name, separator, secret = token[len(AI_PROXY_TOKEN_PREFIX):].rpartition(".")
+    if not separator or not secret or not _LIMA_INSTANCE_NAME.fullmatch(name):
+        return None
+    expected = _read_ai_proxy_secret(ai_proxy_registration_path(name))
+    if not expected or not hmac.compare_digest(expected.encode(), secret.encode()):
+        return None
+    return name
+
+
+def ai_request_box(headers) -> tuple[str, set[str]] | None:
+    """Find the box capability in the API-key headers an AI client sends.
+
+    Claude-compatible clients send it as `x-api-key`; OpenAI-compatible
+    clients, Codex's ChatGPT backend, and ANTHROPIC_AUTH_TOKEN use a bearer
+    `Authorization` header. Returns the box and the (lowercase) names of every
+    header carrying any Devbox capability, none of which is forwarded upstream.
+    A request presenting capabilities of two different boxes, or an invalid one
+    beside a valid one, is refused.
+    """
+    boxes = set()
+    carriers = set()
+    for name, value in headers.items():
+        if AI_PROXY_TOKEN_PREFIX not in value:
+            continue
+        carriers.add(name.lower())
+        candidate = value.strip()
+        if name.lower() == "authorization" and candidate[:7].lower() == "bearer ":
+            candidate = candidate[7:].strip()
+        elif name.lower() != "x-api-key":
+            return None
+        box = ai_proxy_token_box(candidate)
+        if not box:
+            return None
+        boxes.add(box)
+    if len(boxes) != 1:
+        return None
+    return boxes.pop(), carriers
+
+
 def registered_github_proxy_boxes() -> dict[str, str]:
     """Return host-approved Lima box names and their bare proxy endpoints."""
     directory = github_proxy_registration_dir()
@@ -1596,7 +1710,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/_devbox"):
             # Feature markers let bin/devbox restart an older daemon after an
             # upgrade (see PROXY_REQUIRED_FEATURE there). Only ever append.
-            body = b"devbox-ai-proxy ok gh-self-renewal gh-ca-renewal\n"
+            body = b"devbox-ai-proxy ok gh-self-renewal gh-ca-renewal ai-client-auth\n"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
@@ -1622,6 +1736,39 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, "no matching route")
             return
         up = urlsplit(route["upstream"])
+        box = ""
+        capability_headers: set[str] = set()
+        if not github_host and AI_CLIENT_AUTH == "devbox":
+            # Checked before the body is read or any host credential resolved:
+            # the listener may be reachable by more than the intended guest.
+            identified = ai_request_box(self.headers)
+            if identified:
+                box, capability_headers = identified
+            else:
+                message = (
+                    b'{"type":"error","error":{"type":"authentication_error","message":'
+                    b'"Devbox proxy capability missing or revoked; re-run devbox --proxy"}}'
+                )
+                self.send_response(401, "Devbox proxy capability required")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(message)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                try:
+                    self.wfile.write(message)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                self.close_connection = True
+                try:
+                    write_audit_event(build_audit_event(
+                        method=self.command, target=self.path, upstream=up, body=None,
+                        content_type="", source="auth-proxy", provider="",
+                        client=self.client_address[0] if self.client_address else "",
+                        status=401, duration_ms=0, error="client-capability-missing",
+                    ))
+                except Exception as exc:
+                    sys.stderr.write(f"[devbox-ai-proxy] audit write failed: {exc}\n")
+                return
 
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else None
@@ -1649,11 +1796,14 @@ class Handler(BaseHTTPRequestHandler):
                     attempts=attempts,
                     error=error,
                     websocket=websocket,
+                    box=box,
                 ))
             except Exception as exc:
                 sys.stderr.write(f"[devbox-ai-proxy] audit write failed: {exc}\n")
 
-        strip = {h.lower() for h in (route.get("strip_headers") or [])}
+        # The box capability authenticates only this proxy; it never travels on,
+        # even through a custom route that injects no host credential.
+        strip = {h.lower() for h in (route.get("strip_headers") or [])} | capability_headers
         incoming_headers = {
             k: v for k, v in self.headers.items()
             if k.lower() not in DROP and k.lower() not in strip
@@ -1884,6 +2034,15 @@ def main():
     if args == ["--new-traffic-proxy-token"]:
         print(issue_traffic_proxy_token())
         return
+    if len(args) == 2 and args[0] in ("--ai-proxy-token", "--revoke-ai-proxy-token"):
+        try:
+            if args[0] == "--ai-proxy-token":
+                print(issue_ai_proxy_token(args[1]))
+            else:
+                revoke_ai_proxy_token(args[1])
+        except (ValueError, OSError) as exc:
+            raise SystemExit(str(exc)) from exc
+        return
     if args == ["--refresh-gh-proxy-boxes"]:
         try:
             summary = refresh_registered_github_proxy_boxes(force=True)
@@ -1922,6 +2081,16 @@ def main():
         "[devbox-ai-proxy] listening on %s:%d  (config: %s, %d route(s))\n"
         % (_HOST, BIND_PORT, CONFIG_PATH, len(ROUTES))
     )
+    if _HOST not in ("127.0.0.1", "localhost", "::1"):
+        sys.stderr.write(
+            "[devbox-ai-proxy] WARNING: listening beyond loopback; other machines "
+            "may reach this proxy. Prefer \"listen\": \"127.0.0.1:%d\".\n" % BIND_PORT
+        )
+    if AI_CLIENT_AUTH == "none":
+        sys.stderr.write(
+            "[devbox-ai-proxy] WARNING: ai_client_auth is \"none\"; any client that "
+            "reaches this proxy can use the host AI credentials.\n"
+        )
     threading.Thread(
         target=maintain_oauth_sessions,
         name="devbox-oauth-refresh",

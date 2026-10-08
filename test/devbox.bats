@@ -596,17 +596,20 @@ print("" if d is None else d)' "$1"
 @test "a proxy-env template substitutes the URL as plain text, never as a sed program" {
   mkdir -p "$BATS_TEST_TMPDIR/config"
   CONFIG_DIR="$BATS_TEST_TMPDIR/config"
-  printf 'export ANTHROPIC_BASE_URL=__PROXY_URL__\nexport X="a&b|c"\n' > "$CONFIG_DIR/proxy-env"
+  printf 'export ANTHROPIC_BASE_URL=__PROXY_URL__\nexport X="a&b|c"\nexport ANTHROPIC_API_KEY=__PROXY_TOKEN__\n' > "$CONFIG_DIR/proxy-env"
   rendered="$BATS_TEST_TMPDIR/rendered"
   limactl() {
     # Read stdin only for the profile under test: other calls may have none.
     if [[ "$*" == *zz-devbox-10-proxy.sh* ]]; then cat > "$rendered"; fi
     return 0
   }
-  proxy_launcher() { return 1; }
+  printf '#!/bin/sh\n[ "$1" = --ai-proxy-token ] && echo "dbx-ai.$2.c2VjcmV0" || exit 1\n' > "$BATS_TEST_TMPDIR/launcher"
+  chmod +x "$BATS_TEST_TMPDIR/launcher"
+  proxy_launcher() { printf '%s' "$BATS_TEST_TMPDIR/launcher"; }
   run apply_proxy box 'http://host.lima.internal:4141'
   [ "$(sed -n 1p "$rendered")" = 'export ANTHROPIC_BASE_URL=http://host.lima.internal:4141' ]
   [ "$(sed -n 2p "$rendered")" = 'export X="a&b|c"' ]
+  [ "$(sed -n 3p "$rendered")" = 'export ANTHROPIC_API_KEY=dbx-ai.box.c2VjcmV0' ]
 
   # apply_proxy validates its own input too: a sed-program URL never renders.
   rm -f "$rendered"
@@ -658,6 +661,69 @@ print("" if d is None else d)' "$1"
   PROXY_FEATURES="" run proxy_ensure http://host.lima.internal:4141
   [ -e "$stop_log" ]
   [[ "$output" == *"Restarting the older host credential proxy"* ]]
+}
+
+@test "the default proxy profile carries the box capability, not a shared marker" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR/config"; mkdir -p "$CONFIG_DIR"
+  rendered="$BATS_TEST_TMPDIR/rendered"
+  limactl() { if [[ "$*" == *zz-devbox-10-proxy.sh* ]]; then cat > "$rendered"; fi; return 0; }
+  printf '#!/bin/sh\n[ "$1" = --ai-proxy-token ] && echo "dbx-ai.$2.c2VjcmV0" || exit 1\n' > "$BATS_TEST_TMPDIR/launcher"
+  chmod +x "$BATS_TEST_TMPDIR/launcher"
+  proxy_launcher() { printf '%s' "$BATS_TEST_TMPDIR/launcher"; }
+  run apply_proxy devbox-proj-1 'http://host.lima.internal:4141'
+  grep -Fxq 'export ANTHROPIC_API_KEY="dbx-ai.devbox-proj-1.c2VjcmV0"' "$rendered"
+  grep -Fxq 'export OPENAI_API_KEY="dbx-ai.devbox-proj-1.c2VjcmV0"' "$rendered"
+  ! grep -q 'devbox-proxy' "$rendered"
+
+  # A launcher that cannot issue a well-formed capability stops the run.
+  printf '#!/bin/sh\necho "not a token; rm -rf"\n' > "$BATS_TEST_TMPDIR/launcher"
+  rm -f "$rendered"
+  run apply_proxy devbox-proj-1 'http://host.lima.internal:4141'
+  [ "$status" -ne 0 ]
+  [ ! -e "$rendered" ]
+}
+
+@test "destroy, cleanup, and --no-auth revoke the box's AI proxy capability" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR/config"
+  mkdir -p "$CONFIG_DIR/ai-proxy-boxes"
+  limactl() { return 0; }
+  for name in devbox-a devbox-b devbox-c; do echo secret > "$CONFIG_DIR/ai-proxy-boxes/$name.key"; done
+
+  cmd_destroy devbox-a
+  [ ! -e "$CONFIG_DIR/ai-proxy-boxes/devbox-a.key" ]
+
+  clear_auth devbox-b
+  [ ! -e "$CONFIG_DIR/ai-proxy-boxes/devbox-b.key" ]
+
+  run bash -c "source '$DEVBOX'; set +u; CONFIG_DIR='$CONFIG_DIR'; limactl() { return 0; }
+    _DB_NAME=devbox-c _DB_KEEP=0; run_cleanup"
+  [ ! -e "$CONFIG_DIR/ai-proxy-boxes/devbox-c.key" ]
+
+  run ai_proxy_token_path "../escape"
+  [ "$status" -ne 0 ]
+}
+
+@test "proxy registrations follow the proxy's own state directory" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR/config"
+  [[ "$(ai_proxy_token_path devbox-a)" == "$CONFIG_DIR/ai-proxy-boxes/devbox-a.key" ]]
+  DEVBOX_PROXY_STATE_DIR="$BATS_TEST_TMPDIR/proxy-state"
+  [[ "$(ai_proxy_token_path devbox-a)" == "$BATS_TEST_TMPDIR/proxy-state/ai-proxy-boxes/devbox-a.key" ]]
+  [[ "$(gh_proxy_state_path devbox-a)" == "$BATS_TEST_TMPDIR/proxy-state/gh-proxy-boxes/devbox-a.url" ]]
+  [[ "$(traffic_proxy_state_path devbox-a)" == "$BATS_TEST_TMPDIR/proxy-state/traffic-proxy-boxes/devbox-a.url" ]]
+  mkdir -p "$DEVBOX_PROXY_STATE_DIR/ai-proxy-boxes"
+  echo secret > "$DEVBOX_PROXY_STATE_DIR/ai-proxy-boxes/devbox-a.key"
+  revoke_ai_proxy_token devbox-a
+  [ ! -e "$DEVBOX_PROXY_STATE_DIR/ai-proxy-boxes/devbox-a.key" ]
+  unset DEVBOX_PROXY_STATE_DIR
+}
+
+@test "agent trust seeding keeps API keys out of process arguments" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" != *'"$1" "${2:-}"'* ]]
+  key="dbx-ai.devbox-proj.0123456789abcdefghij"
+  run bash -c "source '$DEVBOX'; set +u; printf '{}' | claude_trust_config /proj '$key'"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"\"${key: -20}\""* ]]
 }
 
 @test "GitHub proxy URL carries its capability as HTTP proxy userinfo" {
