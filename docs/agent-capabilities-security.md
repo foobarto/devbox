@@ -35,7 +35,8 @@ read-write so resumable transcripts survive clone deletion; use
 |---|---|---|
 | Persistent AI sessions (default) | Read and modify this project's Devbox-managed Claude, Codex, OpenCode, Pi, and Stado session records across VM lifecycles. This enables native resume commands but also carries transcript instructions and tool output into future clones. | Other projects' Devbox stores, existing host agent histories, auth files, provider tokens, caches, and general host state remain unmounted. `--ephemeral-sessions` / `-e` disconnects the native session paths for that run. |
 | `--ssh-agent` / `-s` | Request authentication and signatures using identities currently loaded in the host SSH agent. This includes SSH/Git access accepted by those identities and Devbox's SSH-format Git commit signing. | It cannot read or copy the private-key material from the agent. It does not gain access to unmounted host files or a host shell. |
-| `--proxy` / `-p` | Make requests through Devbox's configured AI and GitHub routes using the host account's authentication. It can consume quotas and create, read, modify, or upload remote data to the extent the authenticated provider account permits. | It does not receive the underlying API keys, OAuth tokens, or host `gh` token. The guest runs its own CLIs; it cannot run host commands through the proxy. |
+| `--proxy` / `-p` | Make requests through Devbox's configured AI routes using the host's AI-provider logins. It can consume quotas and send prompts, code, and files to those providers. | It does not receive the underlying API keys or OAuth tokens, and it gets no GitHub access. The guest runs its own CLIs; it cannot run host commands through the proxy. |
+| `--gh-proxy` / `-H` | Use `gh` as the host's GitHub login: read, create, modify, delete, or upload anything that account can reach through `api.github.com`. | It does not receive the host `gh` token. It is never implied by `--proxy` or `-a`. |
 | `--traffic-audit` / `-T` | Send proxy-aware public web traffic through a short-lived generic CONNECT capability. Direct TCP/UDP 80/443 fails under the guest firewall; CONNECT audit records reveal destination, timing, and byte counts, while plaintext HTTP can be recorded in detail. | It grants no AI, GitHub, SSH, or host-login credential. HTTPS remains encrypted after CONNECT, and non-web ports remain outside the rule. The generic proxy refuses host/private/LAN destinations. |
 | `--gui` / `-G` | Become a Wayland client of the host session through Waypipe. | It does not receive the raw host Wayland socket or host GPU/render-device nodes. This is still a host-desktop capability, not an isolation boundary; see [GUI forwarding security](gui-security.md). |
 | `--with-agent-config` / `-g` | Read selected non-secret rules, prompts, settings, and custom agents copied into the guest. Those instructions can affect agent behavior. | Authentication state, histories, caches, key directories, and files detected as credentials are excluded. |
@@ -101,7 +102,7 @@ design](../proxy/README.md).
 
 For `gh`, the host proxy daemon renews short-lived capabilities directly for
 host-registered running Lima boxes; it does not re-evaluate project manifests or
-restart guests. `--proxy` replaces Homebrew's public `gh` link with the wrapper
+restart guests. `--gh-proxy` replaces Homebrew's public `gh` link with the wrapper
 to prevent accidental direct execution, while retaining a private executable
 copy for the wrapper itself. Because both remain executable by the guest user,
 this routing measure does not stop deliberately hostile same-user code from
@@ -129,7 +130,9 @@ capability. A configuration that sets `"listen"` beyond loopback or
 `"ai_client_auth": "none"` widens this boundary; the proxy warns at startup.
 
 Without `--proxy`, an in-Devbox agent has no Devbox-managed access to host AI
-or GitHub credentials. An agent running on the host can invoke the authenticated
+logins, and without `--gh-proxy` none to the host GitHub login. The two are
+separate trust boundaries: proxying AI requests does not let the box act as the
+host's GitHub identity. An agent running on the host can invoke the authenticated
 host CLIs directly, inspect accessible credential configuration, and modify the
 proxy's host-side configuration.
 
@@ -163,10 +166,11 @@ configuration, provider request capability, SSH-agent operations, host GUI
 access, and generic proxy-or-fail web egress. A malicious project process can
 use every enabled capability; granting one does not make the others safer.
 
-`-a` intentionally remains `--with-agent-config --proxy --ssh-agent` only.
+`-a` intentionally remains `--with-agent-config --proxy --ssh-agent` only; it
+grants AI requests but never the host GitHub login.
 GUI forwarding must be added explicitly with `--gui` or `-G`.
 
-Avoid using `-a`, `--ssh-agent`, `--proxy`, or `--gui` for unknown code unless
+Avoid using `-a`, `--ssh-agent`, `--proxy`, `--gh-proxy`, or `--gui` for unknown code unless
 you have consciously accepted their separate risks. For the narrowest
 untrusted-code environment, begin with
 `devbox --no-auth --ephemeral-sessions` and no extra mounts, copies, agent

@@ -47,17 +47,22 @@
 #   --ssh-agent, -s  forward the host SSH agent into the box (git/GitHub auth)
 #                    and configure SSH-signed commits; private keys stay host-side.
 #   --proxy[=URL], -p[=URL]
-#                    point AI CLIs and GitHub CLI at a host-side proxy (default
-#                    http://host.lima.internal:4141); real credentials stay on
-#                    the host. Auto-starts the proxy on this host if it isn't
-#                    already running (shared across boxes). See proxy/README.md.
+#                    point the AI CLIs at a host-side proxy that adds the host's
+#                    AI logins (default http://host.lima.internal:4141); the
+#                    credentials stay on the host. Auto-starts the proxy on this
+#                    host if it isn't already running (shared across boxes).
+#                    It does NOT grant GitHub access. See proxy/README.md.
+#   --gh-proxy[=URL|off], -H[=URL|off]
+#                    let the guest's `gh` act as the host's GitHub login through
+#                    the same proxy (a separate, GitHub-only grant). A kept box
+#                    keeps it until --gh-proxy=off or --no-auth removes it.
 #   --traffic-audit[=connect|off], -T
 #                    opt in to proxy-or-fail web egress. `connect` sets standard
 #                    HTTP(S) proxy variables and blocks direct TCP/UDP 80/443
 #                    from the guest, leaving the audited host proxy as the way
 #                    out. It is separate from -a and may break proxy-unaware
 #                    tools; `--traffic-audit=off` removes it from a kept box.
-#   --no-auth, -n    do not inject proxy, API-key, or copied host credentials;
+#   --no-auth, -n    do not inject AI/GitHub proxy, API-key, or copied host credentials;
 #                    also removes devbox-managed proxy/key profiles from an
 #                    existing box. This is the default for a new box.
 #   --api-keys[=F], -K[=F]
@@ -73,7 +78,8 @@
 #                    appear in the host Wayland session. With `-- APP`, run
 #                    just that GUI application instead of opening a shell.
 #                    `-g` remains --with-agent-config for compatibility.
-#   -a               shortcut for --with-agent-config --proxy --ssh-agent.
+#   -a               shortcut for --with-agent-config --proxy --ssh-agent; it
+#                    never includes --gh-proxy.
 #   --mount P[:ro|:rw], -m P[:ro|:rw]
 #                    mount an extra host path into the box at the same path
 #                    (default ro). Repeatable. Applied at box creation.
@@ -966,16 +972,25 @@ record_gh_proxy_endpoint() { # $1 Lima instance $2 bare http proxy URL
   umask 077
   install -d -m 700 "$state_dir"
   tmp="$(mktemp "$state_dir/.${name}.XXXXXX")"
-  printf '%s\n' "$url" > "$tmp"
+  # The second line marks an explicit --gh-proxy grant. Versions before the
+  # AI/GitHub split registered every --proxy box for GitHub without one; those
+  # registrations are not renewed or refreshed (see stored_gh_proxy_endpoint).
+  printf '%s\n%s\n' "$url" "$GH_PROXY_GRANT_MARKER" > "$tmp"
   chmod 600 "$tmp"
   mv -f "$tmp" "$path"
 }
 
+GH_PROXY_GRANT_MARKER="grant=gh_proxy"
+
+# Prints the remembered endpoint of an explicit GitHub grant. Returns 2 for a
+# registration written by the old combined --proxy, which never asked for
+# GitHub access separately.
 stored_gh_proxy_endpoint() { # $1 Lima instance; prints host-owned remembered endpoint
-  local path value
+  local path value marker=""
   path="$(gh_proxy_state_path "$1")"
   [[ -r "$path" ]] || return 1
-  value="$(<"$path")"
+  { IFS= read -r value; IFS= read -r marker || true; } < "$path"
+  [[ "$marker" == "$GH_PROXY_GRANT_MARKER" ]] || return 2
   # Normalized on read too: older versions remembered port-less endpoints.
   if ! value="$(proxy_endpoint "$value")"; then
     warn "ignoring invalid remembered GitHub CLI proxy endpoint for $1"
@@ -1045,7 +1060,7 @@ proxy_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/nul
 # long-lived daemon, so an upgrade leaves the old one serving until something
 # restarts it; bump this marker whenever an older daemon would be unsafe or
 # incompatible with this devbox (e.g. a CA it can no longer deliver).
-PROXY_REQUIRED_FEATURE="ai-client-auth"
+PROXY_REQUIRED_FEATURE="gh-explicit-grant"
 proxy_current_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -qw -- "$PROXY_REQUIRED_FEATURE"; }
 # is anything at all listening on the port?
 proxy_port_open() {
@@ -1123,10 +1138,13 @@ proxy_ensure() {
   else warn "proxy did not come up — see $logf"; return 1; fi
 }
 
-apply_proxy() {
-  local name="$1" url="$2" tmpl="$CONFIG_DIR/proxy-env" launcher gh_wrapper ca_path ai_token
+# --proxy and --gh-proxy are separate grants with separate trust boundaries:
+# the first lets the box spend the host's AI-provider logins, the second lets
+# it act as the host's GitHub identity. Neither implies the other.
+apply_ai_proxy() { # $1 Lima instance $2 bare http proxy URL
+  local name="$1" url="$2" tmpl="$CONFIG_DIR/proxy-env" launcher ai_token
   valid_gh_proxy_endpoint "$url" || die "proxy must be a bare http://host:port URL with a numeric port"
-  log "Wiring AI and GitHub CLIs → proxy $url"
+  log "Wiring AI CLIs → proxy $url"
   launcher="$(proxy_launcher)" || die "credential proxy launcher not found"
   # The guest's API keys are this box's revocable proxy capability, not a host
   # credential: the proxy refuses AI routes without it, so reaching the
@@ -1175,7 +1193,13 @@ print(f"openai_base_url = {json.dumps(sys.argv[1])}")
 PY
   # shellcheck disable=SC2016 # $HOME expands in the guest shell.
   limactl shell "$name" -- bash -c 'rm -f "$HOME/.devbox/codex-proxy/auth.json"'
+}
 
+apply_gh_proxy() { # $1 Lima instance $2 bare http proxy URL
+  local name="$1" url="$2" launcher gh_wrapper ca_path
+  valid_gh_proxy_endpoint "$url" || die "proxy must be a bare http://host:port URL with a numeric port"
+  log "Wiring GitHub CLI → host gh login through proxy $url"
+  launcher="$(proxy_launcher)" || die "credential proxy launcher not found"
   # gh cannot choose a custom API base URL, so its wrapper uses an HTTPS CONNECT
   # proxy. It receives a dummy token only; the host proxy replaces that marker
   # after TLS termination with the token from the host's `gh auth login`.
@@ -1223,7 +1247,7 @@ fi
 GUEST
   renew_gh_proxy_capability "$name" "$url" || die "could not issue GitHub CLI proxy capability"
   limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-12-gh-proxy.sh >/dev/null' <<EOF
-# devbox --proxy: GitHub CLI uses a host-authenticated, GitHub-only TLS proxy.
+# devbox --gh-proxy: GitHub CLI uses a host-authenticated, GitHub-only TLS proxy.
 # A function remains ahead of PATH even when a later user profile prepends
 # Homebrew.  That happens in the stock golden, and otherwise leaves the real
 # guest gh ahead of its Devbox proxy wrapper.
@@ -1243,11 +1267,9 @@ apply_api_keys() {
   limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-20-keys.sh >/dev/null' < "$file"
 }
 
-clear_auth() {
+clear_gh_proxy() { # $1 Lima instance; remove GitHub CLI proxying only
   local name="$1"
-  log "Disabling devbox-managed auth in $name"
   clear_gh_proxy_endpoint "$name"
-  revoke_ai_proxy_token "$name"
   # Restore Homebrew's public gh link only when it still points at our wrapper.
   # shellcheck disable=SC2016 # All variables expand in the guest.
   limactl shell "$name" -- bash -s <<'GUEST'
@@ -1267,15 +1289,36 @@ fi
 if [ -L "$local_shim" ] && [ "$(readlink -f "$local_shim" 2>/dev/null || true)" = "$wrapper" ]; then
   rm -f -- "$local_shim"
 fi
-sudo rm -f /etc/profile.d/zz-devbox-10-proxy.sh \
-  /etc/profile.d/zz-devbox-11-codex-proxy.sh \
-  /etc/profile.d/zz-devbox-12-gh-proxy.sh \
-  /etc/profile.d/zz-devbox-20-keys.sh
-rm -rf -- "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"
+sudo rm -f /etc/profile.d/zz-devbox-12-gh-proxy.sh
+rm -rf -- "$HOME/.devbox/gh-proxy"
 if [ "$restore_brew" -eq 1 ]; then
+  # Homebrew still records the keg as linked, so `link` alone answers "Already
+  # linked" and never recreates bin/gh; unlink first to restore every link.
+  "$brew_bin" unlink gh >/dev/null 2>&1 || true
   "$brew_bin" link --overwrite gh >/dev/null
 fi
 GUEST
+}
+
+clear_ai_proxy() { # $1 Lima instance; remove AI proxying and revoke its capability
+  local name="$1"
+  revoke_ai_proxy_token "$name"
+  # shellcheck disable=SC2016 # $HOME expands in the guest shell.
+  limactl shell "$name" -- bash -c 'sudo rm -f /etc/profile.d/zz-devbox-10-proxy.sh /etc/profile.d/zz-devbox-11-codex-proxy.sh; rm -rf -- "$HOME/.devbox/codex-proxy"'
+}
+
+clear_auth() {
+  local name="$1" failed=0
+  log "Disabling devbox-managed auth in $name"
+  # Host-side revocation first: it cannot fail on the guest's account, and it
+  # is what actually withdraws access. Guest cleanup then runs step by step,
+  # so one failing step (a Homebrew relink, say) cannot skip the rest.
+  revoke_ai_proxy_token "$name"
+  clear_gh_proxy_endpoint "$name"
+  clear_ai_proxy "$name" || failed=1
+  limactl shell "$name" -- bash -c 'sudo rm -f /etc/profile.d/zz-devbox-20-keys.sh' || failed=1
+  clear_gh_proxy "$name" || failed=1
+  [[ $failed -eq 0 ]] || die "could not remove every Devbox-managed auth profile from $name (host-side access is revoked)"
 }
 
 # ------------------------------------------------------- traffic audit egress ---
@@ -1988,7 +2031,7 @@ seed_agent_trust() { # $1 Lima instance $2 mounted project dir
     || warn "could not pre-accept the Codex directory trust prompt"
 
   # Codex shows its sign-in picker whenever auth.json is missing, which is the
-  # normal state under --proxy (apply_proxy removes it so no OAuth material
+  # normal state under --proxy (apply_ai_proxy removes it so no OAuth material
   # reaches the guest). Seed the value already exported as OPENAI_API_KEY —
   # under --proxy the box's revocable proxy capability, never a host
   # credential; the host proxy replaces it. A real auth.json copied in with
@@ -2037,7 +2080,7 @@ def reject_nul(value):
 reject_nul(data)
 
 allowed = {
-    "image", "packages", "start", "ssh_agent", "keep", "proxy", "api_keys",
+    "image", "packages", "start", "ssh_agent", "keep", "proxy", "gh_proxy", "api_keys",
     "with_creds", "with_agent_config", "no_auth", "mounts", "copies", "resources",
 }
 unknown = sorted(set(data) - allowed)
@@ -2124,7 +2167,7 @@ for key in ("ssh_agent", "keep", "with_creds", "with_agent_config", "no_auth"):
     if key in data and not isinstance(data[key], bool):
         raise SystemExit(f"{key} must be true or false")
 
-for key in ("proxy", "api_keys"):
+for key in ("proxy", "gh_proxy", "api_keys"):
     value = data.get(key, False)
     if not isinstance(value, (bool, str)) or isinstance(value, str) and not value:
         raise SystemExit(f"{key} must be true, false, or a non-empty path/URL string")
@@ -2138,19 +2181,22 @@ for key in ("mounts", "copies"):
     if any("\n" in item or "\r" in item for item in value):
         raise SystemExit(f"{key} entries must not contain newlines")
 
-proxy = data.get("proxy", False)
-if proxy is True:
-    if "\n" in proxy_default or "\r" in proxy_default:
-        raise SystemExit("the effective proxy URL must not contain newlines")
-    proxy = proxy_default
-
-if proxy is not False:
+def proxy_endpoint(key):
+    value = data.get(key, False)
+    if value is True:
+        if "\n" in proxy_default or "\r" in proxy_default:
+            raise SystemExit("the effective proxy URL must not contain newlines")
+        value = proxy_default
+    if value is False:
+        return False
     # Same whole-string, ASCII-only rule as valid_gh_proxy_endpoint.
-    match = re.fullmatch(r"http://[A-Za-z0-9.-]+(?::([0-9]{1,5}))?", proxy)
+    match = re.fullmatch(r"http://[A-Za-z0-9.-]+(?::([0-9]{1,5}))?", value)
     if not match or match.group(1) is not None and not 1 <= int(match.group(1)) <= 65535:
-        raise SystemExit("proxy must be a bare http://host:port URL with a numeric port")
-    if match.group(1) is None:
-        proxy += ":4141"
+        raise SystemExit(f"{key} must be a bare http://host:port URL with a numeric port")
+    return value if match.group(1) is not None else value + ":4141"
+
+proxy = proxy_endpoint("proxy")
+gh_proxy = proxy_endpoint("gh_proxy")
 
 api_keys = data.get("api_keys", False)
 if api_keys is True:
@@ -2186,8 +2232,8 @@ for item in data.get("copies", []):
             raise SystemExit("copy entries whose resolved host path contains a colon require an explicit destination")
         copies.append(resolved_source)
 
-if data.get("no_auth") and (data.get("proxy") or data.get("api_keys") or data.get("with_creds")):
-    raise SystemExit("no_auth cannot be combined with proxy, api_keys, or with_creds")
+if data.get("no_auth") and (data.get("proxy") or data.get("gh_proxy") or data.get("api_keys") or data.get("with_creds")):
+    raise SystemExit("no_auth cannot be combined with proxy, gh_proxy, api_keys, or with_creds")
 
 print(json.dumps({
     "image": image or "", "packages": packages, "start": start or "",
@@ -2197,7 +2243,7 @@ print(json.dumps({
     "cpus": cpus or "", "memory": resources.get("memory", ""),
     "disk": resources.get("disk", ""),
     "ssh_agent": data.get("ssh_agent", False), "keep": data.get("keep", False),
-    "proxy": proxy, "api_keys": api_keys,
+    "proxy": proxy, "gh_proxy": gh_proxy, "api_keys": api_keys,
     "with_creds": data.get("with_creds", False),
     "with_agent_config": data.get("with_agent_config", False),
     "no_auth": data.get("no_auth", False),
@@ -2260,7 +2306,10 @@ if data["with_agent_config"]:
 
 proxy = data["proxy"]
 if proxy is not False:
-    emit("proxy", f"Enable the host-side AI authentication proxy: {proxy}")
+    emit("proxy", f"Let AI CLIs use the host's AI logins through the proxy: {proxy}")
+gh_proxy = data["gh_proxy"]
+if gh_proxy is not False:
+    emit("gh-proxy", f"Let gh act as the host's GitHub login through the proxy: {gh_proxy}")
 api_keys = data["api_keys"]
 if api_keys is not False:
     emit("credentials", f"Copy API keys into the box from: {api_keys}")
@@ -2434,7 +2483,8 @@ manifest_request_style() { # $1 request type -> icon<TAB>heading
     ssh)            printf '🔑\tSSH agent' ;;
     keep)           printf '📌\tBox lifecycle' ;;
     agent-config)   printf '🤖\tAgent configuration' ;;
-    proxy)          printf '🌐\tAuthentication proxy' ;;
+    proxy)          printf '🌐\tAI authentication proxy' ;;
+    gh-proxy)       printf '🐙\tGitHub identity (host gh login)' ;;
     credentials)    printf '🔐\tCredentials' ;;
     no-auth)        printf '🔒\tAuthentication' ;;
     mount-ro)       printf '📂\tRead-only host mount' ;;
@@ -2856,6 +2906,7 @@ run_cleanup() {
 
 cmd_run() {
   local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 with_agent_config=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name="" gui=0 traffic_audit="" ephemeral_sessions=0
+  local gh_proxy="" no_gh_proxy=0
   local extra_mounts=() extra_copies=() manifest_requests=() gui_command=()
   local cli_cpus="" cli_memory="" cli_disk=""
   local golden_digest="" golden_provision="" golden_provision_user=""
@@ -2881,6 +2932,10 @@ cmd_run() {
       --api-keys=*|-K=*) api_keys="$(abspath "${1#*=}")";;
       --proxy|-p) proxy="$PROXY_DEFAULT_URL";;
       --proxy=*|-p=*) proxy="${1#*=}";;
+      --gh-proxy|-H) gh_proxy="$PROXY_DEFAULT_URL";;
+      --gh-proxy=off|-H=off) no_gh_proxy=1; gh_proxy="";;
+      --gh-proxy=|-H=) die "--gh-proxy= needs a proxy URL or off";;
+      --gh-proxy=*|-H=*) gh_proxy="${1#*=}";;
       --traffic-audit|-T) traffic_audit=connect;;
       --traffic-audit=*|-T=*) traffic_audit="${1#*=}";;
       --mount|-m) shift; extra_mounts+=("${1:?--mount needs PATH[:ro|:rw]}");;
@@ -2917,7 +2972,7 @@ cmd_run() {
       || die "$PROJECT_MANIFEST_NAME changed while it was being read; run devbox again"
     manifest_semantics="$(manifest_semantics_fingerprint "$manifest")" \
       || die "could not normalize $PROJECT_MANIFEST_NAME"
-    local manifest_image manifest_proxy manifest_api_keys manifest_mounts manifest_copies item
+    local manifest_image manifest_proxy manifest_gh_proxy manifest_api_keys manifest_mounts manifest_copies item
     manifest_image="$(manifest_value "$manifest" image)"
     if [[ $image_set -eq 0 && -n "$manifest_image" ]]; then
       image="$manifest_image"
@@ -2949,6 +3004,10 @@ cmd_run() {
       if [[ -z "$proxy" && "$manifest_proxy" != False ]]; then
         proxy="$manifest_proxy"
       fi
+      manifest_gh_proxy="$(manifest_value "$manifest" gh_proxy)"
+      if [[ -z "$gh_proxy" && $no_gh_proxy -eq 0 && "$manifest_gh_proxy" != False ]]; then
+        gh_proxy="$manifest_gh_proxy"
+      fi
       manifest_api_keys="$(manifest_value "$manifest" api_keys)"
       if [[ -z "$api_keys" && "$manifest_api_keys" != False ]]; then
         api_keys="$manifest_api_keys"
@@ -2972,12 +3031,17 @@ cmd_run() {
       extra_copies+=("$item")
     done < <(python3 -c 'import json, sys; print(*json.load(sys.stdin), sep="\n")' <<< "$manifest_copies")
   fi
-  if [[ $no_auth -eq 1 && ( -n "$proxy" || -n "$api_keys" || $with_creds -eq 1 ) ]]; then
-    die "--no-auth cannot be combined with --proxy, --api-keys, or --with-creds"
+  if [[ $no_auth -eq 1 && ( -n "$proxy" || -n "$gh_proxy" || -n "$api_keys" || $with_creds -eq 1 ) ]]; then
+    die "--no-auth cannot be combined with --proxy, --gh-proxy, --api-keys, or --with-creds"
   fi
+  [[ $no_gh_proxy -eq 0 || -z "$gh_proxy" ]] || die "--gh-proxy=off cannot be combined with --gh-proxy"
   if [[ -n "$proxy" ]]; then
     proxy="$(proxy_endpoint "$proxy")" \
       || die "proxy must be a bare http://host:port URL with a numeric port"
+  fi
+  if [[ -n "$gh_proxy" ]]; then
+    gh_proxy="$(proxy_endpoint "$gh_proxy")" \
+      || die "gh proxy must be a bare http://host:port URL with a numeric port"
   fi
   if [[ -n "$manifest" ]]; then
     confirm_manifest_permissions "$manifest_path" "$manifest_digest" \
@@ -3086,22 +3150,44 @@ cmd_run() {
   [[ -z "$manifest" ]] \
     || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
 
-  local managed_proxy=""
+  local managed_gh_proxy=""
   if [[ $no_auth -eq 1 ]]; then
     clear_auth "$name"
   else
-    managed_proxy="$proxy"
-    if [[ -z "$managed_proxy" && $preexisting -eq 1 ]]; then
-      managed_proxy="$(stored_gh_proxy_endpoint "$name" || true)"
-      [[ -z "$managed_proxy" ]] || log "Refreshing remembered GitHub CLI proxy for $name"
+    if [[ -n "$proxy" ]]; then
+      proxy_ensure "$proxy" || die "could not start credential proxy"
+      apply_ai_proxy "$name" "$proxy"
     fi
-    [[ -z "$managed_proxy" ]] || {
-      proxy_ensure "$managed_proxy" || die "could not start credential proxy"
-      apply_proxy "$name" "$managed_proxy"
-    }
+    if [[ $no_gh_proxy -eq 1 ]]; then
+      if [[ $preexisting -eq 1 ]]; then
+        log "Removing GitHub CLI proxying from $name"
+        clear_gh_proxy "$name"
+      fi
+    else
+      managed_gh_proxy="$gh_proxy"
+      # A kept box keeps the GitHub grant it was given until --gh-proxy=off or
+      # --no-auth removes it; its capability is refreshed on every entry.
+      if [[ -z "$managed_gh_proxy" && $preexisting -eq 1 ]]; then
+        local stored_status=0
+        managed_gh_proxy="$(stored_gh_proxy_endpoint "$name")" || stored_status=$?
+        if [[ $stored_status -eq 2 ]]; then
+          # Wired by the old combined --proxy, never granted on its own: remove
+          # it rather than keep the box acting as the host GitHub identity.
+          managed_gh_proxy=""
+          warn "$name had GitHub CLI access from an older --proxy; removing it (grant it again with --gh-proxy)"
+          clear_gh_proxy "$name"
+        elif [[ -n "$managed_gh_proxy" ]]; then
+          log "Refreshing remembered GitHub CLI proxy for $name (remove with --gh-proxy=off)"
+        fi
+      fi
+      if [[ -n "$managed_gh_proxy" ]]; then
+        proxy_ensure "$managed_gh_proxy" || die "could not start credential proxy"
+        apply_gh_proxy "$name" "$managed_gh_proxy"
+      fi
+    fi
     if [[ -n "$api_keys" ]]; then
       [[ -z "$manifest" ]] || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
-      if [[ -n "$managed_proxy" && -f "$api_keys" ]] \
+      if [[ -n "$proxy" && -f "$api_keys" ]] \
          && grep -Eq '^[[:space:]]*(export[[:space:]]+)?(ANTHROPIC|OPENAI)_API_KEY=' "$api_keys"; then
         warn "$api_keys sets ANTHROPIC_API_KEY/OPENAI_API_KEY, overriding the box's proxy capability; Devbox's proxy will refuse those AI requests"
       fi
@@ -3122,7 +3208,7 @@ cmd_run() {
     off) clear_connect_traffic_audit "$name";;
     connect)
       [[ -n "$traffic_proxy_endpoint" ]] || \
-        traffic_proxy_endpoint="$(proxy_endpoint "${proxy:-$PROXY_DEFAULT_URL}")" \
+        traffic_proxy_endpoint="$(proxy_endpoint "${proxy:-${gh_proxy:-$PROXY_DEFAULT_URL}}")" \
         || die "proxy must be a bare http://host:port URL with a numeric port"
       proxy_ensure "$traffic_proxy_endpoint" || die "could not start traffic proxy"
       apply_connect_traffic_audit "$name" "$traffic_proxy_endpoint";;

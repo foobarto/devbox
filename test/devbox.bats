@@ -425,11 +425,15 @@ print("" if d is None else d)' "$1"
 @test "remembered proxy endpoints from older versions gain an explicit port" {
   CONFIG_DIR="$BATS_TEST_TMPDIR/config"
   mkdir -p "$CONFIG_DIR/gh-proxy-boxes" "$CONFIG_DIR/traffic-proxy-boxes"
-  printf 'http://host.lima.internal\n' > "$CONFIG_DIR/gh-proxy-boxes/box.url"
+  printf 'http://host.lima.internal\ngrant=gh_proxy\n' > "$CONFIG_DIR/gh-proxy-boxes/box.url"
   printf 'http://host.lima.internal\n' > "$CONFIG_DIR/traffic-proxy-boxes/box.url"
   [ "$(stored_gh_proxy_endpoint box)" = "http://host.lima.internal:4141" ]
+  # A registration from the old combined --proxy has no grant marker.
+  printf 'http://host.lima.internal:4141\n' > "$CONFIG_DIR/gh-proxy-boxes/legacy.url"
+  run stored_gh_proxy_endpoint legacy
+  [ "$status" -eq 2 ]
   [ "$(stored_traffic_proxy_endpoint box)" = "http://host.lima.internal:4141" ]
-  printf 'http://h:1;x\n' > "$CONFIG_DIR/gh-proxy-boxes/box.url"
+  printf 'http://h:1;x\ngrant=gh_proxy\n' > "$CONFIG_DIR/gh-proxy-boxes/box.url"
   run stored_gh_proxy_endpoint box
   [ "$status" -ne 0 ]
 }
@@ -606,14 +610,14 @@ print("" if d is None else d)' "$1"
   printf '#!/bin/sh\n[ "$1" = --ai-proxy-token ] && echo "dbx-ai.$2.c2VjcmV0" || exit 1\n' > "$BATS_TEST_TMPDIR/launcher"
   chmod +x "$BATS_TEST_TMPDIR/launcher"
   proxy_launcher() { printf '%s' "$BATS_TEST_TMPDIR/launcher"; }
-  run apply_proxy box 'http://host.lima.internal:4141'
+  run apply_ai_proxy box 'http://host.lima.internal:4141'
   [ "$(sed -n 1p "$rendered")" = 'export ANTHROPIC_BASE_URL=http://host.lima.internal:4141' ]
   [ "$(sed -n 2p "$rendered")" = 'export X="a&b|c"' ]
   [ "$(sed -n 3p "$rendered")" = 'export ANTHROPIC_API_KEY=dbx-ai.box.c2VjcmV0' ]
 
   # apply_proxy validates its own input too: a sed-program URL never renders.
   rm -f "$rendered"
-  run apply_proxy box 'http://host.lima.internal:4141&|e touch pwned|'
+  run apply_ai_proxy box 'http://host.lima.internal:4141&|e touch pwned|'
   [ "$status" -ne 0 ]
   [ ! -e "$rendered" ]
   [ ! -e pwned ]
@@ -670,7 +674,7 @@ print("" if d is None else d)' "$1"
   printf '#!/bin/sh\n[ "$1" = --ai-proxy-token ] && echo "dbx-ai.$2.c2VjcmV0" || exit 1\n' > "$BATS_TEST_TMPDIR/launcher"
   chmod +x "$BATS_TEST_TMPDIR/launcher"
   proxy_launcher() { printf '%s' "$BATS_TEST_TMPDIR/launcher"; }
-  run apply_proxy devbox-proj-1 'http://host.lima.internal:4141'
+  run apply_ai_proxy devbox-proj-1 'http://host.lima.internal:4141'
   grep -Fxq 'export ANTHROPIC_API_KEY="dbx-ai.devbox-proj-1.c2VjcmV0"' "$rendered"
   grep -Fxq 'export OPENAI_API_KEY="dbx-ai.devbox-proj-1.c2VjcmV0"' "$rendered"
   ! grep -q 'devbox-proxy' "$rendered"
@@ -678,7 +682,7 @@ print("" if d is None else d)' "$1"
   # A launcher that cannot issue a well-formed capability stops the run.
   printf '#!/bin/sh\necho "not a token; rm -rf"\n' > "$BATS_TEST_TMPDIR/launcher"
   rm -f "$rendered"
-  run apply_proxy devbox-proj-1 'http://host.lima.internal:4141'
+  run apply_ai_proxy devbox-proj-1 'http://host.lima.internal:4141'
   [ "$status" -ne 0 ]
   [ ! -e "$rendered" ]
 }
@@ -701,6 +705,20 @@ print("" if d is None else d)' "$1"
 
   run ai_proxy_token_path "../escape"
   [ "$status" -ne 0 ]
+}
+
+@test "--no-auth revokes host-side access even when a guest cleanup step fails" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR/config"
+  mkdir -p "$CONFIG_DIR/ai-proxy-boxes" "$CONFIG_DIR/gh-proxy-boxes"
+  echo secret > "$CONFIG_DIR/ai-proxy-boxes/box.key"
+  printf 'http://h:4141\ngrant=gh_proxy\n' > "$CONFIG_DIR/gh-proxy-boxes/box.url"
+  limactl() { [[ "$*" == *brew* || "$*" == *-s* ]] && return 1; echo "ran: ${*: -1}" >&2; return 0; }
+  run clear_auth box
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"host-side access is revoked"* ]]
+  [ ! -e "$CONFIG_DIR/ai-proxy-boxes/box.key" ]
+  [ ! -e "$CONFIG_DIR/gh-proxy-boxes/box.url" ]
+  [[ "$output" == *"zz-devbox-20-keys.sh"* ]]
 }
 
 @test "proxy registrations follow the proxy's own state directory" {
@@ -807,22 +825,129 @@ print("" if d is None else d)' "$1"
   CONFIG_DIR="$original_config_dir"
 }
 
-@test "proxy setup keeps gh credentials on the host behind a guest wrapper" {
-  source_text="$(<"$DEVBOX")"
-  [[ "$source_text" == *'gh-wrapper.py'* ]]
-  [[ "$source_text" == *'zz-devbox-12-gh-proxy.sh'* ]]
-  [[ "$source_text" == *'gh-proxy-ca.pem'* ]]
-  [[ "$source_text" == *'gh auth login'* ]]
-  [[ "$source_text" == *'gh() {'* ]]
-  [[ "$source_text" == *'DEVBOX_GH_PROXY_URL_FILE'* ]]
-  [[ "$source_text" == *'renew_gh_proxy_capability'* ]]
-  [[ "$source_text" != *'start_gh_proxy_capability_renewal'* ]]
-  [[ "$source_text" == *'stored_gh_proxy_endpoint'* ]]
-  [[ "$source_text" == *'formula_prefix="$("$brew_bin" --prefix gh'* ]]
-  [[ "$source_text" == *'real_gh="$real_dir/gh-real"'* ]]
-  [[ "$source_text" == *'ln -s "$wrapper" "$brew_gh"'* ]]
-  [[ "$source_text" == *'"$brew_bin" link --overwrite gh'* ]]
-  [[ "$source_text" == *'rm -rf -- "$HOME/.devbox/codex-proxy" "$HOME/.devbox/gh-proxy"'* ]]
+# Drive cmd_run against an existing kept box with every side effect stubbed,
+# and print which auth grants it applied or removed.
+run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoint
+  run bash -c '
+    source "$1"; shift; set +u
+    project="$(mktemp -d)"
+    instance_exists() { return 0; }
+    instance_status() { echo Running; }
+    prepare_session_dir() { :; }; session_state_other_instance() { :; }
+    ensure_session_mount() { :; }; require_project_writable() { :; }
+    disable_session_persistence() { :; }; remove_session_mount() { :; }
+    apply_session_persistence() { :; }; seed_agent_trust() { :; }
+    apply_git_signing() { :; }; enable_ssh_agent() { :; }; require_ssh_agent() { :; }
+    apply_agent_config() { :; }; run_cleanup() { :; }
+    limactl() { :; }
+    proxy_ensure() { echo "ensure $1"; }
+    apply_ai_proxy() { echo "ai $2"; }
+    apply_gh_proxy() { echo "gh $2"; }
+    clear_gh_proxy() { echo "clear-gh"; }
+    clear_auth() { echo "clear-all"; }
+    stored_gh_proxy_endpoint() {
+      case "${STORED_GH:-0}" in
+        1) echo http://host.lima.internal:4141;;
+        legacy) return 2;;
+        *) return 1;;
+      esac
+    }
+    cmd_run "$project" --keep --ephemeral-sessions "$@"
+  ' _ "$DEVBOX" "$@"
+}
+
+@test "--proxy grants AI routes only; GitHub is a separate --gh-proxy grant" {
+  run_auth_grants --proxy
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ai http://host.lima.internal:4141"* ]]
+  [[ "$output" != *"gh http"* ]]
+
+  run_auth_grants -a
+  [[ "$output" == *"ai http://host.lima.internal:4141"* ]]
+  [[ "$output" != *"gh http"* ]]
+
+  run_auth_grants --gh-proxy
+  [[ "$output" == *"gh http://host.lima.internal:4141"* ]]
+  [[ "$output" != *"ai http"* ]]
+
+  run_auth_grants --proxy --gh-proxy=http://host.lima.internal:5151
+  [[ "$output" == *"ai http://host.lima.internal:4141"* ]]
+  [[ "$output" == *"gh http://host.lima.internal:5151"* ]]
+}
+
+@test "a kept box keeps its GitHub grant until --gh-proxy=off or --no-auth" {
+  STORED_GH=1 run_auth_grants --proxy
+  [[ "$output" == *"gh http://host.lima.internal:4141"* ]]
+  [[ "$output" == *"remove with --gh-proxy=off"* ]]
+
+  # Wired by the old combined --proxy: removed rather than refreshed.
+  STORED_GH=legacy run_auth_grants -a
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"clear-gh"* ]]
+  [[ "$output" == *"from an older --proxy"* ]]
+  [[ "$output" != *"gh http"* ]]
+
+  run_auth_grants --gh-proxy=
+  [ "$status" -ne 0 ]
+
+  STORED_GH=1 run_auth_grants --proxy --gh-proxy=off
+  [[ "$output" == *"ai http://host.lima.internal:4141"* ]]
+  [[ "$output" == *"clear-gh"* ]]
+  [[ "$output" != *"gh http"* ]]
+
+  STORED_GH=1 run_auth_grants --no-auth
+  [[ "$output" == *"clear-all"* ]]
+  [[ "$output" != *"gh http"* && "$output" != *"ai http"* ]]
+
+  STORED_GH=1 run_auth_grants -H=off
+  [[ "$output" == *"clear-gh"* ]]
+  run_auth_grants --gh-proxy --no-auth
+  [ "$status" -ne 0 ]
+}
+
+@test "clearing the GitHub grant leaves the AI grant in the guest, and vice versa" {
+  GUEST_HOME="$BATS_TEST_TMPDIR/guest"; ETC="$BATS_TEST_TMPDIR/etc-profile.d"
+  mkdir -p "$GUEST_HOME/.devbox/gh-proxy/bin" "$GUEST_HOME/.devbox/codex-proxy" "$ETC"
+  for f in zz-devbox-10-proxy.sh zz-devbox-11-codex-proxy.sh zz-devbox-12-gh-proxy.sh zz-devbox-20-keys.sh; do touch "$ETC/$f"; done
+  # Run the real guest scripts locally: /etc/profile.d is redirected to $ETC
+  # and sudo is a pass-through, so the assertions see exactly what they remove.
+  limactl() {
+    shift 2; [[ "$1" == -- ]] && shift
+    local script
+    if [[ "$1" == bash && "$2" == -s ]]; then script="$(cat)"; else script="$3"; fi
+    script="${script//\/etc\/profile.d/$ETC}"
+    (cd "$GUEST_HOME" && HOME="$GUEST_HOME" PATH="$BATS_TEST_TMPDIR/bin:$PATH" bash -c "$script")
+  }
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  printf '#!/bin/sh\n"$@"\n' > "$BATS_TEST_TMPDIR/bin/sudo"; chmod +x "$BATS_TEST_TMPDIR/bin/sudo"
+  CONFIG_DIR="$BATS_TEST_TMPDIR/config"; mkdir -p "$CONFIG_DIR/ai-proxy-boxes"
+  echo secret > "$CONFIG_DIR/ai-proxy-boxes/box.key"
+
+  clear_gh_proxy box
+  [ ! -e "$ETC/zz-devbox-12-gh-proxy.sh" ]
+  [ ! -e "$GUEST_HOME/.devbox/gh-proxy" ]
+  [ -e "$ETC/zz-devbox-10-proxy.sh" ] && [ -e "$ETC/zz-devbox-11-codex-proxy.sh" ]
+  [ -e "$CONFIG_DIR/ai-proxy-boxes/box.key" ]
+
+  clear_ai_proxy box
+  [ ! -e "$ETC/zz-devbox-10-proxy.sh" ] && [ ! -e "$ETC/zz-devbox-11-codex-proxy.sh" ]
+  [ ! -e "$GUEST_HOME/.devbox/codex-proxy" ]
+  [ ! -e "$CONFIG_DIR/ai-proxy-boxes/box.key" ]
+  [ -e "$ETC/zz-devbox-20-keys.sh" ]
+}
+
+@test "manifest gh_proxy is its own declaration and validated like proxy" {
+  manifest="$BATS_TEST_TMPDIR/.devbox.toml"
+  printf 'proxy = true\n' > "$manifest"
+  [ "$(manifest_value "$(project_manifest "$manifest")" gh_proxy)" = False ]
+  printf 'gh_proxy = "http://host.lima.internal"\n' > "$manifest"
+  [ "$(manifest_value "$(project_manifest "$manifest")" gh_proxy)" = "http://host.lima.internal:4141" ]
+  printf 'gh_proxy = "http://h:1;x"\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  printf 'gh_proxy = true\nno_auth = true\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
 }
 
 @test "proxy refresh bypasses project manifest and image resolution" {
@@ -1261,7 +1386,8 @@ PY
   [[ "$rendered" == *"packages|node"*"go"* ]]
   [[ "$rendered" == *"start|npm ci"* ]]
   [[ "$rendered" == *"ssh|Forward the host SSH agent"* ]]
-  [[ "$rendered" == *"proxy|Enable the host-side AI authentication proxy"* ]]
+  [[ "$rendered" == *"proxy|Let AI CLIs use the host's AI logins through the proxy: http://host.lima.internal:4141"* ]]
+  [[ "$rendered" == *"gh-proxy|Let gh act as the host's GitHub login through the proxy: http://host.lima.internal:4141"* ]]
   [[ "$rendered" == *"credentials|Copy host AI credential files"* ]]
   [[ "$rendered" == *"agent-config|Copy allowlisted"* ]]
   [[ "$rendered" == *"mount-ro|Mount /host/data"* ]]
@@ -1648,7 +1774,7 @@ true' ''
 @test "every long run, build, and destroy flag has a single-letter alias" {
   source_text="$(<"$DEVBOX")"
   for alias in \
-    '--image|-i' '--keep|-k' '--ephemeral-sessions|-e' '--ssh-agent|-s' '--proxy|-p' '--no-auth|-n' \
+    '--image|-i' '--keep|-k' '--ephemeral-sessions|-e' '--ssh-agent|-s' '--proxy|-p' '--gh-proxy|-H' '--no-auth|-n' \
     '--api-keys|-K' '--with-creds|-c' '--with-agent-config|-g' \
     '--gui|-G' '--traffic-audit|-T' \
     '--mount|-m' '--copy|-C' '--name|-N' '--force|-f' '--all|-A' '--goldens|-G' \

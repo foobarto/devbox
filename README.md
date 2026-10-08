@@ -89,14 +89,15 @@ devbox sessions [path|clear --yes] [DIR]
 | `--keep`, `-k` | don't auto-delete the box on exit. |
 | `--ephemeral-sessions`, `-e` | keep AI session records on this box's disposable disk instead of attaching the project's persistent session store. |
 | `--ssh-agent`, `-s` | forward the host SSH agent into the box (git/GitHub) and configure signed Git commits. Host **private keys never enter the VM** — only the agent socket and selected public key are used. |
-| `--proxy[=URL]`, `-p[=URL]` | point the AI CLIs and `gh` at a host-side credential proxy; credentials stay on the host. Default `http://host.lima.internal:4141`. |
+| `--proxy[=URL]`, `-p[=URL]` | point the AI CLIs at a host-side credential proxy that adds the host's AI logins; credentials stay on the host. Default `http://host.lima.internal:4141`. Grants no GitHub access. |
+| `--gh-proxy[=URL\|off]`, `-H[=URL\|off]` | let the guest's `gh` act as the host's GitHub login through the same proxy — a separate, GitHub-only grant. A kept box keeps it until `--gh-proxy=off` or `--no-auth`. |
 | `--traffic-audit[=connect\|off]`, `-T` | explicitly route normal web tooling through an audited CONNECT proxy and block direct TCP/UDP 80/443. `off` removes it from a kept box. It is separate from `-a`. |
 | `--no-auth`, `-n` | explicitly disable Devbox-managed proxy, API-key, and copied-credential auth; removes its proxy/key profiles from an existing box. |
 | `--api-keys[=FILE]`, `-K[=FILE]` | inject API keys into the box from an env file (default `~/.config/devbox/api-keys.env`). |
 | `--with-creds`, `-c` | copy host AI-tool credential files into the box (OAuth logins for claude/codex without a proxy). Best-effort. |
 | `--with-agent-config`, `-g` | copy an allowlisted set of non-secret Claude, Codex, OpenCode, and Stado settings, prompts, rules, and custom agents. Auth, histories, caches, and key directories are excluded; suspected credentials are skipped. |
 | `--gui`, `-G` | start a GUI-ready Devbox shell through Waypipe; after the optional `--`, run one guest GUI app instead. |
-| `-a` | shortcut for `--with-agent-config --proxy --ssh-agent`; it never enables `--with-creds` or GUI forwarding. |
+| `-a` | shortcut for `--with-agent-config --proxy --ssh-agent`; it never enables `--gh-proxy`, `--with-creds`, or GUI forwarding. |
 | `--mount PATH[:ro\|:rw]`, `-m PATH[:ro\|:rw]` | mount an extra host path into the box at the same path (default `ro`). Repeatable; applied at box creation. |
 | `--copy SRC[:DEST]`, `-C SRC[:DEST]` | copy an extra host file/dir into the box (`DEST` defaults to the basename in `$HOME`). Repeatable; works on new **and** existing boxes. |
 | `--name NAME`, `-N NAME` | override the derived instance name. |
@@ -258,7 +259,7 @@ Installed ≠ authenticated. Three combinable strategies, pick per your setup:
 
 | you want | use | where secrets live |
 |---|---|---|
-| keys/tokens never enter the box | [`--proxy`](proxy/README.md) | host only |
+| keys/tokens never enter the box | [`--proxy`](proxy/README.md) (AI), [`--gh-proxy`](proxy/README.md#github-cli) (`gh`) | host only |
 | explicitly opt out of Devbox auth | `--no-auth` | no new credentials injected |
 | API keys (opencode, stado, OpenAI/Codex platform keys) | `--api-keys` | copied into the box |
 | Claude/Codex **subscription OAuth** without a proxy | `--with-creds` | copied into the box |
@@ -326,7 +327,9 @@ process that has guest root/sudo and can remove the guest firewall. See
 security](docs/agent-capabilities-security.md) before granting it to untrusted
 code.
 
-For `gh`, log in once on the host with `gh auth login`; `devbox --proxy` gives
+`--proxy` and `--gh-proxy` are separate grants: proxying AI requests never lets
+the box act as your GitHub account. For `gh`, log in once on the host with
+`gh auth login`; `devbox --gh-proxy` gives
 the guest CLI a dummy routing marker plus a short-lived Devbox proxy capability,
 then injects the host token only inside a GitHub-only TLS proxy. The capability
 is not a GitHub token, expires after eight hours, and is renewed every seven
@@ -336,9 +339,9 @@ suspend or long idle is repaired promptly after resume without restarting the
 guest. `devbox proxy refresh` forces the same update immediately.
 
 To prevent an agent from accidentally bypassing the wrapper with Homebrew's
-absolute path, `--proxy` copies the real `gh` binary into the managed private
+absolute path, `--gh-proxy` copies the real `gh` binary into the managed private
 wrapper directory and replaces Homebrew's public `bin/gh` link with the wrapper;
-`--no-auth` restores the normal Homebrew link. This is command-routing hygiene,
+`--gh-proxy=off` and `--no-auth` restore the normal Homebrew link. This is command-routing hygiene,
 not containment against hostile same-user guest code, which can still locate
 and execute files it is permitted to access.
 GitHub Enterprise hosts are not proxied. Git/GitHub SSH auth is separate: use **`--ssh-agent`**. It also enables automatic
@@ -351,9 +354,10 @@ the GitHub Meta API and place them in `~/.ssh/known_hosts`, so GitHub SSH use
 does not stop for a first-connection prompt.
 
 `--no-auth` is the explicit opt-out for a kept box that was previously started
-with `--proxy` or `--api-keys`; it removes Devbox's profile snippets before the
-shell opens. It does not delete credentials created manually inside the VM, and
-cannot be combined with `--proxy`, `--api-keys`, or `--with-creds`. It can be
+with `--proxy`, `--gh-proxy`, or `--api-keys`; it removes Devbox's profile
+snippets before the shell opens. It does not delete credentials created manually
+inside the VM, and cannot be combined with `--proxy`, `--gh-proxy`, `--api-keys`,
+or `--with-creds`. It can be
 combined with `--with-agent-config`, which never intentionally copies auth.
 
 ## Per-project setup
@@ -397,7 +401,7 @@ a request smaller than the golden's is refused with a warning rather than
 silently applied. `cpus` and `memory` are applied per-box at clone time, so
 changing them never requires rebuilding the golden.
 
-The manifest can also declare `ssh_agent`, `keep`, `proxy`, `api_keys`,
+The manifest can also declare `ssh_agent`, `keep`, `proxy`, `gh_proxy`, `api_keys`,
 `with_creds`, `with_agent_config`, `mounts`, `copies`, and `no_auth`. Because a
 project manifest is repository-controlled input, Devbox groups every declaration
 by type, gives each category a distinct icon, and prints multiline

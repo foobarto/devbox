@@ -59,8 +59,8 @@ having access to the forwarded-desktop capability.
 ### The `-a` preset
 
 `-a` expands to `--with-agent-config --proxy --ssh-agent`. It does not enable
-`--with-creds` or GUI forwarding, so it neither copies AI OAuth files into the
-guest nor creates a host-GUI path. Add `--gui` or `-G` separately only when you
+`--gh-proxy`, `--with-creds`, or GUI forwarding, so it grants no host GitHub
+login, copies no AI OAuth files into the guest, and creates no host-GUI path. Add `--gui` or `-G` separately only when you
 intend to grant that capability, for example `devbox --gui -a`.
 
 ### Existing Devboxes and package installation

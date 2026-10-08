@@ -33,6 +33,13 @@
 - Copy directories into a box without following symlinks inside them, so a
   link planted in a copied project directory cannot pull host files in; a
   repeated copy merges instead of nesting, and destinations may contain quotes.
+- **Breaking:** `--proxy` (and `proxy` in `.devbox.toml`) now grants only the
+  host's AI logins. The host GitHub login for `gh` is a separate grant,
+  `--gh-proxy`/`-H` (`gh_proxy`), never included in `-a`. A kept box keeps a
+  `--gh-proxy` grant until `--gh-proxy=off` or `--no-auth`; GitHub access a kept
+  box received from an older `--proxy` is no longer renewed and is removed on
+  its next entry.
+- Restore the guest's Homebrew `gh` link when GitHub proxying is removed.
 
 ## v1.4.0 - 2026-08-28
 

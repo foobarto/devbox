@@ -389,7 +389,7 @@ class GitHubCliProxyTests(TestCase):
         with tempfile.TemporaryDirectory() as directory:
             registrations = Path(directory) / "gh-proxy-boxes"
             registrations.mkdir()
-            (registrations / "devbox-existing-1234.url").write_text("http://host.lima.internal:4141\n")
+            (registrations / "devbox-existing-1234.url").write_text("http://host.lima.internal:4141\ngrant=gh_proxy\n")
             history = {}
             with patch.object(proxy, "STATE_DIR", directory), \
                  patch.object(proxy, "BIND_PORT", 4141), \
@@ -457,7 +457,7 @@ class GitHubCliProxyTests(TestCase):
             registrations = Path(directory) / "gh-proxy-boxes"
             registrations.mkdir()
             (registrations / "devbox-existing-1234.url").write_text(
-                "http://host.lima.internal:4141\n"
+                "http://host.lima.internal:4141\ngrant=gh_proxy\n"
             )
             history = {}
             with patch.object(proxy, "STATE_DIR", directory), \
@@ -475,12 +475,56 @@ class GitHubCliProxyTests(TestCase):
         self.assertEqual(deliver.call_count, 2)
         deliver.assert_called_with("devbox-existing-1234", "http://host.lima.internal:4141")
 
+    def test_daemon_ignores_registrations_from_the_old_combined_proxy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registrations = Path(directory) / "gh-proxy-boxes"
+            registrations.mkdir()
+            (registrations / "devbox-legacy.url").write_text("http://host.lima.internal:4141\n")
+            (registrations / "devbox-granted.url").write_text("http://host.lima.internal:4141\ngrant=gh_proxy\n")
+            with patch.object(proxy, "STATE_DIR", directory), \
+                 patch.object(proxy, "BIND_PORT", 4141):
+                self.assertEqual(sorted(proxy.registered_github_proxy_boxes()), ["devbox-granted"])
+
+    def test_daemon_skips_a_grant_removed_during_its_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registrations = Path(directory) / "gh-proxy-boxes"
+            registrations.mkdir()
+            registration = registrations / "devbox-a.url"
+            registration.write_text("http://host.lima.internal:4141\ngrant=gh_proxy\n")
+
+            def removed_meanwhile():
+                registration.unlink()
+                return {"devbox-a"}
+
+            with patch.object(proxy, "STATE_DIR", directory), \
+                 patch.object(proxy, "BIND_PORT", 4141), \
+                 patch.object(proxy, "running_lima_instances", side_effect=removed_meanwhile), \
+                 patch.object(proxy, "deliver_github_proxy_capability") as deliver:
+                proxy.refresh_registered_github_proxy_boxes(force=True)
+            deliver.assert_not_called()
+
+    def test_daemon_retracts_a_delivery_that_raced_a_grant_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registrations = Path(directory) / "gh-proxy-boxes"
+            registrations.mkdir()
+            registration = registrations / "devbox-a.url"
+            registration.write_text("http://host.lima.internal:4141\ngrant=gh_proxy\n")
+            with patch.object(proxy, "STATE_DIR", directory), \
+                 patch.object(proxy, "BIND_PORT", 4141), \
+                 patch.object(proxy, "running_lima_instances", return_value={"devbox-a"}), \
+                 patch.object(proxy, "deliver_github_proxy_capability",
+                              side_effect=lambda *_: registration.unlink()), \
+                 patch.object(proxy, "retract_github_proxy_capability") as retract:
+                summary = proxy.refresh_registered_github_proxy_boxes(force=True)
+            retract.assert_called_once_with("devbox-a")
+            self.assertEqual(summary["renewed"], 0)
+
     def test_daemon_does_not_start_a_stopped_registered_box(self):
         with tempfile.TemporaryDirectory() as directory:
             registrations = Path(directory) / "gh-proxy-boxes"
             registrations.mkdir()
             (registrations / "devbox-stopped.url").write_text(
-                "http://host.lima.internal:4141\n"
+                "http://host.lima.internal:4141\ngrant=gh_proxy\n"
             )
             with patch.object(proxy, "STATE_DIR", directory), \
                  patch.object(proxy, "BIND_PORT", 4141), \
