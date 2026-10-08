@@ -1024,7 +1024,12 @@ renew_gh_proxy_capability() { # $1 Lima instance $2 bare http proxy URL
 
 # is *our* proxy answering on this port? (health endpoint, not just any listener)
 proxy_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -q 'devbox-ai-proxy'; }
-proxy_self_renewal_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -q 'gh-self-renewal'; }
+# The newest behaviour a running proxy must advertise. The proxy is a shared,
+# long-lived daemon, so an upgrade leaves the old one serving until something
+# restarts it; bump this marker whenever an older daemon would be unsafe or
+# incompatible with this devbox (e.g. a CA it can no longer deliver).
+PROXY_REQUIRED_FEATURE="gh-ca-renewal"
+proxy_current_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -qw -- "$PROXY_REQUIRED_FEATURE"; }
 # is anything at all listening on the port?
 proxy_port_open() {
   local port="${1:-}"
@@ -1076,11 +1081,11 @@ proxy_ensure() {
   valid_gh_proxy_endpoint "$url" || { warn "invalid credential proxy URL: $url"; return 1; }
   port="$(proxy_port "$url")"
   if proxy_health "$port"; then
-    if proxy_self_renewal_health "$port"; then
+    if proxy_current_health "$port"; then
       log "credential proxy already running on 127.0.0.1:$port"
       return 0
     fi
-    log "Restarting host credential proxy once to enable persistent GitHub capability renewal"
+    log "Restarting the older host credential proxy once to load the current version"
     proxy_stop_process || { warn "could not stop the older credential proxy"; return 1; }
     for i in $(seq 1 20); do proxy_port_open "$port" || break; sleep 0.1; done
   fi
@@ -3110,10 +3115,10 @@ cmd_proxy() {
              launcher="$(proxy_launcher)" || die "proxy launcher not found"
              "$launcher" --refresh-gh-proxy-boxes;;
     status) if proxy_health "$port"; then
-              if proxy_self_renewal_health "$port"; then
-                log "AI proxy: RUNNING on 127.0.0.1:$port (GitHub capability self-renewal enabled)"
+              if proxy_current_health "$port"; then
+                log "AI proxy: RUNNING on 127.0.0.1:$port (current version)"
               else
-                warn "AI proxy: RUNNING on 127.0.0.1:$port (restart required for GitHub capability self-renewal)"
+                warn "AI proxy: RUNNING on 127.0.0.1:$port (older version; 'devbox proxy start' restarts it)"
               fi
             elif proxy_port_open "$port"; then warn "port $port held by another (non-devbox) service"
             else log "AI proxy: not running (port $port)"; fi;;
