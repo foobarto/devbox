@@ -48,7 +48,13 @@ chooses, in order:
 
 The proxy reads access tokens fresh on every request. Its background check runs
 every minute, refreshes Claude and Codex OAuth sessions shortly before expiry,
-and retries a request once after a 401 or 403. Claude refreshes through its OAuth
+and retries a request once after a 401. Because a guest can provoke that 401,
+such a forced refresh is skipped when the host has already replaced the
+rejected token, runs under an owner-only host lock shared by every Devbox
+proxy, and happens at most once a minute per provider; when the refreshed token
+is rejected too, the next forced refresh waits 15 minutes. A 403 never
+refreshes; it is retried once only when the host has already replaced the
+token. Claude refreshes through its OAuth
 grant; Codex refreshes through the host CLI's managed-auth `account/read`
 interface, so the proxy never independently consumes Codex's one-time refresh
 token. Refreshing does not send empty model prompts or consume model usage.

@@ -119,6 +119,14 @@ CODEX_BIN = os.environ.get("DEVBOX_CODEX_BIN", "codex")
 CODEX_APP_SERVER_TIMEOUT_SECONDS = 45
 REFRESH_SKEW_SECONDS = 300
 REFRESH_POLL_SECONDS = 60
+# A refresh forced by an upstream 401 is something a guest can provoke. Allow
+# at most one per provider per interval across every proxy process on the
+# host, and back off much longer once a refresh has not cured the 401 (the
+# token was not the problem), so a guest cannot keep rotating the host's
+# refresh token or spawning `codex app-server`. Expiry refreshes are never
+# throttled.
+FORCED_REFRESH_MIN_INTERVAL_SECONDS = 60
+INEFFECTIVE_REFRESH_BACKOFF_SECONDS = 15 * 60
 _REFRESH_LOCKS = {"anthropic": threading.Lock(), "openai": threading.Lock()}
 _GITHUB_CERT_LOCK = threading.Lock()
 # Regenerate the local GitHub CA and leaf this long before either expires, and
@@ -493,12 +501,74 @@ def refresh_token(token_url: str, client_id: str, refresh: str, json_body: bool 
     return data
 
 
+def _refresh_lock_path(provider: str) -> str:
+    if provider == "anthropic":
+        return os.path.join(os.path.dirname(CLAUDE_CREDENTIALS_PATH), ".devbox-oauth-refresh.lock")
+    return CODEX_REFRESH_LOCK_PATH
+
+
+def _refresh_state_path(provider: str) -> str:
+    return os.path.splitext(_refresh_lock_path(provider))[0] + ".state"
+
+
+def _next_forced_refresh(state: dict) -> float:
+    try:
+        return float(state.get("next_forced_refresh", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _forced_refresh_allowed(provider: str) -> bool:
+    """Permit one guest-provokable refresh per interval (caller holds the provider's refresh lock)."""
+    path = _refresh_state_path(provider)
+    state = read_json(path)
+    now = time.time()
+    if now < _next_forced_refresh(state):
+        sys.stderr.write(
+            f"[devbox-ai-proxy] {provider} rejected its OAuth token again; "
+            "not forcing another host refresh yet\n"
+        )
+        return False
+    state["next_forced_refresh"] = now + FORCED_REFRESH_MIN_INTERVAL_SECONDS
+    write_json_atomic(path, state)
+    return True
+
+
+def note_ineffective_refresh(provider: str) -> None:
+    """A refreshed token was rejected too, so stop forcing refreshes for a while."""
+    if provider not in ("anthropic", "openai"):
+        return
+    try:
+        with oauth_refresh_lock(_refresh_lock_path(provider)):
+            path = _refresh_state_path(provider)
+            state = read_json(path)
+            state["next_forced_refresh"] = max(
+                _next_forced_refresh(state), time.time() + INEFFECTIVE_REFRESH_BACKOFF_SECONDS
+            )
+            write_json_atomic(path, state)
+    except OSError as exc:
+        sys.stderr.write(f"[devbox-ai-proxy] could not record OAuth refresh back-off: {exc}\n")
+
+
 @contextmanager
 def codex_refresh_lock():
     """Serialize Codex refreshes across every Devbox proxy on this host."""
-    directory = os.path.dirname(CODEX_REFRESH_LOCK_PATH)
+    with oauth_refresh_lock(_refresh_lock_path("openai")):
+        yield
+
+
+@contextmanager
+def claude_refresh_lock():
+    """Serialize Claude refreshes across every Devbox proxy on this host."""
+    with oauth_refresh_lock(_refresh_lock_path("anthropic")):
+        yield
+
+
+@contextmanager
+def oauth_refresh_lock(path: str):
+    directory = os.path.dirname(path)
     os.makedirs(directory, mode=0o700, exist_ok=True)
-    descriptor = os.open(CODEX_REFRESH_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         os.fchmod(descriptor, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -608,26 +678,51 @@ def request_codex_managed_refresh() -> None:
                 process.wait()
 
 
-def resolve_claude_oauth(force_refresh: bool = False) -> tuple[str, str]:
+def resolve_claude_oauth(
+    force_refresh: bool = False, rejected_access: str = ""
+) -> tuple[str, str]:
     with _REFRESH_LOCKS["anthropic"]:
         credentials = read_json(CLAUDE_CREDENTIALS_PATH)
         oauth = credentials.get("claudeAiOauth")
         if not isinstance(oauth, dict):
             return "", ""
         access = oauth.get("accessToken", "")
-        refresh = oauth.get("refreshToken", "")
-        if force_refresh or token_expiring(oauth.get("expiresAt")):
-            if not isinstance(refresh, str) or not refresh:
-                return "", ""
+        expiring = token_expiring(oauth.get("expiresAt"))
+        if (
+            force_refresh and not expiring and rejected_access
+            and isinstance(access, str) and access and access != rejected_access
+        ):
+            # The host (Claude Code, or another proxy) already replaced the
+            # token the upstream rejected: use it rather than rotating again.
+            return access, "anthropic"
+        if force_refresh or expiring:
             try:
-                refreshed = refresh_token(CLAUDE_TOKEN_URL, CLAUDE_CLIENT_ID, refresh)
-                access = refreshed["access_token"]
-                oauth["accessToken"] = access
-                oauth["refreshToken"] = refreshed.get("refresh_token", refresh)
-                if isinstance(refreshed.get("expires_in"), (int, float)):
-                    oauth["expiresAt"] = int((time.time() + refreshed["expires_in"]) * 1000)
-                credentials["claudeAiOauth"] = oauth
-                write_json_atomic(CLAUDE_CREDENTIALS_PATH, credentials)
+                with claude_refresh_lock():
+                    # Re-read under the cross-process lock: another proxy may
+                    # have consumed the refresh token while this one waited.
+                    credentials = read_json(CLAUDE_CREDENTIALS_PATH)
+                    oauth = credentials.get("claudeAiOauth")
+                    if not isinstance(oauth, dict):
+                        return "", ""
+                    current = oauth.get("accessToken", "")
+                    if (
+                        isinstance(current, str) and current and current != access
+                        and not token_expiring(oauth.get("expiresAt"))
+                    ):
+                        return current, "anthropic"
+                    if not expiring and not _forced_refresh_allowed("anthropic"):
+                        return (current, "anthropic") if isinstance(current, str) and current else ("", "")
+                    refresh = oauth.get("refreshToken", "")
+                    if not isinstance(refresh, str) or not refresh:
+                        return "", ""
+                    refreshed = refresh_token(CLAUDE_TOKEN_URL, CLAUDE_CLIENT_ID, refresh)
+                    access = refreshed["access_token"]
+                    oauth["accessToken"] = access
+                    oauth["refreshToken"] = refreshed.get("refresh_token", refresh)
+                    if isinstance(refreshed.get("expires_in"), (int, float)):
+                        oauth["expiresAt"] = int((time.time() + refreshed["expires_in"]) * 1000)
+                    credentials["claudeAiOauth"] = oauth
+                    write_json_atomic(CLAUDE_CREDENTIALS_PATH, credentials)
             except Exception as exc:
                 sys.stderr.write(f"[devbox-ai-proxy] Claude OAuth refresh failed: {exc}\n")
                 return "", ""
@@ -689,6 +784,11 @@ def resolve_codex_oauth(
                             "openai",
                         )
 
+                    if not token_expiring(current_expires) and not _forced_refresh_allowed("openai"):
+                        if isinstance(current_access, str) and current_access:
+                            account = tokens.get("account_id", "")
+                            return current_access, account if isinstance(account, str) else "", "openai"
+                        return "", "", ""
                     previous_access = current_access
                     request_codex_managed_refresh()
                     credentials = read_json(CODEX_CREDENTIALS_PATH)
@@ -754,7 +854,7 @@ def resolve_auth(auth: dict, force_refresh: bool = False, rejected_access: str =
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         if api_key:
             return "x-api-key", "", api_key, {}, ("authorization",), ""
-        oauth_token, provider = resolve_claude_oauth(force_refresh)
+        oauth_token, provider = resolve_claude_oauth(force_refresh, rejected_access)
         if oauth_token:
             return (
                 "authorization",
@@ -1874,7 +1974,10 @@ class Handler(BaseHTTPRequestHandler):
                     audit_outcome(503, error="authentication-unavailable", websocket=True)
                     return
                 conn, status, response = self._open_websocket(up, headers)
-                if status in (401, 403) and provider:
+                # 401 only: a 403 is a permission answer, not a stale token,
+                # and refreshing on it would let any forbidden request rotate
+                # the host's OAuth session.
+                if status == 401 and provider:
                     conn.close()
                     rejected_access = headers.get("authorization", "").removeprefix("Bearer ")
                     headers, _ = request_headers(
@@ -1888,6 +1991,8 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     conn, status, response = self._open_websocket(up, headers)
                     attempts = 2
+                    if status == 401:
+                        note_ineffective_refresh(provider)
             except Exception as exc:
                 self.send_error(502, "WebSocket upstream error: %s" % exc)
                 audit_outcome(502, error="websocket-upstream-error", attempts=attempts, websocket=True)
@@ -1929,7 +2034,7 @@ class Handler(BaseHTTPRequestHandler):
             attempts = 1
             # OAuth access tokens can be revoked between the preflight and this
             # request. Refresh once and replay only the failed request.
-            if resp.status in (401, 403) and provider:
+            if resp.status == 401 and provider:
                 resp.read()
                 conn.close()
                 rejected_access = headers.get("authorization", "").removeprefix("Bearer ")
@@ -1942,6 +2047,21 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 conn, resp = upstream_request(headers)
                 attempts = 2
+                if resp.status == 401:
+                    note_ineffective_refresh(provider)
+            elif resp.status == 403 and provider in ("anthropic", "openai"):
+                # Some providers answer a revoked OAuth token with 403. Never
+                # refresh for that, but if the host has already replaced the
+                # token, retry once with the replacement.
+                rejected_access = headers.get("authorization", "").removeprefix("Bearer ")
+                current, _ = request_headers()
+                current_access = (current or {}).get("authorization", "").removeprefix("Bearer ")
+                if current_access and current_access != rejected_access:
+                    resp.read()
+                    conn.close()
+                    headers = current
+                    conn, resp = upstream_request(headers)
+                    attempts = 2
         except Exception as exc:  # upstream unreachable / TLS / etc.
             self.send_error(502, "upstream error: %s" % exc)
             audit_outcome(502, provider, "upstream-error")
