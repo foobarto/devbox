@@ -171,9 +171,10 @@ path.write_text(
         'image = "ubuntu-24.04"',
         'packages = ["hello"]',
         f"start = {json.dumps(start)}",
-        "ssh_agent = true",
         "keep = true",
-        "proxy = true",
+        "[grants]",
+        "ssh_agent = true",
+        "ai_proxy = true",
         f"mounts = [{json.dumps(str(mount_source) + ':ro')}]",
         f"copies = [{json.dumps(str(copy_source) + ':e2e-copy.txt')}]",
         "",
@@ -281,7 +282,7 @@ assert_guest "$manifest_instance" \
   "python3 '$MANIFEST_PROJECT/.e2e-trust-check.py' '$MANIFEST_PROJECT' '$MOUNT_SOURCE'"
 
 echo "[e2e] --proxy grants AI routes only; --gh-proxy is a separate grant"
-# The manifest says proxy = true: the box may use the host AI logins but must
+# The manifest grants ai_proxy only: the box may use the host AI logins but must
 # not be wired to the host GitHub identity.
 # shellcheck disable=SC2016 # $HOME expands inside the guest shell.
 assert_guest "$manifest_instance" 'test -f /etc/profile.d/zz-devbox-10-proxy.sh; test ! -e /etc/profile.d/zz-devbox-12-gh-proxy.sh; test ! -e "$HOME/.devbox/gh-proxy"'

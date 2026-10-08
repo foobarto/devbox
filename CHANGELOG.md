@@ -40,6 +40,16 @@
   box received from an older `--proxy` is no longer renewed and is removed on
   its next entry.
 - Restore the guest's Homebrew `gh` link when GitHub proxying is removed.
+- Add grant policies: `.devbox.toml` declares host access in a `[grants]`
+  table, optionally on a named `policy` (`none`, `agent`, `agent-github`, or
+  `~/.config/devbox/policies/NAME.toml`); `devbox --policy NAME` (`-P`) and a
+  machine default in `config.toml` choose one per run, and a kept box is brought
+  in line with the policy in effect. `devbox policy list|show` inspects them.
+- A project manifest builds on the machine default policy and cannot lift its
+  audited egress. A top-level `policy` key in `config.toml`, previously ignored,
+  now sets that default.
+- The per-grant flags, `-a`, and top-level manifest grant keys are deprecated in
+  favour of policies and `[grants]`; they keep working.
 
 ## v1.4.0 - 2026-08-28
 

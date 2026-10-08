@@ -1,7 +1,7 @@
 # Per-project Devbox manifest. Copy this to a project's root as `.devbox.toml`.
-# CLI flags override image/resource/proxy/API-key choices here. Host-affecting
-# options declared in this file are shown and require an explicit approval on
-# startup.
+# CLI flags override image/resource choices here, and `devbox --policy NAME`
+# replaces its policy and [grants]. Host-affecting options declared in this file
+# are shown and require an explicit approval on startup.
 #
 # TOML NOTE: every key after a `[table]` header belongs to that table, so all
 # top-level keys below must come BEFORE the [image] and [resources] sections.
@@ -15,18 +15,13 @@ packages = ["node", "python@3.12"]
 # out of this field unless you intentionally want the shell to wait for them.
 start = "npm install"
 
-# The remaining top-level fields are opt-in host-affecting capabilities.
-# Uncomment what the project genuinely needs; each is listed in the prompt.
-# ssh_agent = true
-# keep = true
-# proxy = true                         # AI logins only; or "http://host.lima.internal:4141"
-# gh_proxy = true                      # host GitHub login for gh — a separate grant
-# api_keys = true                      # or "/path/to/api-keys.env"
-# with_creds = true
-# with_agent_config = true             # copies allowlisted settings, never auth files
-# mounts = ["/host/data:ro", "/host/cache:rw"]
-# copies = ["~/.netrc", "./tooling:~/tooling"]
-# no_auth = true                       # cannot be combined with proxy/gh_proxy/api_keys/with_creds
+# keep = true                         # keep the box after the shell exits
+
+# Host access is granted through a policy and/or a [grants] table — see
+# docs/policies.md. Without either, the box gets nothing from the host beyond
+# the project mount (or the machine default policy, if one is configured).
+# A named base: none, agent, agent-github, or ~/.config/devbox/policies/NAME.toml.
+# policy = "agent"
 
 # --- base image ------------------------------------------------------------
 # Shorthand form — use this when you only need to pick a base image:
@@ -69,3 +64,17 @@ memory = "6GiB"
 # Disk is a ceiling, not an allocation: Lima's qcow2 is sparse, so this costs
 # only what is actually written. It is also grow-only — qcow2 cannot shrink.
 disk = "100GiB"
+
+# --- grants ----------------------------------------------------------------
+# Each grant is listed in the approval prompt. Keys here replace the base
+# policy's. Uncomment only what the project genuinely needs.
+# [grants]
+# ai_proxy = true                      # host AI logins via the proxy; or a proxy URL
+# github = true                        # host GitHub login for gh — a separate grant
+# ssh_agent = true
+# agent_config = true                  # allowlisted settings, never auth files
+# api_keys = true                      # or "/path/to/api-keys.env"
+# host_credentials = true              # copies host AI credential files
+# egress = "audit"                     # "open" (default) or "audit"
+# mounts = ["/host/data:ro", "/host/cache:rw"]
+# copies = ["~/.netrc", "./tooling:~/tooling"]
