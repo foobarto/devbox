@@ -783,6 +783,19 @@ print("" if d is None else d)' "$1"
   [ "$(cat "$GUEST_HOME/conf/netrc")" = single ]
 }
 
+@test "audited egress lets the guest reach loopback and the Devbox proxy directly" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR/config"; mkdir -p "$CONFIG_DIR"
+  profile="$BATS_TEST_TMPDIR/traffic-profile"
+  printf '#!/bin/sh\necho "part.one"\n' > "$BATS_TEST_TMPDIR/launcher"; chmod +x "$BATS_TEST_TMPDIR/launcher"
+  proxy_launcher() { printf '%s' "$BATS_TEST_TMPDIR/launcher"; }
+  ensure_guest_nftables() { :; }; apply_connect_traffic_firewall() { :; }
+  limactl() { if [[ "$*" == *zz-devbox-30-traffic-audit.sh* ]]; then cat > "$profile"; fi; return 0; }
+  apply_connect_traffic_audit box http://host.lima.internal:4141
+  grep -Fxq "export HTTPS_PROXY=http://part.one@host.lima.internal:4141" "$profile"
+  grep -Fxq "export NO_PROXY=localhost,127.0.0.1,::1,host.lima.internal no_proxy=localhost,127.0.0.1,::1,host.lima.internal" "$profile"
+  ! grep -q 'unset NO_PROXY' "$profile"
+}
+
 @test "GitHub proxy URL carries its capability as HTTP proxy userinfo" {
   run bash -c 'printf %s "$2" | { source "$1"; github_proxy_url "$3"; }' _ "$DEVBOX" "part.one" "http://host.lima.internal:4141"
   [ "$status" -eq 0 ]
