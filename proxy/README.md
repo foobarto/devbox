@@ -115,7 +115,13 @@ covered. Remove it from a kept box with `devbox --traffic-audit=off`. See the
 For Codex subscriptions, `devbox --proxy` gives the guest an isolated,
 non-secret Codex profile that points its ChatGPT backend and WebSocket traffic
 to the host proxy. As its API key the guest only receives the box's proxy
-capability; the host replaces it with the refreshed OAuth header.
+capability; the host replaces it with the refreshed OAuth header. Only Codex's
+own API, `chatgpt.com/backend-api/codex/`, is routed: the rest of
+`chatgpt.com/backend-api` (conversation history, account, billing, and cloud
+tasks) never receives the host login. Request paths with dot segments or encoded
+separators are refused, so no route can be escaped through its prefix. A
+`proxy.config.json` copied from an older example still routes all of
+`/backend-api/`; change its `match` to `/backend-api/codex/`.
 The host must have a current `codex` CLI on `PATH`. All Devbox proxy processes
 also serialize refresh requests through an owner-only host lock and re-read
 `auth.json` after taking it, so custom-port or concurrently started proxies

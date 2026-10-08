@@ -22,6 +22,8 @@
 - The credential proxy listens on `127.0.0.1` by default, and its AI routes
   require a per-box capability, revoked when the box is destroyed or run with
   `--no-auth`. Custom `proxy-env` templates get it as `__PROXY_TOKEN__`.
+- Limit the proxy's ChatGPT route to Codex's API (`/backend-api/codex/`) and
+  refuse request paths with dot segments or encoded separators.
 
 ## v1.4.0 - 2026-08-28
 
