@@ -19,13 +19,14 @@ start = "npm install"
 # Uncomment what the project genuinely needs; each is listed in the prompt.
 # ssh_agent = true
 # keep = true
-# proxy = true                         # or "http://host.lima.internal:4141"
+# proxy = true                         # AI logins only; or "http://host.lima.internal:4141"
+# gh_proxy = true                      # host GitHub login for gh — a separate grant
 # api_keys = true                      # or "/path/to/api-keys.env"
 # with_creds = true
 # with_agent_config = true             # copies allowlisted settings, never auth files
 # mounts = ["/host/data:ro", "/host/cache:rw"]
 # copies = ["~/.netrc", "./tooling:~/tooling"]
-# no_auth = true                       # cannot be combined with proxy/api_keys/with_creds
+# no_auth = true                       # cannot be combined with proxy/gh_proxy/api_keys/with_creds
 
 # --- base image ------------------------------------------------------------
 # Shorthand form — use this when you only need to pick a base image:

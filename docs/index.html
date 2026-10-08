@@ -103,8 +103,8 @@
           </article>
           <article class="capability">
             <p class="capability-number">02</p><h3>Authenticated provider requests</h3>
-            <p>The host proxy makes permitted AI and GitHub requests without putting the underlying host tokens in the VM—and records the requested action.</p>
-            <code>--proxy</code>
+            <p>The host proxy makes permitted AI requests—and, only as a separate grant, GitHub requests—without putting the underlying host tokens in the VM, and records the requested action.</p>
+            <code>--proxy</code> <code>--gh-proxy</code>
           </article>
           <article class="capability">
             <p class="capability-number">03</p><h3>Proxy-or-fail web egress</h3>
@@ -147,7 +147,7 @@
           <div class="audit-cards">
             <article>
               <span>DETAILED REQUEST AUDIT</span>
-              <h3>AI + GitHub through <code>--proxy</code></h3>
+              <h3>AI and GitHub through <code>--proxy</code> / <code>--gh-proxy</code></h3>
               <p>Capture the real submitted prompt or API payload, then see whether a remote mutation succeeded.</p>
               <pre><code><span class="prompt">$</span> devbox proxy audit show
 <span class="prompt">$</span> devbox proxy audit export audit.html</code></pre>
@@ -216,7 +216,8 @@
         <div class="flag-list">
           <article><code>--keep, -k</code><p>Leave the box running when the shell exits.</p></article>
           <article><code>--ephemeral-sessions, -e</code><p>Keep this run's AI transcripts on the disposable guest disk.</p></article>
-          <article><code>--proxy[=URL], -p</code><p>Use host-side AI and GitHub authentication without exposing real tokens in the VM.</p></article>
+          <article><code>--proxy[=URL], -p</code><p>Use host-side AI authentication without exposing real tokens in the VM.</p></article>
+          <article><code>--gh-proxy[=URL|off], -H</code><p>Separately, let <code>gh</code> act as the host's GitHub login, again without exposing the token.</p></article>
           <article><code>--traffic-audit, -T</code><p>Route normal web tooling through the audited proxy or fail on direct web ports.</p></article>
           <article><code>--ssh-agent, -s</code><p>Forward the host SSH agent for authentication and SSH-signed commits.</p></article>
           <article><code>--gui, -G</code><p>Open a GUI-ready shell or a guest Wayland application through Waypipe.</p></article>

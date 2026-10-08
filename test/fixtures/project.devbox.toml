@@ -4,6 +4,7 @@ start = "npm ci"
 ssh_agent = true
 keep = true
 proxy = "http://host.lima.internal:4141"
+gh_proxy = true
 with_creds = true
 with_agent_config = true
 mounts = ["/host/data:ro"]

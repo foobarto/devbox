@@ -280,6 +280,18 @@ PY
 assert_guest "$manifest_instance" \
   "python3 '$MANIFEST_PROJECT/.e2e-trust-check.py' '$MANIFEST_PROJECT' '$MOUNT_SOURCE'"
 
+echo "[e2e] --proxy grants AI routes only; --gh-proxy is a separate grant"
+# The manifest says proxy = true: the box may use the host AI logins but must
+# not be wired to the host GitHub identity.
+# shellcheck disable=SC2016 # $HOME expands inside the guest shell.
+assert_guest "$manifest_instance" 'test -f /etc/profile.d/zz-devbox-10-proxy.sh; test ! -e /etc/profile.d/zz-devbox-12-gh-proxy.sh; test ! -e "$HOME/.devbox/gh-proxy"'
+run_session approve "$DEVBOX_BIN" "$MANIFEST_PROJECT" --gh-proxy
+# shellcheck disable=SC2016 # $HOME and brew expand inside the guest shell.
+assert_guest "$manifest_instance" 'test -f /etc/profile.d/zz-devbox-12-gh-proxy.sh; test -x "$HOME/.devbox/gh-proxy/bin/gh"; test "$(readlink -f "$(brew --prefix)/bin/gh")" = "$HOME/.devbox/gh-proxy/bin/gh"'
+run_session approve "$DEVBOX_BIN" "$MANIFEST_PROJECT" --gh-proxy=off
+# shellcheck disable=SC2016 # $HOME and brew expand inside the guest shell.
+assert_guest "$manifest_instance" 'test ! -e /etc/profile.d/zz-devbox-12-gh-proxy.sh; test ! -e "$HOME/.devbox/gh-proxy"; test -f /etc/profile.d/zz-devbox-10-proxy.sh; gh --version >/dev/null'
+
 echo "[e2e] -a copies non-secret agent config without copying OAuth credentials"
 run_session approve "$DEVBOX_BIN" "$MANIFEST_PROJECT" -a
 # shellcheck disable=SC2016 # $HOME expands inside the guest shell.

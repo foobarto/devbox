@@ -36,8 +36,9 @@ leaky or compromised box can't exfiltrate what it never had.
 
 ## Authentication (works out of the box)
 
-For Claude, Codex, and GitHub CLI, `devbox --proxy` needs no proxy configuration
-file when the corresponding host CLI is already logged in. Each default route
+For Claude and Codex (`devbox --proxy`) and GitHub CLI (`devbox --gh-proxy`, a
+separate grant), no proxy configuration file is needed when the corresponding
+host CLI is already logged in. Each default route
 chooses, in order:
 
 | provider | API-key preference | OAuth credential |
@@ -158,18 +159,23 @@ both and delivers the new CA certificate to running boxes with their next
 renewal check.
 GitHub-owned download hosts are tunnelled without TLS interception.
 
-`--proxy` also moves the usable Homebrew `gh` binary into the wrapper's managed
+`--gh-proxy` is a grant of its own: `--proxy` and `-a` never include it, so a
+box can use the host's AI logins while staying sealed off from the host's
+GitHub identity. A kept box keeps the grant until `devbox --gh-proxy=off` or
+`--no-auth` removes it.
+
+`--gh-proxy` also moves the usable Homebrew `gh` binary into the wrapper's managed
 private directory and replaces Homebrew's public `bin/gh` link with the wrapper.
 That prevents ordinary child-process and absolute-Homebrew-path mistakes. The
 real binary must remain executable by the same guest user for the wrapper to run
 it, so this is not a security boundary against deliberately hostile guest code.
-`--no-auth` restores Homebrew's normal link.
+`--gh-proxy=off` and `--no-auth` restore Homebrew's normal link.
 
 Log in on the host first:
 
 ```sh
 gh auth login
-devbox --proxy
+devbox --gh-proxy
 ```
 
 The guest wrapper refuses `gh auth login`, `logout`, and token-changing auth
@@ -191,7 +197,7 @@ credential-safe smoke check. Do not run `gh auth login` in the guest; log in on
 the host instead. Re-entering a kept box still repairs the wrapper/profile and
 records it for daemon renewal, but is no longer needed for routine refreshes.
 After upgrading from a proxy version without daemon renewal, the first new
-`devbox --proxy`, `devbox proxy start`, or `devbox proxy refresh` restarts only
+`devbox --proxy`/`--gh-proxy`, `devbox proxy start`, or `devbox proxy refresh` restarts only
 the host proxy process once; it does not restart any guest.
 
 If the box says `gh` is missing, it predates the golden-image installation.
@@ -202,7 +208,7 @@ the golden and recreate only that box:
 devbox build --force
 devbox ls                         # identify the kept box name
 devbox destroy <box-name>
-devbox --keep --proxy
+devbox --keep --gh-proxy
 ```
 
 ## Quick start

@@ -149,6 +149,7 @@ try:
 except ValueError as exc:
     raise SystemExit("GitHub proxy capability renewal intervals must be integers") from exc
 _LIMA_INSTANCE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+GITHUB_GRANT_MARKER = "grant=gh_proxy"  # matches GH_PROXY_GRANT_MARKER in bin/devbox
 # stdin: the capability-bearing proxy URL on the first line, then the current
 # local CA certificate. Delivering the CA with every renewal lets a running box
 # follow a regenerated CA instead of failing TLS until its next `devbox` run.
@@ -1306,7 +1307,13 @@ def registered_github_proxy_boxes() -> dict[str, str]:
             continue
         try:
             with open(entry.path, encoding="utf-8") as endpoint_file:
-                endpoint = endpoint_file.read(4096).strip()
+                lines = endpoint_file.read(4096).splitlines()
+            # Only explicit --gh-proxy grants carry the marker. Registrations
+            # from before the AI/GitHub split came from a plain --proxy and are
+            # left to expire instead of being renewed.
+            if len(lines) < 2 or lines[1].strip() != GITHUB_GRANT_MARKER:
+                continue
+            endpoint = lines[0].strip()
             parsed = urlsplit(endpoint)
             endpoint_port = parsed.port or 4141
         except (OSError, ValueError):
@@ -1402,6 +1409,17 @@ def deliver_github_proxy_capability(name: str, endpoint: str) -> None:
         raise RuntimeError(f"could not update {name}: {detail}")
 
 
+def retract_github_proxy_capability(name: str) -> None:
+    """Remove a just-delivered capability from a guest whose grant was revoked."""
+    try:
+        subprocess.run(
+            ["limactl", "shell", name, "--", "bash", "-c", 'rm -f -- "$HOME/.devbox/gh-proxy/proxy-url"'],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        sys.stderr.write(f"[devbox-ai-proxy] could not retract GitHub capability from {name}: {exc}\n")
+
+
 def refresh_registered_github_proxy_boxes(
     renewed_at: dict[str, tuple[str, float, int]] | None = None,
     *,
@@ -1449,11 +1467,22 @@ def refresh_registered_github_proxy_boxes(
             and timestamp - previous[1] < GITHUB_PROXY_RENEW_SECONDS
         ):
             continue
+        # Re-check: `--gh-proxy=off` may have removed the grant while this
+        # pass was running, and a late delivery would re-create guest state.
+        registration = os.path.join(github_proxy_registration_dir(), f"{name}.url")
+        if not os.path.isfile(registration):
+            continue
         try:
             deliver_github_proxy_capability(name, endpoint)
         except RuntimeError as exc:
             summary["failed"] += 1
             sys.stderr.write(f"[devbox-ai-proxy] GitHub capability renewal failed: {exc}\n")
+            continue
+        # The grant can still disappear between that check and the delivery.
+        # Removal deletes the registration before touching the guest, so a
+        # registration missing now means the delivery raced it: take it back.
+        if not os.path.isfile(registration):
+            retract_github_proxy_capability(name)
             continue
         history[name] = (endpoint, timestamp, ca_generation)
         summary["renewed"] += 1
@@ -1929,7 +1958,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/_devbox"):
             # Feature markers let bin/devbox restart an older daemon after an
             # upgrade (see PROXY_REQUIRED_FEATURE there). Only ever append.
-            body = b"devbox-ai-proxy ok gh-self-renewal gh-ca-renewal ai-client-auth\n"
+            body = b"devbox-ai-proxy ok gh-self-renewal gh-ca-renewal ai-client-auth gh-explicit-grant\n"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
