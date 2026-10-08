@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.0.1 - 2026-10-08
+
+- Show account-specific Codex models, including Daybreak Blue, when using the
+  AI proxy. Fetch the account's model catalog through the proxy on each entry
+  and load it into the isolated Codex profile without copying host credentials.
+- Validate catalogs with the guest's installed Codex before replacing a working
+  catalog. Bound refresh time and response size, refuse redirects and symlinked
+  profile paths, and retain the previous catalog if a refresh fails.
+
 ## v2.0.0 - 2026-10-08
 
 - Invalidate cached `.devbox.toml` approval when a symlink or contextual default

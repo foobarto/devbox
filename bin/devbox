@@ -1179,6 +1179,125 @@ proxy_ensure() {
 # --proxy and --gh-proxy are separate grants with separate trust boundaries:
 # the first lets the box spend the host's AI-provider logins, the second lets
 # it act as the host's GitHub identity. Neither implies the other.
+refresh_codex_proxy_config() { # $1 Lima instance $2 Codex proxy base URL $3 box capability
+  # Send the capability on stdin, never in the guest process's argument list.
+  # shellcheck disable=SC2016 # $1 expands in the guest shell.
+  { printf '%s\n' "$3"; cat <<'PY'
+import json
+import http.client
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+base_url = sys.argv[1]
+capability = os.environ.pop("DEVBOX_AI_CAPABILITY")
+profile = Path.home() / ".devbox" / "codex-proxy"
+catalog = profile / "models.json"
+config = profile / "config.toml"
+for path in (profile.parent, profile, catalog, config):
+    if path.is_symlink():
+        raise SystemExit("[devbox] refusing a symlink in the Codex proxy profile")
+for path in (profile.parent, profile):
+    path.mkdir(mode=0o700, exist_ok=True)
+    path.chmod(0o700)
+
+def valid_catalog(data):
+    return (isinstance(data, dict) and isinstance(data.get("models"), list)
+            and bool(data["models"])
+            and all(isinstance(model, dict)
+                    and isinstance(model.get("slug"), str) and model["slug"]
+                    and isinstance(model.get("display_name"), str)
+                    for model in data["models"]))
+
+def check_catalog(path):
+    # Let the installed CLI check its own schema, which changes between
+    # versions. An isolated home avoids touching running Codex state or loading
+    # user hooks/plugins. No RPCs or inference requests are sent.
+    with tempfile.TemporaryDirectory(prefix=".catalog-check.", dir=profile) as state:
+        subprocess.run(
+            ["codex", "app-server", "--strict-config",
+             "-c", f"model_catalog_json={json.dumps(str(path))}",
+             "-c", f"openai_base_url={json.dumps(base_url)}"],
+            env=dict(os.environ, CODEX_HOME=state, OPENAI_API_KEY=capability,
+                     OPENAI_BASE_URL=base_url), cwd=state, stdin=subprocess.DEVNULL,
+            capture_output=True, check=True, timeout=5)
+
+def atomic_write(path, text, validate=False):
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=profile)
+    try:
+        with os.fdopen(fd, "w") as output:
+            output.write(text)
+        if validate:
+            check_catalog(Path(temporary))
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+def expired(_signum, _frame):
+    raise TimeoutError("model catalog refresh deadline")
+
+previous_alarm = signal.signal(signal.SIGALRM, expired)
+signal.alarm(20)
+catalog_ready = False
+try:
+    version_output = subprocess.run(
+        ["codex", "--version"], capture_output=True, text=True,
+        check=True, timeout=5).stdout
+    version = re.search(r"codex-cli ([0-9][A-Za-z0-9.+-]*)", version_output)
+    if version is None:
+        raise ValueError("unknown Codex version")
+    request = urllib.request.Request(
+        f"{base_url}/models?client_version={version[1]}",
+        headers={"Authorization": f"Bearer {capability}",
+                 "Accept": "application/json", "originator": "codex_cli_rs",
+                 "User-Agent": f"codex_cli_rs/{version[1]}"})
+    # Reach the credential proxy directly and never forward its capability on
+    # a redirect or through an environment-configured HTTP proxy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    with opener.open(request, timeout=15) as response:
+        body = response.read(4 * 1024 * 1024 + 1)
+    if len(body) > 4 * 1024 * 1024:
+        raise ValueError("oversized model catalog")
+    data = json.loads(body)
+    if not valid_catalog(data):
+        raise ValueError("invalid model catalog")
+    # Only the model definitions cross into the guest, not account/cache state.
+    atomic_write(catalog, json.dumps({"models": data["models"]}) + "\n", validate=True)
+    catalog_ready = True
+except (OSError, ValueError, subprocess.SubprocessError, http.client.HTTPException):
+    # Do not print exception text: a custom upstream could echo credentials.
+    print("[devbox] could not refresh Codex's account model catalog; "
+          "using the previous catalog or bundled models", file=sys.stderr)
+finally:
+    signal.alarm(0)
+    signal.signal(signal.SIGALRM, previous_alarm)
+
+text = f"openai_base_url = {json.dumps(base_url)}\n"
+try:
+    if valid_catalog(json.loads(catalog.read_text())):
+        if not catalog_ready:
+            check_catalog(catalog)
+        catalog.chmod(0o600)
+        text += f"model_catalog_json = {json.dumps(str(catalog))}\n"
+except (OSError, ValueError, subprocess.SubprocessError):
+    pass
+atomic_write(config, text)
+PY
+  } | limactl shell "$1" -- bash -c \
+    'IFS= read -r DEVBOX_AI_CAPABILITY; export DEVBOX_AI_CAPABILITY; exec python3 - "$1"' \
+    bash "$2"
+}
+
 apply_ai_proxy() { # $1 Lima instance $2 bare http proxy URL
   local name="$1" url="$2" tmpl="$CONFIG_DIR/proxy-env" launcher ai_token
   valid_gh_proxy_endpoint "$url" || die "proxy must be a bare http://host:port URL with a numeric port"
@@ -1220,15 +1339,10 @@ EOF
 # devbox --proxy: keep Codex's isolated proxy profile separate from user config.
 export CODEX_HOME="$HOME/.devbox/codex-proxy"
 EOF
-  # shellcheck disable=SC2016 # $HOME expands in the guest shell.
-  limactl shell "$name" -- bash -c 'umask 077; install -d -m 700 "$HOME/.devbox/codex-proxy"'
-  # shellcheck disable=SC2016 # $HOME expands in the guest shell.
-  python3 - "$url/backend-api/codex" <<'PY' \
-    | limactl shell "$name" -- bash -c 'tee "$HOME/.devbox/codex-proxy/config.toml" >/dev/null; chmod 600 "$HOME/.devbox/codex-proxy/config.toml"'
-import json
-import sys
-print(f"openai_base_url = {json.dumps(sys.argv[1])}")
-PY
+  # API-key auth uses Codex's bundled model list, even when inference is routed
+  # to a ChatGPT subscription. Load that account's catalog explicitly so its
+  # additional models are selectable too. Refresh on every entry/rewiring.
+  refresh_codex_proxy_config "$name" "$url/backend-api/codex" "$ai_token"
   # shellcheck disable=SC2016 # $HOME expands in the guest shell.
   limactl shell "$name" -- bash -c 'rm -f "$HOME/.devbox/codex-proxy/auth.json"'
 }
