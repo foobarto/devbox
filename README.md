@@ -82,6 +82,7 @@ devbox sessions [path|clear --yes] [DIR]
 
 | flag | effect |
 |---|---|
+| `--policy NAME`, `-P NAME` | grant the box exactly what [grant policy](docs/policies.md) `NAME` contains (`none`, `agent`, `agent-github`, or a host-defined one), instead of the project's `[grants]`. A kept box is brought in line with it. |
 | `--image NAME`, `-i NAME` | base image for this box's golden (default `ubuntu-24.04`). See [Images](#images). |
 | `--cpus N`, `-j N` | CPUs for this box (default 4). |
 | `--memory SIZE`, `-M SIZE` | memory for this box, e.g. `12GiB` (default `6GiB`). |
@@ -97,10 +98,43 @@ devbox sessions [path|clear --yes] [DIR]
 | `--with-creds`, `-c` | copy host AI-tool credential files into the box (OAuth logins for claude/codex without a proxy). Best-effort. |
 | `--with-agent-config`, `-g` | copy an allowlisted set of non-secret Claude, Codex, OpenCode, and Stado settings, prompts, rules, and custom agents. Auth, histories, caches, and key directories are excluded; suspected credentials are skipped. |
 | `--gui`, `-G` | start a GUI-ready Devbox shell through Waypipe; after the optional `--`, run one guest GUI app instead. |
-| `-a` | shortcut for `--with-agent-config --proxy --ssh-agent`; it never enables `--gh-proxy`, `--with-creds`, or GUI forwarding. |
+| `-a` | shortcut for `--with-agent-config --proxy --ssh-agent`, added to the run's grants; it never enables `--gh-proxy`, `--with-creds`, or GUI forwarding. `--policy agent` grants the same set but replaces the project's grants. |
 | `--mount PATH[:ro\|:rw]`, `-m PATH[:ro\|:rw]` | mount an extra host path into the box at the same path (default `ro`). Repeatable; applied at box creation. |
 | `--copy SRC[:DEST]`, `-C SRC[:DEST]` | copy an extra host file/dir into the box (`DEST` defaults to the basename in `$HOME`). Repeatable; works on new **and** existing boxes. |
 | `--name NAME`, `-N NAME` | override the derived instance name. |
+
+The per-grant flags — `--proxy`, `--gh-proxy`, `--ssh-agent`,
+`--with-agent-config`, `--api-keys`, `--with-creds`, `--traffic-audit`, and
+`--no-auth`, plus the `-a` bundle — are deprecated in favour of
+[grant policies](#grant-policies). They still work and add to the run's grants.
+
+### Grant policies
+
+Everything a box may use from the host beyond its project mount is a grant:
+the AI proxy, the GitHub proxy, the SSH agent, agent configuration, API keys,
+copied credentials, mounts, copies, and audited egress. Declare them once in
+the project's `.devbox.toml`, or pick a named policy:
+
+```toml
+policy = "agent"           # optional base: none, agent, agent-github, or ~/.config/devbox/policies/NAME.toml
+
+[grants]
+egress = "audit"
+mounts = ["./fixtures:ro"]
+```
+
+```sh
+devbox --policy none .     # this run gets nothing from the host, whatever the project asks
+devbox policy show agent   # what a policy grants
+```
+
+The grants for a run come from `--policy`, else the project's manifest (built on
+its own `policy` or the machine default), else a machine default
+`policy = "NAME"` in `~/.config/devbox/config.toml`. A project cannot lift a
+machine default's audited egress. While a policy is in effect, a kept box loses
+any grant it no longer contains. See
+[grant policies](docs/policies.md) for every grant and how it maps to the old
+flags.
 
 > **Agent boundaries:** a Devbox agent cannot read host files or credentials by
 > default. `--ssh-agent` lets it use loaded SSH identities without extracting
@@ -401,12 +435,13 @@ a request smaller than the golden's is refused with a warning rather than
 silently applied. `cpus` and `memory` are applied per-box at clone time, so
 changing them never requires rebuilding the golden.
 
-The manifest can also declare `ssh_agent`, `keep`, `proxy`, `gh_proxy`, `api_keys`,
-`with_creds`, `with_agent_config`, `mounts`, `copies`, and `no_auth`. Because a
-project manifest is repository-controlled input, Devbox groups every declaration
+The manifest can also declare `keep`, a grant `policy`, and a `[grants]` table
+(see [grant policies](#grant-policies)); the older top-level grant keys still
+work but are deprecated. Because a project manifest is repository-controlled
+input, Devbox groups every declaration
 by type, gives each category a distinct icon, and prints multiline
 provisioning and startup scripts as readable blocks. Relative host paths in
-local images, `api_keys`, `mounts`, and copy sources resolve from the manifest's
+local images and in the manifest's `[grants]` resolve from the manifest's
 directory, so their meaning does not change with the shell's working directory.
 
 On the first use of a manifest, Devbox offers an optional AI summary and safety
@@ -442,7 +477,8 @@ Configuration and generated golden metadata live under `~/.config/devbox/`
 
 ```
 ~/.config/devbox/
-├── config.toml                  # machine-wide [resources] defaults
+├── config.toml                  # machine-wide [resources] and default grant policy
+├── policies/NAME.toml           # host-defined grant policies (see docs/policies.md)
 ├── devbox-golden-<image>.yaml   # generated golden configs
 ├── api-keys.env                 # for --api-keys / the proxy   (gitignored)
 ├── proxy.config.json            # proxy routes                 (gitignored)

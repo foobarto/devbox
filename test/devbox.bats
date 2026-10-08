@@ -828,9 +828,12 @@ print("" if d is None else d)' "$1"
 # Drive cmd_run against an existing kept box with every side effect stubbed,
 # and print which auth grants it applied or removed.
 run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoint
+  # Never the real ~/.config/devbox: config.toml could carry a default policy.
+  export DEVBOX_CONFIG_DIR="${AUTH_CONFIG_DIR:-$BATS_TEST_TMPDIR/auth-config}"
+  mkdir -p "$DEVBOX_CONFIG_DIR"
   run bash -c '
     source "$1"; shift; set +u
-    project="$(mktemp -d)"
+    project="${AUTH_PROJECT:-$(mktemp -d)}"
     instance_exists() { return 0; }
     instance_status() { echo Running; }
     prepare_session_dir() { :; }; session_state_other_instance() { :; }
@@ -844,7 +847,12 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
     apply_ai_proxy() { echo "ai $2"; }
     apply_gh_proxy() { echo "gh $2"; }
     clear_gh_proxy() { echo "clear-gh"; }
+    clear_ai_proxy() { echo "clear-ai"; }
     clear_auth() { echo "clear-all"; }
+    clear_connect_traffic_audit() { echo "clear-traffic"; }
+    apply_connect_traffic_audit() { echo "traffic $2"; }
+    stored_traffic_proxy_endpoint() { [[ "${STORED_TRAFFIC:-0}" == 1 ]] && echo http://host.lima.internal:4141; }
+    confirm_manifest_permissions() { :; }
     stored_gh_proxy_endpoint() {
       case "${STORED_GH:-0}" in
         1) echo http://host.lima.internal:4141;;
@@ -881,7 +889,7 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
   [[ "$output" == *"remove with --gh-proxy=off"* ]]
 
   # Wired by the old combined --proxy: removed rather than refreshed.
-  STORED_GH=legacy run_auth_grants -a
+  STORED_GH=legacy run_auth_grants --proxy
   [ "$status" -eq 0 ]
   [[ "$output" == *"clear-gh"* ]]
   [[ "$output" == *"from an older --proxy"* ]]
@@ -903,6 +911,173 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
   [[ "$output" == *"clear-gh"* ]]
   run_auth_grants --gh-proxy --no-auth
   [ "$status" -ne 0 ]
+}
+
+@test "grants come from --policy, else the manifest, else the machine default" {
+  AUTH_CONFIG_DIR="$BATS_TEST_TMPDIR/cfg"; mkdir -p "$AUTH_CONFIG_DIR"
+  AUTH_PROJECT="$BATS_TEST_TMPDIR/proj"; mkdir -p "$AUTH_PROJECT"
+  export AUTH_CONFIG_DIR AUTH_PROJECT
+
+  # Machine default, no manifest.
+  printf 'policy = "agent-github"\n' > "$AUTH_CONFIG_DIR/config.toml"
+  run_auth_grants
+  [[ "$output" == *"ai http://host.lima.internal:4141"* && "$output" == *"gh http://host.lima.internal:4141"* ]]
+
+  # A manifest without its own policy builds on the machine default.
+  printf '[grants]\negress = "audit"\n' > "$AUTH_PROJECT/.devbox.toml"
+  run_auth_grants
+  [[ "$output" == *"ai http"* && "$output" == *"gh http"* && "$output" == *"traffic http"* ]]
+  # ... and its keys replace the default's.
+  printf '[grants]\ngithub = false\n' > "$AUTH_PROJECT/.devbox.toml"
+  run_auth_grants
+  [[ "$output" == *"ai http"* && "$output" != *"gh http"* ]]
+  # A manifest naming its own policy does not build on the default.
+  printf 'policy = "none"\n[grants]\nai_proxy = true\negress = "audit"\n' > "$AUTH_PROJECT/.devbox.toml"
+  run_auth_grants
+  [[ "$output" == *"ai http"* && "$output" != *"gh http"* && "$output" == *"traffic http"* ]]
+
+  # An explicit --policy replaces the manifest.
+  run_auth_grants --policy none
+  [[ "$output" != *"ai http"* && "$output" != *"gh http"* && "$output" != *"traffic http"* ]]
+
+  # A host policy file shadows the built-in name; manifest keys override it.
+  mkdir -p "$AUTH_CONFIG_DIR/policies"
+  printf '[grants]\ngithub = true\n' > "$AUTH_CONFIG_DIR/policies/agent.toml"
+  run_auth_grants --policy agent
+  [[ "$output" == *"gh http"* && "$output" != *"ai http"* ]]
+  printf 'policy = "agent"\n[grants]\ngithub = false\nai_proxy = true\n' > "$AUTH_PROJECT/.devbox.toml"
+  run_auth_grants
+  [[ "$output" == *"ai http"* && "$output" != *"gh http"* ]]
+  unset AUTH_CONFIG_DIR AUTH_PROJECT
+}
+
+@test "--policy overrides a manifest whose policy this host does not have" {
+  AUTH_PROJECT="$BATS_TEST_TMPDIR/proj"; mkdir -p "$AUTH_PROJECT"; export AUTH_PROJECT
+  printf 'policy = "only-on-another-host"\n[grants]\nai_proxy = true\n' > "$AUTH_PROJECT/.devbox.toml"
+  run_auth_grants
+  [ "$status" -ne 0 ]
+  run_auth_grants --policy none
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"ai http"* ]]
+  _DB_MANIFEST_GRANTS_REPLACED=1
+  records="$(manifest_request_records "$(project_manifest "$AUTH_PROJECT/.devbox.toml")" | tr '\0' '\n')"
+  [[ "$records" == *"not used: --policy replaces them"* ]]
+  [[ "$records" != *"proxy|"* ]]
+  unset AUTH_PROJECT
+}
+
+@test "a kept box is brought in line with its policy; without one it keeps its grants" {
+  AUTH_CONFIG_DIR="$BATS_TEST_TMPDIR/cfg"; export AUTH_CONFIG_DIR
+  mkdir -p "$AUTH_CONFIG_DIR/ai-proxy-boxes" "$AUTH_CONFIG_DIR/gh-proxy-boxes"
+  AUTH_PROJECT="$BATS_TEST_TMPDIR/proj"; mkdir -p "$AUTH_PROJECT"; export AUTH_PROJECT
+  box="$(bash -c 'source "$1"; instance_name ubuntu-24.04 "$(readlink -f "$2")"' _ "$DEVBOX" "$AUTH_PROJECT")"
+  echo secret > "$AUTH_CONFIG_DIR/ai-proxy-boxes/$box.key"
+  printf 'http://host.lima.internal:4141\ngrant=gh_proxy\n' > "$AUTH_CONFIG_DIR/gh-proxy-boxes/$box.url"
+
+  STORED_GH=1 STORED_TRAFFIC=1 run_auth_grants --policy none
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"clear-ai"* && "$output" == *"clear-gh"* && "$output" == *"clear-traffic"* ]]
+  [[ "$output" != *"gh http"* && "$output" != *"traffic http"* ]]
+
+  # No policy anywhere: the legacy behaviour refreshes what the box has.
+  STORED_GH=1 STORED_TRAFFIC=1 run_auth_grants
+  [[ "$output" == *"gh http"* && "$output" == *"traffic http"* && "$output" != *"clear-"* ]]
+  unset AUTH_CONFIG_DIR AUTH_PROJECT
+}
+
+@test "-a adds to the run's grants and never removes a remembered GitHub grant" {
+  STORED_GH=1 run_auth_grants -a
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ai http://host.lima.internal:4141"* && "$output" == *"gh http://host.lima.internal:4141"* ]]
+  [[ "$output" != *"clear-"* ]]
+  [[ "$output" == *"-a deprecated"* ]]
+  run_auth_grants -a --no-auth
+  [ "$status" -ne 0 ]
+}
+
+@test "a manifest cannot relax the machine default's audited egress" {
+  AUTH_CONFIG_DIR="$BATS_TEST_TMPDIR/cfg"; mkdir -p "$AUTH_CONFIG_DIR/policies"; export AUTH_CONFIG_DIR
+  AUTH_PROJECT="$BATS_TEST_TMPDIR/proj"; mkdir -p "$AUTH_PROJECT"; export AUTH_PROJECT
+  printf 'policy = "audited"\n' > "$AUTH_CONFIG_DIR/config.toml"
+  printf '[grants]\negress = "audit"\n' > "$AUTH_CONFIG_DIR/policies/audited.toml"
+  printf '[grants]\negress = "open"\nai_proxy = true\n' > "$AUTH_PROJECT/.devbox.toml"
+  run_auth_grants
+  [[ "$output" == *"traffic http"* && "$output" == *"ai http"* ]]
+  # The approval shows the default it builds on.
+  DEVBOX_CONFIG_DIR="$AUTH_CONFIG_DIR" run bash -c 'source "$1"; set +u
+    manifest_request_records "$(project_manifest "$2/.devbox.toml")" | tr "\0" "\n"' _ "$DEVBOX" "$AUTH_PROJECT"
+  [[ "$output" == *"policy|Builds on this machine's default grant policy audited"* ]]
+  [[ "$output" == *"egress|"* ]]
+  unset AUTH_CONFIG_DIR AUTH_PROJECT
+}
+
+@test "policy convergence removes the copied API-key profile from a kept box" {
+  AUTH_PROJECT="$BATS_TEST_TMPDIR/proj"; mkdir -p "$AUTH_PROJECT"; export AUTH_PROJECT
+  run bash -c '
+    source "$1"; set +u
+    export DEVBOX_CONFIG_DIR="$2/cfg"; CONFIG_DIR="$2/cfg"; mkdir -p "$CONFIG_DIR"
+    instance_exists() { return 0; }; instance_status() { echo Running; }
+    prepare_session_dir() { :; }; session_state_other_instance() { :; }
+    require_project_writable() { :; }; disable_session_persistence() { :; }; remove_session_mount() { :; }
+    seed_agent_trust() { :; }; run_cleanup() { :; }
+    stored_gh_proxy_endpoint() { return 1; }; stored_traffic_proxy_endpoint() { return 1; }
+    limactl() { [[ "$*" == *zz-devbox-20-keys.sh* ]] && echo "LIMACTL $*"; return 0; }
+    cmd_run "$3" --keep --ephemeral-sessions --policy none
+  ' _ "$DEVBOX" "$BATS_TEST_TMPDIR" "$AUTH_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"LIMACTL shell"*"sudo rm -f /etc/profile.d/zz-devbox-20-keys.sh"* ]]
+  unset AUTH_PROJECT
+}
+
+@test "policy list reports bad configuration, and a dangling policy file is an error" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR/cfg"; mkdir -p "$CONFIG_DIR/policies"
+  GLOBAL_CONFIG="$CONFIG_DIR/config.toml"
+  printf 'policy = "nope"\n' > "$GLOBAL_CONFIG"
+  run cmd_policy list
+  [ "$status" -ne 0 ]
+  printf '[policy]\nname = "x"\n' > "$GLOBAL_CONFIG"
+  run cmd_policy list
+  [ "$status" -ne 0 ]
+  printf 'policy = "agent"\n' > "$GLOBAL_CONFIG"
+  run cmd_policy list
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"default: agent"* ]]
+  ln -s "$BATS_TEST_TMPDIR/missing.toml" "$CONFIG_DIR/policies/none.toml"
+  run policy_manifest none
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"dangling link"* ]]
+}
+
+@test "per-grant flags and top-level manifest grant keys are deprecated, not removed" {
+  run_auth_grants --proxy --ssh-agent
+  [[ "$output" == *"--proxy --ssh-agent deprecated"* ]]
+  [[ "$output" == *"ai http"* ]]
+  AUTH_PROJECT="$BATS_TEST_TMPDIR/proj"; mkdir -p "$AUTH_PROJECT"; export AUTH_PROJECT
+  printf 'proxy = true\n' > "$AUTH_PROJECT/.devbox.toml"
+  run_auth_grants
+  [[ "$output" == *"top level are deprecated; move them into [grants]"* ]]
+  [[ "$output" == *"ai http"* ]]
+  printf 'proxy = true\n[grants]\nssh_agent = true\n' > "$AUTH_PROJECT/.devbox.toml"
+  run_auth_grants
+  [ "$status" -ne 0 ]
+  unset AUTH_PROJECT
+}
+
+@test "policy grants are validated and resolve paths from their own file" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR/cfg"; mkdir -p "$CONFIG_DIR/policies/sub" "$BATS_TEST_TMPDIR/cfg/policies/data"
+  printf '[grants]\nmounts = ["./data:ro"]\nai_proxy = "http://host.lima.internal"\n' > "$CONFIG_DIR/policies/ro.toml"
+  grants="$(policy_manifest ro)"
+  [ "$(manifest_json_value "$grants" mounts)" = "[\"$(readlink -f "$CONFIG_DIR/policies/data"):ro\"]" ]
+  [ "$(manifest_value "$grants" proxy)" = "http://host.lima.internal:4141" ]
+  printf '[grants]\nunknown = true\n' > "$CONFIG_DIR/policies/bad.toml"
+  run policy_manifest bad
+  [ "$status" -ne 0 ]
+  run policy_manifest "../escape"
+  [ "$status" -ne 0 ]
+  printf 'policy = "ro"\n' > "$BATS_TEST_TMPDIR/.devbox.toml"
+  records="$(manifest_request_records "$(project_manifest "$BATS_TEST_TMPDIR/.devbox.toml")" | tr '\0' '\n')"
+  [[ "$records" == *"policy|Use grant policy ro ($CONFIG_DIR/policies/ro.toml)"* ]]
+  [[ "$records" == *"mount-ro|Mount $(readlink -f "$CONFIG_DIR/policies/data")"* ]]
 }
 
 @test "clearing the GitHub grant leaves the AI grant in the guest, and vice versa" {
@@ -992,7 +1167,7 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
   source_text="$(<"$DEVBOX")"
   [[ "$source_text" == *'cmd_gui() { cmd_run --gui "$@"; }'* ]]
   [[ "$source_text" == *'--gui|-G) gui=1'* ]]
-  [[ "$source_text" == *'-a) with_agent_config=1; proxy="$PROXY_DEFAULT_URL"; ssh_agent=1'* ]]
+  [[ "$source_text" == *'-a) with_agent_config=1; proxy="$PROXY_DEFAULT_URL"; ssh_agent=1; legacy_flags+=(-a);;'* ]]
   [[ "$source_text" != *'-a) with_agent_config=1; proxy="$PROXY_DEFAULT_URL"; ssh_agent=1; gui=1'* ]]
   [[ "$source_text" == *'waypipe --no-gpu'*'ssh -F "$ssh_config" "lima-$name"'* ]]
   [[ "$source_text" == *'ssh -F "$ssh_config" -tt "lima-$name"'* ]]
@@ -1764,8 +1939,8 @@ true' ''
   [ "$status" -eq 0 ]
   [[ "$output" == *"--with-agent-config, -g"* ]]
   [[ "$output" == *"--gui, -G"* ]]
-  [[ "$output" == *"shortcut for --with-agent-config --proxy --ssh-agent"* ]]
-  [[ "$output" != *"shortcut for --with-agent-config --proxy --ssh-agent --gui"* ]]
+  [[ "$output" == *"shortcut for --with-agent-config --proxy --ssh-agent, added"* ]]
+  [[ "$output" == *"--gh-proxy. \`--policy agent\` grants the same set but"* ]]
   run bash "$DEVBOX" -V
   [ "$status" -eq 0 ]
   [ "$output" = "devbox $(tr -d "[:space:]" < "$BATS_TEST_DIRNAME/../VERSION")" ]

@@ -24,9 +24,16 @@
 #                               manage the shared host-side proxy
 #   devbox sessions [path|clear [--yes]] [DIR]
 #                               inspect or remove persistent AI session state
+#   devbox policy [list|show NAME]
+#                               list grant policies or show what one grants
 #   devbox --version|-V
 #
 # Run flags
+#   --policy NAME, -P NAME
+#                    grant the box exactly what policy NAME contains (built-in:
+#                    none, agent, agent-github; or ~/.config/devbox/policies/
+#                    NAME.toml), instead of the project's [grants]. A kept box is
+#                    brought in line with it. See docs/policies.md.
 #   --image NAME, -i NAME
 #                    base image for this box's golden (default: ubuntu-24.04).
 #                    NAME may be a Lima template name (ubuntu-24.04, debian-12,
@@ -78,8 +85,12 @@
 #                    appear in the host Wayland session. With `-- APP`, run
 #                    just that GUI application instead of opening a shell.
 #                    `-g` remains --with-agent-config for compatibility.
-#   -a               shortcut for --with-agent-config --proxy --ssh-agent; it
-#                    never includes --gh-proxy.
+#   -a               shortcut for --with-agent-config --proxy --ssh-agent, added
+#                    to the run's grants like those flags; it never includes
+#                    --gh-proxy. `--policy agent` grants the same set but
+#                    replaces the project's grants.
+#   The per-grant flags above are deprecated in favour of --policy and
+#   [grants] in .devbox.toml; they still add to the run's grants.
 #   --mount P[:ro|:rw], -m P[:ro|:rw]
 #                    mount an extra host path into the box at the same path
 #                    (default ro). Repeatable. Applied at box creation.
@@ -267,6 +278,22 @@ import json, sys, tomllib
 from pathlib import Path
 data = tomllib.loads(Path(sys.argv[1]).read_text()).get("resources", {})
 print(json.dumps({k: v for k, v in data.items() if k in ("cpus", "memory", "disk")}))
+PY
+}
+
+# The machine-default grant policy: a top-level `policy = "NAME"` in config.toml.
+global_default_policy() {
+  [[ -r "$GLOBAL_CONFIG" ]] || return 0
+  python3 - "$GLOBAL_CONFIG" <<'PY'
+import sys, tomllib
+from pathlib import Path
+try:
+    policy = tomllib.loads(Path(sys.argv[1]).read_text()).get("policy", "")
+except (OSError, tomllib.TOMLDecodeError) as exc:
+    raise SystemExit(f"could not read {sys.argv[1]}: {exc}")
+if not isinstance(policy, str):
+    raise SystemExit("config.toml: policy must be a policy name")
+print(policy)
 PY
 }
 
@@ -2044,7 +2071,8 @@ seed_agent_trust() { # $1 Lima instance $2 mounted project dir
 
 # --------------------------------------------------------- project manifest --
 project_manifest() { # $1 .devbox.toml -> normalized JSON
-  python3 - "$1" "$PROXY_DEFAULT_URL" "$DEFAULT_KEYS_FILE" <<'PY'
+  python3 - "$1" "$PROXY_DEFAULT_URL" "$DEFAULT_KEYS_FILE" "$CONFIG_DIR/policies" "$GLOBAL_CONFIG" \
+    "${_DB_MANIFEST_GRANTS_REPLACED:-0}" <<'PY'
 import json
 import os
 import re
@@ -2059,6 +2087,11 @@ except ImportError:
 path = Path(sys.argv[1])
 proxy_default = sys.argv[2]
 keys_default = os.path.realpath(os.path.abspath(os.path.expanduser(sys.argv[3])))
+policies_dir = sys.argv[4]
+global_config = sys.argv[5]
+# `devbox --policy` replaces the manifest's grants for the run, so they are not
+# resolved at all: a policy this host does not have cannot block the override.
+grants_replaced = sys.argv[6] == "1"
 manifest_dir = os.path.realpath(os.path.dirname(os.path.abspath(path)))
 try:
     data = tomllib.loads(path.read_text())
@@ -2079,9 +2112,18 @@ def reject_nul(value):
 
 reject_nul(data)
 
+# The old top-level grant keys are still read; new manifests declare grants in
+# a [grants] table, optionally on top of a named policy (docs/policies.md).
+LEGACY_GRANT_KEYS = {
+    "proxy": "ai_proxy", "gh_proxy": "github", "ssh_agent": "ssh_agent",
+    "with_agent_config": "agent_config", "api_keys": "api_keys",
+    "with_creds": "host_credentials", "mounts": "mounts", "copies": "copies",
+}
+GRANT_KEYS = {"ai_proxy", "github", "ssh_agent", "agent_config", "api_keys",
+              "host_credentials", "egress", "mounts", "copies"}
 allowed = {
-    "image", "packages", "start", "ssh_agent", "keep", "proxy", "gh_proxy", "api_keys",
-    "with_creds", "with_agent_config", "no_auth", "mounts", "copies", "resources",
+    "image", "packages", "start", "keep", "resources", "policy", "grants", "no_auth",
+    *LEGACY_GRANT_KEYS,
 }
 unknown = sorted(set(data) - allowed)
 if unknown:
@@ -2116,10 +2158,10 @@ elif image is not None and (not isinstance(image, str) or not image):
 if image and ("\n" in image or "\r" in image or chr(34) in image or chr(92) in image):
     raise SystemExit("image location must not contain newlines, double quotes, or backslashes")
 
-def resolve_host_path(value):
+def resolve_host_path(value, base_dir=None):
     value = os.path.expanduser(value)
     if not os.path.isabs(value):
-        value = os.path.join(manifest_dir, value)
+        value = os.path.join(base_dir or manifest_dir, value)
     resolved = os.path.realpath(value)
     if "\n" in resolved or "\r" in resolved:
         raise SystemExit("resolved host paths must not contain newlines")
@@ -2163,26 +2205,18 @@ start = data.get("start")
 if start is not None and (not isinstance(start, str) or not start):
     raise SystemExit("start must be a non-empty shell command string")
 
-for key in ("ssh_agent", "keep", "with_creds", "with_agent_config", "no_auth"):
-    if key in data and not isinstance(data[key], bool):
-        raise SystemExit(f"{key} must be true or false")
+if "keep" in data and not isinstance(data["keep"], bool):
+    raise SystemExit("keep must be true or false")
+if "no_auth" in data and not isinstance(data["no_auth"], bool):
+    raise SystemExit("no_auth must be true or false")
 
-for key in ("proxy", "gh_proxy", "api_keys"):
-    value = data.get(key, False)
-    if not isinstance(value, (bool, str)) or isinstance(value, str) and not value:
-        raise SystemExit(f"{key} must be true, false, or a non-empty path/URL string")
-    if isinstance(value, str) and ("\n" in value or "\r" in value):
-        raise SystemExit(f"{key} must not contain newlines")
+BUILTIN_POLICIES = {
+    "none": {},
+    "agent": {"agent_config": True, "ai_proxy": True, "ssh_agent": True},
+    "agent-github": {"agent_config": True, "ai_proxy": True, "ssh_agent": True, "github": True},
+}
 
-for key in ("mounts", "copies"):
-    value = data.get(key, [])
-    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
-        raise SystemExit(f"{key} must be an array of non-empty strings")
-    if any("\n" in item or "\r" in item for item in value):
-        raise SystemExit(f"{key} entries must not contain newlines")
-
-def proxy_endpoint(key):
-    value = data.get(key, False)
+def proxy_endpoint(key, value):
     if value is True:
         if "\n" in proxy_default or "\r" in proxy_default:
             raise SystemExit("the effective proxy URL must not contain newlines")
@@ -2195,44 +2229,148 @@ def proxy_endpoint(key):
         raise SystemExit(f"{key} must be a bare http://host:port URL with a numeric port")
     return value if match.group(1) is not None else value + ":4141"
 
-proxy = proxy_endpoint("proxy")
-gh_proxy = proxy_endpoint("gh_proxy")
+def normalize_grants(raw, base_dir, where):
+    """Validate one source's grants and resolve its paths from base_dir."""
+    if not isinstance(raw, dict):
+        raise SystemExit(f"{where} must be a table")
+    unknown = sorted(set(raw) - GRANT_KEYS)
+    if unknown:
+        raise SystemExit(f"unknown grant(s) in {where}: {', '.join(unknown)}")
+    grants = {}
+    for key in ("ssh_agent", "agent_config", "host_credentials"):
+        if key in raw:
+            if not isinstance(raw[key], bool):
+                raise SystemExit(f"{where}: {key} must be true or false")
+            grants[key] = raw[key]
+    for key in ("ai_proxy", "github", "api_keys"):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if not isinstance(value, (bool, str)) or isinstance(value, str) and not value:
+            raise SystemExit(f"{where}: {key} must be true, false, or a non-empty path/URL string")
+        if isinstance(value, str) and ("\n" in value or "\r" in value):
+            raise SystemExit(f"{where}: {key} must not contain newlines")
+        if key == "api_keys":
+            if value is True:
+                if "\n" in keys_default or "\r" in keys_default:
+                    raise SystemExit("the effective default API-key path must not contain newlines")
+                value = keys_default
+            elif isinstance(value, str):
+                value = resolve_host_path(value, base_dir)
+            grants[key] = value
+        else:
+            grants[key] = proxy_endpoint(key, value)
+    if "egress" in raw:
+        if raw["egress"] not in ("open", "audit"):
+            raise SystemExit(f'{where}: egress must be "open" or "audit"')
+        grants["egress"] = raw["egress"]
+    for key in ("mounts", "copies"):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+            raise SystemExit(f"{where}: {key} must be an array of non-empty strings")
+        if any("\n" in item or "\r" in item for item in value):
+            raise SystemExit(f"{key} entries must not contain newlines")
+        resolved = []
+        for item in value:
+            if key == "mounts":
+                suffix = next((suffix for suffix in (":rw", ":ro") if item.endswith(suffix)), "")
+                source = item[:-len(suffix)] if suffix else item
+                if not source:
+                    raise SystemExit("mount entries require a host path")
+                resolved_source = resolve_host_path(source, base_dir)
+                # Lima splits a --mount value on "," and reads ":" as a mode
+                # delimiter, so either one in the resolved path could add a
+                # different, writable mount.
+                if ":" in resolved_source or "," in resolved_source:
+                    raise SystemExit("mount host paths must not contain ':' or ',' (after resolving symlinks)")
+                resolved.append(resolved_source + suffix)
+            elif ":" in item:
+                source, destination = item.rsplit(":", 1)
+                if not source or not destination:
+                    raise SystemExit("copy entries require SRC[:DEST]")
+                resolved.append(f"{resolve_host_path(source, base_dir)}:{destination}")
+            else:
+                resolved_source = resolve_host_path(item, base_dir)
+                if ":" in resolved_source:
+                    raise SystemExit("copy entries whose resolved host path contains a colon require an explicit destination")
+                resolved.append(resolved_source)
+        grants[key] = resolved
+    return grants
 
-api_keys = data.get("api_keys", False)
-if api_keys is True:
-    if "\n" in keys_default or "\r" in keys_default:
-        raise SystemExit("the effective default API-key path must not contain newlines")
-    api_keys = keys_default
-elif isinstance(api_keys, str):
-    api_keys = resolve_host_path(api_keys)
+def load_policy(name):
+    """Return (grants, source) for a host-defined or built-in policy."""
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+        raise SystemExit("policy must be a policy name (letters, digits, '.', '_', '-')")
+    policy_path = os.path.join(policies_dir, f"{name}.toml")
+    if os.path.lexists(policy_path) and not os.path.exists(policy_path):
+        raise SystemExit(f"policy {name}: {policy_path} is a dangling link")
+    if os.path.exists(policy_path):
+        real = os.path.realpath(policy_path)
+        try:
+            policy = tomllib.loads(Path(real).read_text())
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise SystemExit(f"could not read policy {name}: {exc}")
+        reject_nul(policy)
+        unknown = sorted(set(policy) - {"grants"})
+        if unknown:
+            raise SystemExit(f"policy {name}: unknown key(s): {', '.join(unknown)}")
+        return normalize_grants(policy.get("grants", {}), os.path.dirname(real), f"policy {name}"), real
+    if name in BUILTIN_POLICIES:
+        return normalize_grants(BUILTIN_POLICIES[name], manifest_dir, f"policy {name}"), "built-in"
+    raise SystemExit(f"unknown policy: {name} (built-in: {', '.join(BUILTIN_POLICIES)}; "
+                     f"or create {policy_path})")
 
-mounts = []
-for item in data.get("mounts", []):
-    suffix = next((suffix for suffix in (":rw", ":ro") if item.endswith(suffix)), "")
-    source = item[:-len(suffix)] if suffix else item
-    if not source:
-        raise SystemExit("mount entries require a host path")
-    resolved_source = resolve_host_path(source)
-    # Lima splits a --mount value on "," and reads ":" as a mode delimiter, so
-    # either one in the resolved path could add a different, writable mount.
-    if ":" in resolved_source or "," in resolved_source:
-        raise SystemExit("mount host paths must not contain ':' or ',' (after resolving symlinks)")
-    mounts.append(resolved_source + suffix)
+def machine_default_policy():
+    try:
+        config = tomllib.loads(Path(global_config).read_text())
+    except FileNotFoundError:
+        return ""
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise SystemExit(f"could not read {global_config}: {exc}")
+    name = config.get("policy", "")
+    if not isinstance(name, str):
+        raise SystemExit(f"{global_config}: policy must be a policy name")
+    return name
 
-copies = []
-for item in data.get("copies", []):
-    if ":" in item:
-        source, destination = item.rsplit(":", 1)
-        if not source or not destination:
-            raise SystemExit("copy entries require SRC[:DEST]")
-        copies.append(f"{resolve_host_path(source)}:{destination}")
+legacy_keys = sorted(key for key in LEGACY_GRANT_KEYS if key in data)
+policy_name = data.get("policy", "")
+policy_source = ""
+default_policy = ""
+if legacy_keys and ("policy" in data or "grants" in data):
+    raise SystemExit(f"declare {', '.join(legacy_keys)} inside [grants] when using policy or [grants]")
+if grants_replaced:
+    grants = {}
+    policy_name = ""
+    legacy_keys = []
+elif legacy_keys:
+    grants = normalize_grants({LEGACY_GRANT_KEYS[key]: data[key] for key in legacy_keys},
+                              manifest_dir, ".devbox.toml")
+else:
+    grants = {}
+    if "policy" in data:
+        grants, policy_source = load_policy(policy_name)
     else:
-        resolved_source = resolve_host_path(item)
-        if ":" in resolved_source:
-            raise SystemExit("copy entries whose resolved host path contains a colon require an explicit destination")
-        copies.append(resolved_source)
+        # Without a policy of its own, a manifest builds on this machine's
+        # default policy, which is part of what the approval shows and covers.
+        default_policy = machine_default_policy()
+        if default_policy:
+            grants, policy_source = load_policy(default_policy)
+    default_egress = grants.get("egress") if default_policy else None
+    grants.update(normalize_grants(data.get("grants", {}), manifest_dir, "[grants]"))
+    # The machine owner's audited egress is a restriction, not a grant: a
+    # repository manifest cannot relax it.
+    if default_egress == "audit":
+        grants["egress"] = "audit"
 
-if data.get("no_auth") and (data.get("proxy") or data.get("gh_proxy") or data.get("api_keys") or data.get("with_creds")):
+proxy = grants.get("ai_proxy", False)
+gh_proxy = grants.get("github", False)
+api_keys = grants.get("api_keys", False)
+mounts = grants.get("mounts", [])
+copies = grants.get("copies", [])
+
+if data.get("no_auth") and (proxy or gh_proxy or api_keys or grants.get("host_credentials")):
     raise SystemExit("no_auth cannot be combined with proxy, gh_proxy, api_keys, or with_creds")
 
 print(json.dumps({
@@ -2242,14 +2380,39 @@ print(json.dumps({
     "image_provision_user": image_provision_user,
     "cpus": cpus or "", "memory": resources.get("memory", ""),
     "disk": resources.get("disk", ""),
-    "ssh_agent": data.get("ssh_agent", False), "keep": data.get("keep", False),
+    "ssh_agent": grants.get("ssh_agent", False), "keep": data.get("keep", False),
     "proxy": proxy, "gh_proxy": gh_proxy, "api_keys": api_keys,
-    "with_creds": data.get("with_creds", False),
-    "with_agent_config": data.get("with_agent_config", False),
+    "with_creds": grants.get("host_credentials", False),
+    "with_agent_config": grants.get("agent_config", False),
     "no_auth": data.get("no_auth", False),
     "mounts": mounts, "copies": copies,
+    "traffic_audit": "connect" if grants.get("egress") == "audit" else "",
+    "policy": policy_name or default_policy, "policy_source": policy_source,
+    "policy_is_default": bool(default_policy),
+    # A policy, [grants], or the machine default declares the box's whole grant
+    # set (docs/policies.md).
+    "grants_declared": not grants_replaced and ("policy" in data or "grants" in data or bool(default_policy)),
+    "grants_replaced": grants_replaced,
+    "legacy_grant_keys": legacy_keys,
 }))
 PY
+}
+
+# A named policy as normalized grants: the same validation and path resolution
+# as a project manifest that says only `policy = "NAME"`.
+policy_manifest() { # $1 policy name -> normalized JSON
+  local tmp out
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/devbox-policy.XXXXXX")" || return 1
+  # Explicit checks: callers use `|| die`, which disables errexit in here, and
+  # an empty manifest would silently mean "no grants".
+  if ! python3 -c 'import json, sys; print("policy = " + json.dumps(sys.argv[1]))' "$1" > "$tmp/$PROJECT_MANIFEST_NAME" \
+      || [[ ! -s "$tmp/$PROJECT_MANIFEST_NAME" ]] \
+      || ! out="$(_DB_MANIFEST_GRANTS_REPLACED=0 project_manifest "$tmp/$PROJECT_MANIFEST_NAME")"; then
+    rm -rf -- "$tmp"
+    return 1
+  fi
+  rm -rf -- "$tmp"
+  printf '%s\n' "$out"
 }
 
 manifest_value() { # $1 normalized manifest JSON $2 key
@@ -2274,6 +2437,16 @@ data = json.load(os.fdopen(3))
 
 def emit(kind, detail):
     sys.stdout.buffer.write(f"{kind}|{detail}".encode() + b"\0")
+
+if data.get("grants_replaced"):
+    emit("policy", "Any policy or grants this manifest declares are not used: --policy replaces them for this run")
+if data.get("policy"):
+    source = data.get("policy_source") or ""
+    if data.get("policy_is_default"):
+        emit("policy", f"Builds on this machine's default grant policy {data['policy']} ({source}); "
+                       "the combined grants are listed below")
+    else:
+        emit("policy", f"Use grant policy {data['policy']} ({source}); the combined grants are listed below")
 
 if data["image"]:
     emit("image", f"Declared base image: {data['image']}")
@@ -2317,6 +2490,8 @@ if data["with_creds"]:
     emit("credentials", "Copy host AI credential files into the box")
 if data["no_auth"]:
     emit("no-auth", "Disable Devbox-managed authentication")
+if data.get("traffic_audit"):
+    emit("egress", "Send ordinary web traffic only through the audited host proxy (egress = audit)")
 
 for item in data["mounts"]:
     if item.endswith(":rw"):
@@ -2487,6 +2662,8 @@ manifest_request_style() { # $1 request type -> icon<TAB>heading
     gh-proxy)       printf '🐙\tGitHub identity (host gh login)' ;;
     credentials)    printf '🔐\tCredentials' ;;
     no-auth)        printf '🔒\tAuthentication' ;;
+    policy)         printf '📜\tGrant policy' ;;
+    egress)         printf '🧭\tWeb egress' ;;
     mount-ro)       printf '📂\tRead-only host mount' ;;
     mount-rw)       printf '✍️\tRead-write host mount' ;;
     copy)           printf '📋\tHost file copy' ;;
@@ -2906,7 +3083,7 @@ run_cleanup() {
 
 cmd_run() {
   local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 with_agent_config=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name="" gui=0 traffic_audit="" ephemeral_sessions=0
-  local gh_proxy="" no_gh_proxy=0
+  local gh_proxy="" no_gh_proxy=0 cli_policy="" legacy_flags=()
   local extra_mounts=() extra_copies=() manifest_requests=() gui_command=()
   local cli_cpus="" cli_memory="" cli_disk=""
   local golden_digest="" golden_provision="" golden_provision_user=""
@@ -2923,21 +3100,23 @@ cmd_run() {
       --disk=*|-D=*) cli_disk="${1#*=}";;
       --keep|-k) keep=1;;
       --ephemeral-sessions|-e) ephemeral_sessions=1;;
-      --ssh-agent|-s) ssh_agent=1;;
-      --with-creds|-c) with_creds=1;;
-      --with-agent-config|-g) with_agent_config=1;;
-      -a) with_agent_config=1; proxy="$PROXY_DEFAULT_URL"; ssh_agent=1;;
-      --no-auth|-n) no_auth=1;;
-      --api-keys|-K) api_keys="$DEFAULT_KEYS_FILE";;
-      --api-keys=*|-K=*) api_keys="$(abspath "${1#*=}")";;
-      --proxy|-p) proxy="$PROXY_DEFAULT_URL";;
-      --proxy=*|-p=*) proxy="${1#*=}";;
-      --gh-proxy|-H) gh_proxy="$PROXY_DEFAULT_URL";;
-      --gh-proxy=off|-H=off) no_gh_proxy=1; gh_proxy="";;
+      --ssh-agent|-s) ssh_agent=1; legacy_flags+=(--ssh-agent);;
+      --with-creds|-c) with_creds=1; legacy_flags+=(--with-creds);;
+      --with-agent-config|-g) with_agent_config=1; legacy_flags+=(--with-agent-config);;
+      -a) with_agent_config=1; proxy="$PROXY_DEFAULT_URL"; ssh_agent=1; legacy_flags+=(-a);;
+      --policy|-P) shift; cli_policy="${1:?--policy needs a policy name}";;
+      --policy=*|-P=*) cli_policy="${1#*=}";;
+      --no-auth|-n) no_auth=1; legacy_flags+=(--no-auth);;
+      --api-keys|-K) api_keys="$DEFAULT_KEYS_FILE"; legacy_flags+=(--api-keys);;
+      --api-keys=*|-K=*) api_keys="$(abspath "${1#*=}")"; legacy_flags+=(--api-keys);;
+      --proxy|-p) proxy="$PROXY_DEFAULT_URL"; legacy_flags+=(--proxy);;
+      --proxy=*|-p=*) proxy="${1#*=}"; legacy_flags+=(--proxy);;
+      --gh-proxy|-H) gh_proxy="$PROXY_DEFAULT_URL"; legacy_flags+=(--gh-proxy);;
+      --gh-proxy=off|-H=off) no_gh_proxy=1; gh_proxy=""; legacy_flags+=(--gh-proxy);;
       --gh-proxy=|-H=) die "--gh-proxy= needs a proxy URL or off";;
-      --gh-proxy=*|-H=*) gh_proxy="${1#*=}";;
-      --traffic-audit|-T) traffic_audit=connect;;
-      --traffic-audit=*|-T=*) traffic_audit="${1#*=}";;
+      --gh-proxy=*|-H=*) gh_proxy="${1#*=}"; legacy_flags+=(--gh-proxy);;
+      --traffic-audit|-T) traffic_audit=connect; legacy_flags+=(--traffic-audit);;
+      --traffic-audit=*|-T=*) traffic_audit="${1#*=}"; legacy_flags+=(--traffic-audit);;
       --mount|-m) shift; extra_mounts+=("${1:?--mount needs PATH[:ro|:rw]}");;
       --mount=*|-m=*) extra_mounts+=("${1#*=}");;
       --copy|-C) shift; extra_copies+=("${1:?--copy needs SRC[:DEST]}");;
@@ -2962,6 +3141,10 @@ cmd_run() {
   [[ $gui -eq 0 ]] || require_host_gui
 
   local manifest_path="$dir/$PROJECT_MANIFEST_NAME" manifest="" manifest_start=""
+  # Global, not local: the delegated cmd_build and every re-check must read the
+  # manifest the same way for its fingerprint to match.
+  _DB_MANIFEST_GRANTS_REPLACED=0
+  [[ -z "$cli_policy" ]] || _DB_MANIFEST_GRANTS_REPLACED=1
   if [[ -f "$manifest_path" ]]; then
     manifest_digest="$(manifest_fingerprint "$manifest_path")" \
       || die "could not read $PROJECT_MANIFEST_NAME"
@@ -2972,7 +3155,7 @@ cmd_run() {
       || die "$PROJECT_MANIFEST_NAME changed while it was being read; run devbox again"
     manifest_semantics="$(manifest_semantics_fingerprint "$manifest")" \
       || die "could not normalize $PROJECT_MANIFEST_NAME"
-    local manifest_image manifest_proxy manifest_gh_proxy manifest_api_keys manifest_mounts manifest_copies item
+    local manifest_image item
     manifest_image="$(manifest_value "$manifest" image)"
     if [[ $image_set -eq 0 && -n "$manifest_image" ]]; then
       image="$manifest_image"
@@ -2989,47 +3172,62 @@ cmd_run() {
     manifest_packages="$(manifest_json_value "$manifest" packages)"
     manifest_start="$(manifest_value "$manifest" start)"
 
-    if [[ "$(manifest_value "$manifest" ssh_agent)" == True && $ssh_agent -eq 0 ]]; then
-      ssh_agent=1
-    fi
     if [[ "$(manifest_value "$manifest" keep)" == True ]]; then
       keep=1
     fi
+  fi
 
-    if [[ "$(manifest_value "$manifest" with_agent_config)" == True && $with_agent_config -eq 0 ]]; then
-      with_agent_config=1
+  # The run's grants come from exactly one place (docs/policies.md): an
+  # explicit --policy, else the project manifest, else the machine default.
+  # A declared policy is the box's whole grant set, so a kept box is brought
+  # in line with it below; the legacy flags still add to it.
+  local grants="" policy_in_effect=0 default_policy="" item
+  if [[ -n "$cli_policy" ]]; then
+    grants="$(policy_manifest "$cli_policy")" || die "invalid policy: $cli_policy"
+    policy_in_effect=1
+  elif [[ -n "$manifest" ]]; then
+    # The manifest's normalized grants already build on the machine default.
+    grants="$manifest"
+    [[ "$(manifest_value "$manifest" grants_declared)" == True ]] && policy_in_effect=1
+    if [[ "$(manifest_json_value "$manifest" legacy_grant_keys)" != "[]" ]]; then
+      warn "$PROJECT_MANIFEST_NAME grant keys at the top level are deprecated; move them into [grants] (see docs/policies.md)"
     fi
+  else
+    default_policy="$(global_default_policy)" || die "invalid $GLOBAL_CONFIG"
+    if [[ -n "$default_policy" ]]; then
+      grants="$(policy_manifest "$default_policy")" || die "invalid default policy in $GLOBAL_CONFIG: $default_policy"
+      policy_in_effect=1
+    fi
+  fi
+  if [[ ${#legacy_flags[@]} -gt 0 ]]; then
+    warn "$(printf '%s\n' "${legacy_flags[@]}" | sort -u | paste -sd' ' -) deprecated: use --policy or [grants] in $PROJECT_MANIFEST_NAME (see docs/policies.md)"
+  fi
+
+  if [[ -n "$grants" ]]; then
+    [[ "$(manifest_value "$grants" ssh_agent)" == True ]] && ssh_agent=1
+    [[ "$(manifest_value "$grants" with_agent_config)" == True ]] && with_agent_config=1
     if [[ $no_auth -eq 0 ]]; then
-      manifest_proxy="$(manifest_value "$manifest" proxy)"
-      if [[ -z "$proxy" && "$manifest_proxy" != False ]]; then
-        proxy="$manifest_proxy"
-      fi
-      manifest_gh_proxy="$(manifest_value "$manifest" gh_proxy)"
-      if [[ -z "$gh_proxy" && $no_gh_proxy -eq 0 && "$manifest_gh_proxy" != False ]]; then
-        gh_proxy="$manifest_gh_proxy"
-      fi
-      manifest_api_keys="$(manifest_value "$manifest" api_keys)"
-      if [[ -z "$api_keys" && "$manifest_api_keys" != False ]]; then
-        api_keys="$manifest_api_keys"
-      fi
-      if [[ "$(manifest_value "$manifest" with_creds)" == True && $with_creds -eq 0 ]]; then
-        with_creds=1
-      fi
+      local grant_value
+      grant_value="$(manifest_value "$grants" proxy)"
+      [[ -n "$proxy" || "$grant_value" == False ]] || proxy="$grant_value"
+      grant_value="$(manifest_value "$grants" gh_proxy)"
+      [[ -n "$gh_proxy" || $no_gh_proxy -eq 1 || "$grant_value" == False ]] || gh_proxy="$grant_value"
+      grant_value="$(manifest_value "$grants" api_keys)"
+      [[ -n "$api_keys" || "$grant_value" == False ]] || api_keys="$grant_value"
+      [[ "$(manifest_value "$grants" with_creds)" == True ]] && with_creds=1
     fi
-    if [[ "$(manifest_value "$manifest" no_auth)" == True && $no_auth -eq 0 ]]; then
-      no_auth=1
+    [[ "$(manifest_value "$grants" no_auth)" == True ]] && no_auth=1
+    if [[ -z "$traffic_audit" && "$(manifest_value "$grants" traffic_audit)" == connect ]]; then
+      traffic_audit=connect
     fi
-
-    manifest_mounts="$(manifest_json_value "$manifest" mounts)"
     while IFS= read -r item; do
       [[ -n "$item" ]] || continue
       extra_mounts+=("$item")
-    done < <(python3 -c 'import json, sys; print(*json.load(sys.stdin), sep="\n")' <<< "$manifest_mounts")
-    manifest_copies="$(manifest_json_value "$manifest" copies)"
+    done < <(python3 -c 'import json, sys; print(*json.load(sys.stdin)["mounts"], sep="\n")' <<< "$grants")
     while IFS= read -r item; do
       [[ -n "$item" ]] || continue
       extra_copies+=("$item")
-    done < <(python3 -c 'import json, sys; print(*json.load(sys.stdin), sep="\n")' <<< "$manifest_copies")
+    done < <(python3 -c 'import json, sys; print(*json.load(sys.stdin)["copies"], sep="\n")' <<< "$grants")
   fi
   if [[ $no_auth -eq 1 && ( -n "$proxy" || -n "$gh_proxy" || -n "$api_keys" || $with_creds -eq 1 ) ]]; then
     die "--no-auth cannot be combined with --proxy, --gh-proxy, --api-keys, or --with-creds"
@@ -3150,13 +3348,19 @@ cmd_run() {
   [[ -z "$manifest" ]] \
     || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
 
-  local managed_gh_proxy=""
+  local managed_gh_proxy="" converge=0
+  # A kept box follows a declared policy: grants it no longer contains are
+  # removed (docs/policies.md). Without a policy, a kept box keeps what it has.
+  [[ $policy_in_effect -eq 1 && $preexisting -eq 1 ]] && converge=1
   if [[ $no_auth -eq 1 ]]; then
     clear_auth "$name"
   else
     if [[ -n "$proxy" ]]; then
       proxy_ensure "$proxy" || die "could not start credential proxy"
       apply_ai_proxy "$name" "$proxy"
+    elif [[ $converge -eq 1 && -e "$(ai_proxy_token_path "$name")" ]]; then
+      log "Removing AI proxy access from $name: not granted by its policy"
+      clear_ai_proxy "$name"
     fi
     if [[ $no_gh_proxy -eq 1 ]]; then
       if [[ $preexisting -eq 1 ]]; then
@@ -3167,7 +3371,12 @@ cmd_run() {
       managed_gh_proxy="$gh_proxy"
       # A kept box keeps the GitHub grant it was given until --gh-proxy=off or
       # --no-auth removes it; its capability is refreshed on every entry.
-      if [[ -z "$managed_gh_proxy" && $preexisting -eq 1 ]]; then
+      if [[ -z "$managed_gh_proxy" && $converge -eq 1 ]]; then
+        if [[ -e "$(gh_proxy_state_path "$name")" ]]; then
+          log "Removing GitHub CLI proxying from $name: not granted by its policy"
+          clear_gh_proxy "$name"
+        fi
+      elif [[ -z "$managed_gh_proxy" && $preexisting -eq 1 ]]; then
         local stored_status=0
         managed_gh_proxy="$(stored_gh_proxy_endpoint "$name")" || stored_status=$?
         if [[ $stored_status -eq 2 ]]; then
@@ -3192,6 +3401,8 @@ cmd_run() {
         warn "$api_keys sets ANTHROPIC_API_KEY/OPENAI_API_KEY, overriding the box's proxy capability; Devbox's proxy will refuse those AI requests"
       fi
       apply_api_keys "$name" "$api_keys"
+    elif [[ $converge -eq 1 ]]; then
+      limactl shell "$name" -- bash -c 'sudo rm -f /etc/profile.d/zz-devbox-20-keys.sh' </dev/null
     fi
     [[ $with_creds -eq 1 ]] && apply_creds  "$name"
   fi
@@ -3199,7 +3410,10 @@ cmd_run() {
   local managed_traffic_audit="$traffic_audit" traffic_proxy_endpoint=""
   if [[ -z "$managed_traffic_audit" && $preexisting -eq 1 ]]; then
     traffic_proxy_endpoint="$(stored_traffic_proxy_endpoint "$name" || true)"
-    if [[ -n "$traffic_proxy_endpoint" ]]; then
+    if [[ -n "$traffic_proxy_endpoint" && $converge -eq 1 ]]; then
+      traffic_proxy_endpoint=""
+      managed_traffic_audit=off
+    elif [[ -n "$traffic_proxy_endpoint" ]]; then
       managed_traffic_audit=connect
       log "Refreshing remembered proxy-or-fail traffic audit for $name"
     fi
@@ -3289,6 +3503,39 @@ cmd_proxy() {
              *) die "usage: devbox proxy audit [status|show [LIMIT]|export [FILE]]";;
            esac;;
     *) die "usage: devbox proxy [start|stop|status|refresh|audit]";;
+  esac
+}
+
+cmd_policy() {
+  local sub="${1:-list}" name grants records=() record type detail
+  case "$sub" in
+    list)
+      printf '%s\n' "built-in: none agent agent-github"
+      if [[ -d "$CONFIG_DIR/policies" ]]; then
+        for name in "$CONFIG_DIR"/policies/*.toml; do
+          [[ -e "$name" ]] && printf 'host: %s (%s)\n' "$(basename "$name" .toml)" "$name"
+        done
+      fi
+      name="$(global_default_policy)" || die "invalid $GLOBAL_CONFIG"
+      if [[ -n "$name" ]]; then
+        policy_manifest "$name" >/dev/null || die "the default policy in $GLOBAL_CONFIG is invalid: $name"
+        printf 'default: %s\n' "$name"
+      fi
+      ;;
+    show)
+      name="${2:?usage: devbox policy show NAME}"
+      grants="$(policy_manifest "$name")" || die "invalid policy: $name"
+      while IFS= read -r -d '' record; do records+=("$record"); done \
+        < <(manifest_request_records "$grants")
+      printf 'policy %s:\n' "$name"
+      [[ ${#records[@]} -gt 0 ]] || printf '  (no grants)\n'
+      for record in "${records[@]}"; do
+        type="${record%%|*}"; detail="${record#*|}"
+        [[ "$type" == policy ]] && continue
+        printf '  %-12s %s\n' "$type" "${detail//$'\n'/ }"
+      done
+      ;;
+    *) die "usage: devbox policy [list|show NAME]";;
   esac
 }
 
@@ -3400,6 +3647,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     -h|--help|help) usage; exit 0;;
     -V|--version|version) printf 'devbox %s\n' "$DEVBOX_VERSION"; exit 0;;
     sessions)       shift; cmd_sessions "$@"; exit $?;;
+    policy)         shift; cmd_policy "$@"; exit $?;;
   esac
   need limactl
   case "${1:-}" in
