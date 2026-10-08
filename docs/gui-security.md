@@ -34,8 +34,9 @@ client and compositor. See Waypipe's
   GPU render-node access.
 - GUI commands and their working directories are shell-quoted before running
   in the guest.
-- `.devbox.toml` has no `gui` option. A repository cannot enable GUI forwarding
-  merely by being opened; the operator must choose a GUI CLI flag.
+- `.devbox.toml` has no `gui` option, and GUI forwarding is not a grant, so no
+  policy or `[grants]` table can enable it. A repository cannot enable GUI
+  forwarding merely by being opened; the operator must choose a GUI CLI flag.
 
 These controls avoid exposing the raw host socket and GPU devices. They do not
 make a forwarded GUI client harmless.
@@ -58,7 +59,8 @@ having access to the forwarded-desktop capability.
 
 ### The `-a` preset
 
-`-a` expands to `--with-agent-config --proxy --ssh-agent`. It does not enable
+`-a` expands to `--with-agent-config --proxy --ssh-agent`, the same set as the
+built-in `agent` policy (`--policy agent`, the preferred form). It does not enable
 `--gh-proxy`, `--with-creds`, or GUI forwarding, so it grants no host GitHub
 login, copies no AI OAuth files into the guest, and creates no host-GUI path. Add `--gui` or `-G` separately only when you
 intend to grant that capability, for example `devbox --gui -a`.
@@ -85,11 +87,11 @@ notes that traffic size and timing can still reveal interaction patterns.
    If you would not run an application directly on the host, do not forward its
    GUI into the host session.
 2. Inspect a repository's `.devbox.toml` before approving its requested startup
-   command, mounts, copies, or provisioning. Decline the prompt if it asks for
+   command, policy and grants, mounts, copies, or provisioning. Decline the prompt if it asks for
    access you do not intend to grant.
-3. Prefer the smallest set of flags. GUI forwarding is always opt-in; omit
-   `--gui`/`-G` unless it is required. Omit `-a` when proxy access or
-   SSH-agent forwarding is not required.
+3. Prefer the smallest set of grants. GUI forwarding is always opt-in; omit
+   `--gui`/`-G` unless it is required. Prefer `--policy none` over `agent`
+   (or `-a`) when proxy access or SSH-agent forwarding is not required.
 4. Keep the host and guest Waypipe packages updated. Use an ordinary package
    source you trust for an older Devbox's first-time installation.
 5. End the GUI shell or app when finished. Unless `--keep` is set, Devbox then

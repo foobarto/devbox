@@ -37,9 +37,10 @@ location = "ubuntu-24.04"
 # digest = "sha512:…"
 
 # Optional root script baked into the golden. It runs ONCE at golden build time,
-# after devbox's base packages and before Homebrew — not per box — so this is
-# where a heavy distro toolchain belongs. Use a single-quoted ''' string when the
-# script contains backslash escapes: a """ string would interpret them.
+# after the golden's base toolchain (including Homebrew and the AI CLIs) is in
+# place — not per box — so this is where a heavy distro toolchain belongs. Use
+# a single-quoted ''' string when the script contains backslash escapes: a """
+# string would interpret them.
 # provision = '''
 # apt-get install -y --no-install-recommends build-essential
 # '''

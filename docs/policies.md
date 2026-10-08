@@ -60,13 +60,16 @@ The first of these that applies decides the grants for the run:
    the project.
 2. The project's `.devbox.toml`: a base — its own `policy = "NAME"`, or else the
    machine default — then its `[grants]` table, whose keys replace the base's.
+   A manifest still using the old top-level grant keys takes exactly those
+   grants instead, and no policy is in effect for it.
 3. The machine default alone, a top-level `policy = "NAME"` in
    `~/.config/devbox/config.toml`, when there is no manifest.
 4. Nothing: no grants.
 
 `egress = "audit"` in the machine default is a restriction a project cannot
-lift: a manifest building on that default keeps audited egress whatever its
-`[grants]` say.
+lift: every manifest keeps audited egress under such a default, whatever policy,
+`[grants]`, or legacy keys it declares. The operator's own `--policy` is not
+bound by it.
 
 ```toml
 # .devbox.toml
@@ -106,10 +109,11 @@ added by flags and a kept box retains what it was given until `--no-auth` or
 The per-grant flags (`--proxy`, `--gh-proxy`, `--ssh-agent`,
 `--with-agent-config`, `--api-keys`, `--with-creds`, `--traffic-audit`,
 `--no-auth`) and the `-a` bundle still work, with a deprecation notice pointing
-at `[grants]` and `--policy`. They add to the run's grants; `--no-auth`,
+at `[grants]` and `--policy` (`--no-auth` and a manifest's `no_auth = true` remain
+accepted alongside policies). They add to the run's grants; `--no-auth`,
 `--gh-proxy=off`, and `--traffic-audit=off` remove the corresponding ones. Unlike
 `--policy agent`, which replaces the project's grants and brings a kept box in
 line, `-a` only adds agent configuration, the AI proxy, and the SSH agent. The old top-level manifest keys
 (`proxy`, `gh_proxy`, `ssh_agent`, `with_agent_config`, `api_keys`, `with_creds`,
-`mounts`, `copies`, `no_auth`) are still read, with the same notice; a manifest
-cannot mix them with `policy` or `[grants]`.
+`mounts`, `copies`) are still read, with the same notice; a manifest cannot mix
+them with `policy` or `[grants]`.

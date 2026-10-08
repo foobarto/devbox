@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # devbox — disposable, CWD-mounted dev VMs on Lima/QEMU, preloaded with an
-# AI-CLI toolchain (claude, codex, opencode, stado) plus GitHub CLI (`gh`) and
-# Homebrew.
+# AI-CLI toolchain (claude, codex, opencode, pi, stado), the Herdr terminal
+# agent multiplexer, GitHub CLI (`gh`), and Homebrew.
 #
 # Model
 #   A one-time "golden" Lima instance per base image carries the toolchain.
@@ -67,11 +67,12 @@
 #                    opt in to proxy-or-fail web egress. `connect` sets standard
 #                    HTTP(S) proxy variables and blocks direct TCP/UDP 80/443
 #                    from the guest, leaving the audited host proxy as the way
-#                    out. It is separate from -a and may break proxy-unaware
+#                    out. NO_PROXY exempts only guest loopback and the Devbox
+#                    proxy. It is separate from -a and may break proxy-unaware
 #                    tools; `--traffic-audit=off` removes it from a kept box.
 #   --no-auth, -n    do not inject AI/GitHub proxy, API-key, or copied host credentials;
 #                    also removes devbox-managed proxy/key profiles from an
-#                    existing box. This is the default for a new box.
+#                    existing box. Without any policy, a new box gets none.
 #   --api-keys[=F], -K[=F]
 #                    inject API keys into the box from env file F
 #                    (default ~/.config/devbox/api-keys.env).
@@ -115,7 +116,11 @@
 #   dialog inside the agent — is the boundary. Scoped to that one directory:
 #   never $HOME, and never the read-only paths added with --mount.
 #
-# Project manifest (.devbox.toml)
+# Project manifest (.devbox.toml) — see examples/.devbox.toml
+#   packages = ["node"]              Homebrew formulae installed per box
+#   start    = "npm ci"              command run in the project after boot
+#   keep     = true                  keep the box after the shell exits
+#   policy   = "agent"               optional grant-policy base (docs/policies.md)
 #   image  = "ubuntu-24.04"          shorthand, or the table form:
 #   [image]
 #   location = "/path/kali.qcow2"    template name, template://, *.yaml, *.qcow2, URL
@@ -124,6 +129,10 @@
 #   provision_user = "…"             optional, user script baked into the golden
 #   [resources]
 #   cpus = 8 / memory = "12GiB" / disk = "80GiB"
+#   [grants]
+#   ai_proxy / github / ssh_agent / agent_config / api_keys /
+#   host_credentials / egress / mounts / copies — what the box may use from
+#   the host; shown for approval like every other declaration.
 #   Custom provisioning changes the golden's identity, so a project cannot
 #   redefine the golden another project clones from.
 #
@@ -132,13 +141,15 @@
 #   DEVBOX_SESSION_DIR  persistent per-project AI session root
 #                       (default $XDG_STATE_HOME/devbox/sessions, falling back
 #                       to ~/.local/state/devbox/sessions)
-#   DEVBOX_PROXY_URL    default --proxy URL
+#   DEVBOX_PROXY_URL    default proxy URL for ai_proxy/github = true (and
+#                       --proxy, --gh-proxy, --traffic-audit)
 #   DEVBOX_BUILD_TIMEOUT
 #                       how long a golden build may take (default 90m). Lima's
 #                       own default is 10m, which heavy [image].provision blows
 #                       through — leaving a VM provisioning behind a failed start.
 #
 # Global config (~/.config/devbox/config.toml)
+#   policy = "NAME" — machine-default grant policy (top-level, before tables).
 #   [resources] cpus/memory/disk — machine-wide defaults, overridden by a
 #   project manifest, which is overridden by the CLI flags above.
 #

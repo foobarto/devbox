@@ -88,7 +88,7 @@
             <p class="eyebrow">THE TRADE-OFF</p>
             <h2>A sealed box is useless. An open one is risky.</h2>
           </div>
-          <p>Devbox starts with no host access. Every feature below adds one named capability—so you can make the trade-off consciously, per task.</p>
+          <p>Devbox starts with no host access. Every feature below adds one named grant—declared once in a policy or a project's <code>[grants]</code>—so you can make the trade-off consciously, per task.</p>
         </div>
         <div class="capability-grid">
           <article class="capability default">
@@ -147,7 +147,7 @@
           <div class="audit-cards">
             <article>
               <span>DETAILED REQUEST AUDIT</span>
-              <h3>AI and GitHub through <code>--proxy</code> / <code>--gh-proxy</code></h3>
+              <h3>AI and GitHub through the <code>ai_proxy</code> / <code>github</code> grants</h3>
               <p>Capture the real submitted prompt or API payload, then see whether a remote mutation succeeded.</p>
               <pre><code><span class="prompt">$</span> devbox proxy audit show
 <span class="prompt">$</span> devbox proxy audit export audit.html</code></pre>
@@ -155,7 +155,7 @@
             </article>
             <article>
               <span>OPAQUE HTTPS METADATA</span>
-              <h3>General web traffic through <code>--traffic-audit</code></h3>
+              <h3>General web traffic with <code>egress = "audit"</code></h3>
               <p>The CONNECT tunnel logs destination, timing, and byte counts. HTTPS paths, prompts, and bodies remain end-to-end encrypted.</p>
               <small>Proxy-unaware tools fail on direct TCP/UDP web ports rather than silently bypassing this audit.</small>
             </article>
@@ -188,7 +188,7 @@
 <span class="prompt">$</span> devbox gui -- weston-terminal
 <span class="comment">→ one app; returns when it exits</span>
 
-<span class="prompt">$</span> devbox --gui -a -- code .</code></pre>
+<span class="prompt">$</span> devbox --gui --policy agent -- code .</code></pre>
       </section>
 
       <section id="how" class="how section">
@@ -207,13 +207,16 @@
 <span class="prompt">$</span> devbox gui [DIR] [FLAGS] [-- APP ...]  <span class="comment"># open a GUI-ready shell or app</span>
 <span class="prompt">$</span> devbox build [--image N] [--force]      <span class="comment"># create or refresh a golden image</span>
 <span class="prompt">$</span> devbox sessions path|clear [DIR]       <span class="comment"># inspect or remove resumable state</span>
+<span class="prompt">$</span> devbox policy list|show NAME           <span class="comment"># what a grant policy gives a box</span>
+<span class="prompt">$</span> devbox proxy start|status|audit        <span class="comment"># manage the shared host proxy</span>
 <span class="prompt">$</span> devbox destroy NAME | --all | --goldens</code></pre>
         </div>
       </section>
 
       <section id="flags" class="shell section">
-        <div class="section-heading stacked"><div><p class="eyebrow">KEY FLAGS</p><h2>The ones you’ll reach for.</h2></div><p>Flags make host-backed capabilities explicit. They work on a new box and, where applicable, refresh or remove state in an existing kept box.</p></div>
+        <div class="section-heading stacked"><div><p class="eyebrow">KEY FLAGS</p><h2>The ones you’ll reach for.</h2></div><p>A policy names a box's host grants in one place; the older per-grant flags remain as shortcuts. A kept box is brought in line with the policy in effect each time you enter it.</p></div>
         <div class="flag-list">
+          <article><code>--policy NAME, -P</code><p>Grant exactly what a policy holds: <code>none</code>, <code>agent</code>, <code>agent-github</code>, or your own in <code>~/.config/devbox/policies/</code>.</p></article>
           <article><code>--keep, -k</code><p>Leave the box running when the shell exits.</p></article>
           <article><code>--ephemeral-sessions, -e</code><p>Keep this run's AI transcripts on the disposable guest disk.</p></article>
           <article><code>--proxy[=URL], -p</code><p>Use host-side AI authentication without exposing real tokens in the VM.</p></article>
@@ -221,7 +224,7 @@
           <article><code>--traffic-audit, -T</code><p>Route normal web tooling through the audited proxy or fail on direct web ports.</p></article>
           <article><code>--ssh-agent, -s</code><p>Forward the host SSH agent for authentication and SSH-signed commits.</p></article>
           <article><code>--gui, -G</code><p>Open a GUI-ready shell or a guest Wayland application through Waypipe.</p></article>
-          <article><code>-a</code><p>The common trusted-code preset: agent config, host credential proxy, and SSH agent—never GUI.</p></article>
+          <article><code>-a</code><p>Shortcut for the <code>agent</code> grants—agent config, AI proxy, SSH agent—added to the run; never GitHub or GUI.</p></article>
           <article><code>--no-auth, -n</code><p>Remove Devbox-managed proxy, API-key, and copied-credential profiles from a kept box.</p></article>
           <article><code>--image NAME, -i</code><p>Select a Lima template, configuration file, or cloud image for the golden.</p></article>
         </div>
@@ -230,15 +233,18 @@
 
       <section id="manifest" class="manifest section">
         <div class="shell manifest-layout">
-          <div><p class="eyebrow">PROJECT MANIFEST</p><h2><code>.devbox.toml</code></h2><p>Keep project-local packages, resource settings, mounts, and startup commands with the project. Devbox summarizes host-affecting requests and asks before applying them.</p><a class="text-link" href="https://github.com/foobarto/devbox/blob/main/examples/.devbox.toml">See the annotated example <span aria-hidden="true">→</span></a></div>
+          <div><p class="eyebrow">PROJECT MANIFEST</p><h2><code>.devbox.toml</code></h2><p>Keep project-local packages, resources, startup commands, and the host grants it needs (<code>policy</code>, <code>[grants]</code>) with the project. Devbox summarizes host-affecting requests and asks before applying them.</p><a class="text-link" href="https://github.com/foobarto/devbox/blob/main/examples/.devbox.toml">See the annotated example <span aria-hidden="true">→</span></a></div>
           <pre class="toml"><code><span class="toml-key">image</span> = <span class="toml-string">"ubuntu-24.04"</span>
+<span class="toml-key">packages</span> = [<span class="toml-string">"just"</span>, <span class="toml-string">"watchexec"</span>]
+<span class="toml-key">start</span> = <span class="toml-string">"just dev"</span>
+<span class="toml-key">policy</span> = <span class="toml-string">"agent"</span>
 
 [<span class="toml-key">resources</span>]
 <span class="toml-key">cpus</span> = <span class="toml-number">8</span>
 <span class="toml-key">memory</span> = <span class="toml-string">"12GiB"</span>
 
-<span class="toml-key">packages</span> = [<span class="toml-string">"just"</span>, <span class="toml-string">"watchexec"</span>]
-<span class="toml-key">start</span> = <span class="toml-string">"just dev"</span></code></pre>
+[<span class="toml-key">grants</span>]
+<span class="toml-key">egress</span> = <span class="toml-string">"audit"</span></code></pre>
         </div>
       </section>
 

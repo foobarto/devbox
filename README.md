@@ -76,6 +76,9 @@ devbox build [--image N] [--force]   build/refresh the golden image
 devbox ls                            list devbox instances
 devbox destroy NAME | --all | --goldens
 devbox sessions [path|clear --yes] [DIR]
+devbox policy [list|show NAME]       list grant policies or show what one grants
+devbox proxy [start|stop|status|refresh|audit]
+devbox --version
 ```
 
 ### Run flags
@@ -137,10 +140,10 @@ any grant it no longer contains. See
 flags.
 
 > **Agent boundaries:** a Devbox agent cannot read host files or credentials by
-> default. `--ssh-agent` lets it use loaded SSH identities without extracting
-> their private keys; `--proxy` primarily prevents credential exfiltration by
-> keeping tokens on the host, while still letting it make permitted provider
-> requests. Give either capability only to trusted code. See [agent capability
+> default. The `ssh_agent` grant lets it use loaded SSH identities without
+> extracting their private keys; `ai_proxy` and `github` primarily prevent
+> credential exfiltration by keeping tokens on the host, while still letting it
+> make permitted provider requests. Give these grants only to trusted code. See [agent capability
 > security](docs/agent-capabilities-security.md).
 
 ### GUI apps on a Wayland host
@@ -174,9 +177,10 @@ supplied.
 > See [GUI forwarding security](docs/gui-security.md) for the threat model and
 > safe-use guidance.
 
-Use `-a` for the usual agent-config + proxy + SSH-agent setup. Add `--gui` or
-`-G` explicitly when you also want GUI forwarding, e.g.
-`devbox --gui -a -m ~/data:ro -C ~/.netrc`. Build accepts `-i` and `-f` for
+Use `--policy agent` (or `policy = "agent"` in the manifest) for the usual
+agent-config + AI-proxy + SSH-agent setup. GUI forwarding is not a grant: add
+`--gui` or `-G` explicitly when you want it, e.g.
+`devbox --gui --policy agent -m ~/data:ro -C ~/.netrc`. Build accepts `-i` and `-f` for
 `--image` and `--force`; destroy accepts `-A` and `-G` for `--all` and
 `--goldens`. Help and version are `-h` and `-V`.
 
@@ -289,15 +293,16 @@ Each distinct image gets its own golden. Base-package provisioning auto-detects
 
 ## Auth
 
-Installed ≠ authenticated. Three combinable strategies, pick per your setup:
+Installed ≠ authenticated. These combinable [grants](docs/policies.md) — or
+their deprecated flags — cover the usual setups:
 
-| you want | use | where secrets live |
+| you want | grant (flag) | where secrets live |
 |---|---|---|
-| keys/tokens never enter the box | [`--proxy`](proxy/README.md) (AI), [`--gh-proxy`](proxy/README.md#github-cli) (`gh`) | host only |
-| explicitly opt out of Devbox auth | `--no-auth` | no new credentials injected |
-| API keys (opencode, stado, OpenAI/Codex platform keys) | `--api-keys` | copied into the box |
-| Claude/Codex **subscription OAuth** without a proxy | `--with-creds` | copied into the box |
-| AI CLI settings, prompts, rules, and custom agents without auth | `--with-agent-config` | allowlisted non-secret files copied into the box |
+| keys/tokens never enter the box | [`ai_proxy`](proxy/README.md) (`--proxy`) for AI, [`github`](proxy/README.md#github-cli) (`--gh-proxy`) for `gh` | host only |
+| explicitly opt out of Devbox auth | `--policy none` (`--no-auth`) | no new credentials injected |
+| API keys (opencode, stado, OpenAI/Codex platform keys) | `api_keys` (`--api-keys`) | copied into the box |
+| Claude/Codex **subscription OAuth** without a proxy | `host_credentials` (`--with-creds`) | copied into the box |
+| AI CLI settings, prompts, rules, and custom agents without auth | `agent_config` (`--with-agent-config`) | allowlisted non-secret files copied into the box |
 | nothing | *(default)* | you log in interactively inside the box |
 
 The proxy supports API keys plus Claude, Codex, and GitHub CLI logins. A host CLI login
@@ -335,18 +340,23 @@ hooks run unprompted — see
 
 ### Opt-in web egress audit
 
-Use `--traffic-audit` when you want ordinary guest web tools to be auditable
-too, rather than only the built-in AI and GitHub authentication routes:
+Grant `egress = "audit"` (or use the deprecated `--traffic-audit`) when you want
+ordinary guest web tools to be auditable too, rather than only the built-in AI
+and GitHub authentication routes:
 
-```sh
-devbox --traffic-audit                 # equivalent to --traffic-audit=connect
-devbox --keep --traffic-audit          # renew a kept box's short-lived capability
-devbox --keep --traffic-audit=off      # remove its profile and guest firewall rule
+```toml
+[grants]
+egress = "audit"                       # devbox --traffic-audit; renewed on each entry
 ```
+
+On a kept box, a policy without it — or `--traffic-audit=off` — removes the
+profile and the guest firewall rule.
 
 It sets standard `HTTP(S)_PROXY`/`ALL_PROXY` variables with a short-lived
 Devbox capability, then rejects direct TCP and UDP traffic to ports 80 and 443
-inside the guest. Proxy-aware HTTPS traffic therefore uses CONNECT; its audit
+inside the guest. `NO_PROXY` exempts only guest loopback and the Devbox proxy
+host, so AI clients still reach the credential proxy directly. Proxy-aware HTTPS
+traffic therefore uses CONNECT; its audit
 record contains destination, timing, and byte counts, but not encrypted paths
 or request bodies. Plain HTTP proxy requests can be recorded in detail because
 they are not encrypted. Tools that ignore proxy variables, use certificate
@@ -354,7 +364,7 @@ pinning, or use non-web ports can fail or fall outside this coverage. The
 generic proxy accepts only public destinations, so it cannot be used to reach
 host loopback or private-network web services.
 
-This is intentionally explicit and is not included in `-a`. It is an egress
+It is not part of the `agent` policy or `-a`. It is an egress
 guard for normal guest applications, not a containment boundary against a
 process that has guest root/sudo and can remove the guest firewall. See
 [proxy audit logging](docs/proxy-audit.md) and [agent capability
@@ -387,9 +397,12 @@ method. Newly built golden images fetch GitHub's published SSH host keys from
 the GitHub Meta API and place them in `~/.ssh/known_hosts`, so GitHub SSH use
 does not stop for a first-connection prompt.
 
-`--no-auth` is the explicit opt-out for a kept box that was previously started
-with `--proxy`, `--gh-proxy`, or `--api-keys`; it removes Devbox's profile
-snippets before the shell opens. It does not delete credentials created manually
+While a policy is in effect, entering a kept box removes the proxy, API-key, and
+audited-egress state the policy lacks, so `devbox --policy none` is the clean
+opt-out for those; SSH-agent forwarding, copied files, and mounts stay until the
+box is recreated. The deprecated
+`--no-auth` likewise removes Devbox's AI/GitHub proxy and API-key profiles
+before the shell opens, without changing other grants. It does not delete credentials created manually
 inside the VM, and cannot be combined with `--proxy`, `--gh-proxy`, `--api-keys`,
 or `--with-creds`. It can be
 combined with `--with-agent-config`, which never intentionally copies auth.
@@ -482,12 +495,15 @@ Configuration and generated golden metadata live under `~/.config/devbox/`
 ├── devbox-golden-<image>.yaml   # generated golden configs
 ├── api-keys.env                 # for --api-keys / the proxy   (gitignored)
 ├── proxy.config.json            # proxy routes                 (gitignored)
-└── proxy-env                    # optional --proxy env template (uses __PROXY_URL__)
+└── proxy-env                    # optional AI-proxy env template (__PROXY_URL__, __PROXY_TOKEN__)
 ```
 
-`config.toml` sets the defaults for every project on this machine:
+`config.toml` sets the defaults for every project on this machine — top-level
+keys such as the default grant policy before any table:
 
 ```toml
+policy = "agent"                 # machine-default grant policy (docs/policies.md)
+
 [resources]
 cpus = 8
 memory = "12GiB"
@@ -506,17 +522,21 @@ Devbox ask again on the next run.
 
 ## Tests
 
-Unit tests cover the pure logic (name derivation, image-stanza + golden-YAML
-generation, dispatch) and spin up no VM, so they're fast.
+`make test` runs the bats suite for `bin/devbox` and the Python tests for the
+proxy and the site. They start no VM: Lima is exercised through stubs or its
+template resolver, and the tests that need `limactl` or PyYAML skip when either
+is absent.
 
 ```sh
 brew install bats-core     # once
 make hooks                 # once per checkout; enables credential guard
-make test                  # or: bats test/
+make test
+make lint                  # shellcheck, when installed
 ```
 
-The one `limactl validate` test skips automatically if `limactl` isn't
-installed.
+`make e2e` is the destructive integration suite: it creates real Lima boxes,
+calls the host's Claude and Codex logins through the proxy, and copies
+credentials into a disposable VM. Run it deliberately; see `test/e2e.sh`.
 
 ## Notes & limits
 
