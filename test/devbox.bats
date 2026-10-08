@@ -190,6 +190,33 @@ print("" if d is None else d)' "$1"
   [[ "$output" == *"EDIT: edit box --mount /state/sess:w"* ]]
 }
 
+@test "a stopped kept box gains SSH-agent forwarding without aborting devbox" {
+  # enable_ssh_agent is the final command of cmd_run's `[[ … ]] && enable_ssh_agent`
+  # list. On a Stopped box a trailing `[[ Running ]] && limactl start` returned
+  # 1 and `set -e` ended devbox right after the edit, before the box booted.
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    SSH_AUTH_SOCK=\$(mktemp -u); python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' \"\$SSH_AUTH_SOCK\"
+    limactl() {
+      case \"\$*\" in
+        *--json*)   printf '{}\n';;          # forwarding not enabled yet
+        *--format*) printf 'Stopped\n';;
+        edit*)      printf 'EDIT: %s\n' \"\$*\" >&2;;
+        start*)     printf 'START\n' >&2;;
+        *)          return 0;;
+      esac
+    }
+    ssh_agent=1 preexisting=1
+    [[ \$ssh_agent -eq 1 && \$preexisting -eq 1 ]] && enable_ssh_agent box
+    echo CONTINUED
+    rm -f \"\$SSH_AUTH_SOCK\"
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"EDIT: edit box --set .ssh.forwardAgent = true"* ]]
+  [[ "$output" != *START* ]]
+  [[ "$output" == *CONTINUED* ]]
+}
+
 @test "clearing session persistence removes only the session mount" {
   run bash -c "
     source '$DEVBOX' 2>/dev/null; set +u
@@ -1800,7 +1827,11 @@ true' ''
   run bash -c "
     source '$DEVBOX' 2>/dev/null; set +u
     limactl() { echo 'limactl: instance not running'; return 1; }
-    guest_login_value fake-box '\${ANTHROPIC_API_KEY:-}'
+    value=\"\$(guest_login_value fake-box '\${ANTHROPIC_API_KEY:-}')\"
+    printf '%s' \"\$value\"
   "
+  # Assigned under set -e in seed_agent_trust: a non-zero status here would
+  # abort devbox before handover instead of just skipping the seeding.
+  [ "$status" -eq 0 ]
   [ "$output" = "" ]
 }
