@@ -112,6 +112,11 @@ REFRESH_SKEW_SECONDS = 300
 REFRESH_POLL_SECONDS = 60
 _REFRESH_LOCKS = {"anthropic": threading.Lock(), "openai": threading.Lock()}
 _GITHUB_CERT_LOCK = threading.Lock()
+# Regenerate the local GitHub CA and leaf this long before either expires, and
+# re-check a cached set at least this often in a long-running daemon.
+GITHUB_CERT_RENEW_BEFORE_SECONDS = 30 * 24 * 60 * 60
+GITHUB_CERT_RECHECK_SECONDS = 60 * 60
+_GITHUB_CERT_CHECKED: dict[tuple, float] = {}
 _GITHUB_CAPABILITY_LOCK = threading.Lock()
 _TRAFFIC_CAPABILITY_LOCK = threading.Lock()
 GITHUB_MITM_HOSTS = {"api.github.com", "uploads.github.com"}
@@ -127,14 +132,26 @@ try:
 except ValueError as exc:
     raise SystemExit("GitHub proxy capability renewal intervals must be integers") from exc
 _LIMA_INSTANCE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+# stdin: the capability-bearing proxy URL on the first line, then the current
+# local CA certificate. Delivering the CA with every renewal lets a running box
+# follow a regenerated CA instead of failing TLS until its next `devbox` run.
 _GITHUB_PROXY_URL_UPDATE_SCRIPT = r'''
 set -e
 state_dir="$HOME/.devbox/gh-proxy"
 umask 077
-install -d -m 700 "$state_dir"
+install -d -m 700 "$state_dir" "$state_dir/certs"
+IFS= read -r url
 tmp="$(mktemp "$state_dir/.proxy-url.XXXXXX")"
-cat > "$tmp"
+printf '%s\n' "$url" > "$tmp"
 chmod 600 "$tmp"
+ca_tmp="$(mktemp "$state_dir/.ca.XXXXXX")"
+cat > "$ca_tmp"
+if [ -s "$ca_tmp" ]; then
+  chmod 644 "$ca_tmp"
+  mv -f "$ca_tmp" "$state_dir/certs/devbox-gh-proxy-ca.pem"
+else
+  rm -f "$ca_tmp"
+fi
 mv -f "$tmp" "$state_dir/proxy-url"
 '''
 
@@ -811,48 +828,151 @@ def github_certificate_paths() -> tuple[str, str, str]:
     )
 
 
+def _openssl(*arguments: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            ["openssl", *arguments], check=False, capture_output=True, text=True, timeout=30,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("GitHub CLI proxy needs openssl on the host") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("openssl did not finish checking the GitHub CLI proxy certificate") from exc
+
+
+def github_certificate_problem(ca_path: str, cert_path: str, key_path: str) -> str | None:
+    """Return why a cached CA/leaf set must be replaced, or None when it is usable.
+
+    Strict X.509 clients (Python >= 3.13 by default) reject certificates without
+    key identifiers, and a leaf that silently expires breaks every guest `gh`.
+    The checks use only `openssl x509`/`verify`/`pkey` output common to OpenSSL
+    and LibreSSL, so an unsupported verification flag can never cause a
+    regeneration loop.
+    """
+    for label, path in (("CA", ca_path), ("leaf", cert_path)):
+        if _openssl("x509", "-noout", "-checkend", str(GITHUB_CERT_RENEW_BEFORE_SECONDS),
+                    "-in", path).returncode != 0:
+            return f"{label} certificate is unreadable or expires within 30 days"
+        text = _openssl("x509", "-noout", "-text", "-in", path).stdout
+        for extension in ("Subject Key Identifier", "Authority Key Identifier"):
+            if f"X509v3 {extension}" not in text:
+                return f"{label} certificate has no {extension}"
+    if _openssl("verify", "-purpose", "sslserver", "-CAfile", ca_path, cert_path).returncode != 0:
+        return "leaf certificate is not signed by the local CA"
+    certificate_key = _openssl("x509", "-noout", "-pubkey", "-in", cert_path).stdout
+    private_key = _openssl("pkey", "-pubout", "-in", key_path).stdout
+    if not certificate_key or certificate_key != private_key:
+        return "leaf private key does not match its certificate"
+    return None
+
+
+@contextmanager
+def github_certificate_lock(shared: bool = False):
+    """Serialize CA/leaf replacement across proxy and CLI processes.
+
+    Readers take the lock shared, so a TLS context never loads the new key with
+    the old certificate while another process is swapping them.
+    """
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    descriptor = os.open(os.path.join(STATE_DIR, ".gh-proxy-certs.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _github_certificate_state(paths: tuple[str, str, str]) -> tuple | None:
+    try:
+        return tuple((path, os.stat(path).st_mtime_ns, os.stat(path).st_size) for path in paths)
+    except OSError:
+        return None
+
+
 def ensure_github_certificates() -> tuple[str, str, str]:
-    """Create a local CA and GitHub leaf certificate once, with strict modes."""
+    """Return a usable local CA and GitHub leaf, (re)creating them when needed.
+
+    The CA private key is discarded after signing, so the CA can never mint a
+    certificate for any other host; replacing the leaf therefore means replacing
+    the CA too. Guests receive the new CA on their next `devbox` run and, while
+    running, with their next capability renewal.
+    """
+    paths = github_certificate_paths()
     with _GITHUB_CERT_LOCK:
-        ca_path, cert_path, key_path = github_certificate_paths()
-        if all(os.path.isfile(path) for path in (ca_path, cert_path, key_path)):
-            return ca_path, cert_path, key_path
+        state = _github_certificate_state(paths)
+        checked = _GITHUB_CERT_CHECKED.get(state) if state else None
+        if checked is not None and time.time() - checked < GITHUB_CERT_RECHECK_SECONDS:
+            return paths
+        with github_certificate_lock():
+            state = _github_certificate_state(paths)
+            if state is not None:
+                problem = github_certificate_problem(*paths)
+                if problem is None:
+                    _GITHUB_CERT_CHECKED.clear()
+                    _GITHUB_CERT_CHECKED[state] = time.time()
+                    return paths
+                sys.stderr.write(f"[devbox-ai-proxy] regenerating GitHub CLI proxy CA: {problem}\n")
+            _create_github_certificates(*paths)
+            _GITHUB_CERT_CHECKED.clear()
+            state = _github_certificate_state(paths)
+            if state is not None:
+                _GITHUB_CERT_CHECKED[state] = time.time()
+        return paths
 
-        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=".devbox-gh-ca-", dir=STATE_DIR) as directory:
-            ca_key = os.path.join(directory, "ca-key.pem")
-            ca_cert = os.path.join(directory, "ca.pem")
-            leaf_key = os.path.join(directory, "leaf-key.pem")
-            leaf_csr = os.path.join(directory, "leaf.csr")
-            leaf_cert = os.path.join(directory, "leaf.pem")
-            ca_config = os.path.join(directory, "ca.cnf")
-            leaf_config = os.path.join(directory, "leaf.cnf")
-            with open(ca_config, "w", encoding="utf-8") as config:
-                config.write("""[req]\ndistinguished_name = dn\nx509_extensions = v3_ca\nprompt = no\n[dn]\nCN = Devbox GitHub Proxy CA\n[v3_ca]\nbasicConstraints = critical, CA:true\nkeyUsage = critical, keyCertSign, cRLSign\nsubjectKeyIdentifier = hash\n""")
-            with open(leaf_config, "w", encoding="utf-8") as config:
-                config.write("""[req]\ndistinguished_name = dn\nreq_extensions = v3_req\nprompt = no\n[dn]\nCN = api.github.com\n[v3_req]\nbasicConstraints = critical, CA:false\nkeyUsage = critical, digitalSignature, keyEncipherment\nextendedKeyUsage = serverAuth\nsubjectAltName = @alt_names\n[alt_names]\nDNS.1 = api.github.com\nDNS.2 = uploads.github.com\n""")
-            commands = (
-                ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-keyout", ca_key, "-out", ca_cert, "-config", ca_config],
-                ["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", leaf_key, "-out", leaf_csr, "-config", leaf_config],
-                ["openssl", "x509", "-req", "-in", leaf_csr, "-CA", ca_cert, "-CAkey", ca_key, "-CAcreateserial", "-out", leaf_cert, "-days", "825", "-extfile", leaf_config, "-extensions", "v3_req"],
-            )
-            try:
-                for command in commands:
-                    subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            except FileNotFoundError as exc:
-                raise RuntimeError("GitHub CLI proxy needs openssl on the host") from exc
-            except subprocess.CalledProcessError as exc:
-                detail = exc.stderr.decode("utf-8", "replace").strip()
-                raise RuntimeError(f"could not create GitHub CLI proxy certificate: {detail}") from exc
 
-            for source, destination, mode in (
-                (ca_cert, ca_path, 0o644),
-                (leaf_cert, cert_path, 0o644),
-                (leaf_key, key_path, 0o600),
-            ):
-                os.chmod(source, mode)
-                os.replace(source, destination)
-        return ca_path, cert_path, key_path
+def github_server_context() -> ssl.SSLContext:
+    """Load the GitHub leaf for one MITM session, consistent with its key."""
+    _, certificate, private_key = ensure_github_certificates()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    with github_certificate_lock(shared=True):
+        context.load_cert_chain(certificate, private_key)
+    return context
+
+
+def _create_github_certificates(ca_path: str, cert_path: str, key_path: str) -> None:
+    with tempfile.TemporaryDirectory(prefix=".devbox-gh-ca-", dir=STATE_DIR) as directory:
+        ca_key = os.path.join(directory, "ca-key.pem")
+        ca_cert = os.path.join(directory, "ca.pem")
+        leaf_key = os.path.join(directory, "leaf-key.pem")
+        leaf_csr = os.path.join(directory, "leaf.csr")
+        leaf_cert = os.path.join(directory, "leaf.pem")
+        ca_config = os.path.join(directory, "ca.cnf")
+        leaf_config = os.path.join(directory, "leaf.cnf")
+        with open(ca_config, "w", encoding="utf-8") as config:
+            config.write("""[req]\ndistinguished_name = dn\nx509_extensions = v3_ca\nprompt = no\n[dn]\nCN = Devbox GitHub Proxy CA\n[v3_ca]\nbasicConstraints = critical, CA:true\nkeyUsage = critical, keyCertSign, cRLSign\nsubjectKeyIdentifier = hash\nauthorityKeyIdentifier = keyid:always\n""")
+        # The CSR section must not name an authority key: the CSR has no issuer
+        # yet. The signing section adds it once the CA is known.
+        with open(leaf_config, "w", encoding="utf-8") as config:
+            config.write("""[req]\ndistinguished_name = dn\nreq_extensions = v3_req\nprompt = no\n[dn]\nCN = api.github.com\n[v3_req]\nbasicConstraints = critical, CA:false\nkeyUsage = critical, digitalSignature, keyEncipherment\nextendedKeyUsage = serverAuth\nsubjectAltName = @alt_names\n[v3_leaf]\nbasicConstraints = critical, CA:false\nkeyUsage = critical, digitalSignature, keyEncipherment\nextendedKeyUsage = serverAuth\nsubjectAltName = @alt_names\nsubjectKeyIdentifier = hash\nauthorityKeyIdentifier = keyid:always\n[alt_names]\nDNS.1 = api.github.com\nDNS.2 = uploads.github.com\n""")
+        commands = (
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-keyout", ca_key, "-out", ca_cert, "-config", ca_config],
+            ["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", leaf_key, "-out", leaf_csr, "-config", leaf_config],
+            ["openssl", "x509", "-req", "-in", leaf_csr, "-CA", ca_cert, "-CAkey", ca_key, "-CAcreateserial", "-out", leaf_cert, "-days", "825", "-extfile", leaf_config, "-extensions", "v3_leaf"],
+        )
+        try:
+            for command in commands:
+                subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except FileNotFoundError as exc:
+            raise RuntimeError("GitHub CLI proxy needs openssl on the host") from exc
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError(f"could not create GitHub CLI proxy certificate: {detail}") from exc
+
+        # Never install a fresh set unchecked: if this host's openssl makes one
+        # that fails the check, installing it would replace a still-usable CA
+        # and then regenerate on every run. Check it while it is still staged.
+        problem = github_certificate_problem(ca_cert, leaf_cert, leaf_key)
+        if problem is not None:
+            raise RuntimeError(f"newly generated GitHub CLI proxy certificate is unusable: {problem}")
+        # Key before certificate: a reader that sees the new leaf certificate
+        # must already find its matching key.
+        for source, destination, mode in (
+            (ca_cert, ca_path, 0o644),
+            (leaf_key, key_path, 0o600),
+            (leaf_cert, cert_path, 0o644),
+        ):
+            os.chmod(source, mode)
+            os.replace(source, destination)
 
 
 def github_proxy_key_path() -> str:
@@ -1013,10 +1133,19 @@ def github_proxy_url(endpoint: str, capability: str) -> str:
 def deliver_github_proxy_capability(name: str, endpoint: str) -> None:
     """Atomically update a running guest; capability bytes travel over stdin."""
     capability_url = github_proxy_url(endpoint, issue_github_proxy_token())
+    # The capability is what keeps a guest working; never withhold it because
+    # the CA could not be checked. An empty CA leaves the guest's copy alone.
+    ca_certificate = ""
+    try:
+        ca_path, _, _ = ensure_github_certificates()
+        with open(ca_path, encoding="utf-8") as ca_file:
+            ca_certificate = ca_file.read()
+    except (OSError, RuntimeError) as exc:
+        sys.stderr.write(f"[devbox-ai-proxy] not delivering the GitHub CLI proxy CA: {exc}\n")
     try:
         result = subprocess.run(
             ["limactl", "shell", name, "--", "bash", "-c", _GITHUB_PROXY_URL_UPDATE_SCRIPT],
-            input=capability_url + "\n",
+            input=capability_url + "\n" + ca_certificate,
             check=False,
             capture_output=True,
             text=True,
@@ -1030,7 +1159,7 @@ def deliver_github_proxy_capability(name: str, endpoint: str) -> None:
 
 
 def refresh_registered_github_proxy_boxes(
-    renewed_at: dict[str, tuple[str, float]] | None = None,
+    renewed_at: dict[str, tuple[str, float, int]] | None = None,
     *,
     force: bool = False,
     now: float | None = None,
@@ -1040,6 +1169,18 @@ def refresh_registered_github_proxy_boxes(
         raise RuntimeError("DEVBOX_GH_PROXY_CAPABILITY_RENEW_SECONDS must be positive")
     registrations = registered_github_proxy_boxes()
     running = running_lima_instances() if registrations else set()
+    # A replaced CA (expiry, or a set predating key identifiers) must reach
+    # running guests now, not at their next scheduled renewal.
+    ca_generation = 0
+    if registrations:
+        try:
+            ensure_github_certificates()
+        except (OSError, RuntimeError) as exc:
+            sys.stderr.write(f"[devbox-ai-proxy] GitHub CLI proxy CA check failed: {exc}\n")
+        try:
+            ca_generation = os.stat(github_certificate_paths()[0]).st_mtime_ns
+        except OSError:
+            ca_generation = 0
     timestamp = time.time() if now is None else now
     history = renewed_at if renewed_at is not None else {}
     for stale_name in set(history) - set(registrations):
@@ -1060,6 +1201,7 @@ def refresh_registered_github_proxy_boxes(
             not force
             and previous is not None
             and previous[0] == endpoint
+            and previous[2:] == (ca_generation,)
             and timestamp - previous[1] < GITHUB_PROXY_RENEW_SECONDS
         ):
             continue
@@ -1069,7 +1211,7 @@ def refresh_registered_github_proxy_boxes(
             summary["failed"] += 1
             sys.stderr.write(f"[devbox-ai-proxy] GitHub capability renewal failed: {exc}\n")
             continue
-        history[name] = (endpoint, timestamp)
+        history[name] = (endpoint, timestamp, ca_generation)
         summary["renewed"] += 1
     return summary
 
@@ -1082,7 +1224,7 @@ def maintain_github_proxy_capabilities() -> None:
             "DEVBOX_GH_PROXY_CAPABILITY_POLL_SECONDS must be positive\n"
         )
         return
-    renewed_at: dict[str, tuple[str, float]] = {}
+    renewed_at: dict[str, tuple[str, float, int]] = {}
     while True:
         try:
             summary = refresh_registered_github_proxy_boxes(renewed_at)
@@ -1430,9 +1572,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            _, certificate, private_key = ensure_github_certificates()
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            context.load_cert_chain(certificate, private_key)
+            context = github_server_context()
             self.send_response(200, "Connection Established")
             self.end_headers()
             self.wfile.flush()
@@ -1454,7 +1594,9 @@ class Handler(BaseHTTPRequestHandler):
         # Health/identity endpoint so callers can distinguish this proxy from
         # any other service that happens to hold the port.
         if self.path.startswith("/_devbox"):
-            body = b"devbox-ai-proxy ok gh-self-renewal\n"
+            # Feature markers let bin/devbox restart an older daemon after an
+            # upgrade (see PROXY_REQUIRED_FEATURE there). Only ever append.
+            body = b"devbox-ai-proxy ok gh-self-renewal gh-ca-renewal\n"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))

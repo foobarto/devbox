@@ -15,6 +15,10 @@
   `.devbox.toml` that could alter the generated golden config.
 - Fix `devbox --ssh-agent` exiting silently on a stopped kept box, and a
   silent exit when the guest login environment could not be read.
+- Generate the GitHub CLI proxy CA and leaf with key identifiers so strict
+  X.509 clients accept them, and replace them before they expire.
+- Restart a running older credential proxy once after an upgrade, so running
+  boxes receive a replaced CA.
 
 ## v1.4.0 - 2026-08-28
 

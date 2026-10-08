@@ -18,6 +18,14 @@ from unittest.mock import Mock, patch
 
 MODULE = Path(__file__).parents[1] / "proxy" / "devbox-ai-proxy.py"
 GH_WRAPPER = Path(__file__).parents[1] / "proxy" / "gh-wrapper.py"
+# Never let a test read or replace the host's real proxy state (CA, capability
+# keys, audit log): point every default state path at a throwaway directory
+# before the module computes them. Tests that need a specific directory still
+# patch STATE_DIR themselves.
+_ISOLATED_STATE = tempfile.TemporaryDirectory(prefix="devbox-proxy-test-")
+os.environ["DEVBOX_PROXY_STATE_DIR"] = _ISOLATED_STATE.name
+os.environ["DEVBOX_PROXY_AUDIT_PATH"] = os.path.join(_ISOLATED_STATE.name, "proxy-audit.jsonl")
+os.environ.pop("DEVBOX_PROXY_CONFIG", None)
 SPEC = importlib.util.spec_from_file_location("devbox_ai_proxy", MODULE)
 proxy = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(proxy)
@@ -251,6 +259,148 @@ class GitHubCliProxyTests(TestCase):
             )
         self.assertEqual(verified.returncode, 0, verified.stderr)
 
+    def test_generated_github_certificates_pass_strict_x509_verification(self):
+        # Python >= 3.13 enables VERIFY_X509_STRICT by default, which rejects
+        # certificates without Subject/Authority Key Identifiers.
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(proxy, "STATE_DIR", directory):
+            ca_path, certificate, _ = proxy.ensure_github_certificates()
+            verified = proxy.subprocess.run(
+                ["openssl", "verify", "-x509_strict", "-purpose", "sslserver", "-CAfile", ca_path, certificate],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertIsNone(proxy.github_certificate_problem(*proxy.github_certificate_paths()))
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_github_certificates_are_regenerated_when_unusable(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(proxy, "STATE_DIR", directory):
+            ca_path, certificate, private_key = proxy.ensure_github_certificates()
+            first_ca = Path(ca_path).read_text()
+            # A valid set is reused, not churned: guests hold this CA.
+            proxy._GITHUB_CERT_CHECKED.clear()
+            proxy.ensure_github_certificates()
+            self.assertEqual(Path(ca_path).read_text(), first_ca)
+
+            # A set from before key identifiers, an expiring one, and a leaf
+            # whose key no longer matches are all replaced with a fresh CA.
+            for problem in ("certificate has no Authority Key Identifier",
+                            "expires within 30 days", "does not match"):
+                proxy._GITHUB_CERT_CHECKED.clear()
+                # The existing set fails; the freshly generated one passes.
+                with patch.object(proxy, "github_certificate_problem", side_effect=[problem, None]), \
+                     patch.object(proxy.sys, "stderr"):
+                    proxy.ensure_github_certificates()
+                regenerated = Path(ca_path).read_text()
+                self.assertNotEqual(regenerated, first_ca)
+                first_ca = regenerated
+                self.assertIsNone(proxy.github_certificate_problem(ca_path, certificate, private_key))
+                self.assertEqual(Path(private_key).stat().st_mode & 0o777, 0o600)
+
+    def test_a_real_pre_key_identifier_set_is_replaced_once_then_kept(self):
+        # Reproduce the v1.4.0 generator exactly: no authorityKeyIdentifier on
+        # the CA and no key identifiers on the leaf.
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(proxy, "STATE_DIR", directory), \
+             patch.object(proxy.sys, "stderr"):
+            ca_path, cert_path, key_path = proxy.github_certificate_paths()
+            work = Path(directory) / "old"
+            work.mkdir()
+            (work / "ca.cnf").write_text("[req]\ndistinguished_name = dn\nx509_extensions = v3_ca\nprompt = no\n[dn]\nCN = Old CA\n[v3_ca]\nbasicConstraints = critical, CA:true\nkeyUsage = critical, keyCertSign, cRLSign\nsubjectKeyIdentifier = hash\n")
+            (work / "leaf.cnf").write_text("[req]\ndistinguished_name = dn\nreq_extensions = v3_req\nprompt = no\n[dn]\nCN = api.github.com\n[v3_req]\nbasicConstraints = critical, CA:false\nsubjectAltName = DNS:api.github.com\n")
+            for command in (
+                ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-keyout", str(work / "ca-key.pem"), "-out", ca_path, "-config", str(work / "ca.cnf")],
+                ["req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", key_path, "-out", str(work / "leaf.csr"), "-config", str(work / "leaf.cnf")],
+                ["x509", "-req", "-in", str(work / "leaf.csr"), "-CA", ca_path, "-CAkey", str(work / "ca-key.pem"), "-CAcreateserial", "-out", cert_path, "-days", "825", "-extfile", str(work / "leaf.cnf"), "-extensions", "v3_req"],
+            ):
+                proxy.subprocess.run(["openssl", *command], check=True, capture_output=True)
+            old_ca = Path(ca_path).read_text()
+            self.assertIn("Key Identifier", proxy.github_certificate_problem(ca_path, cert_path, key_path))
+
+            proxy._GITHUB_CERT_CHECKED.clear()
+            proxy.ensure_github_certificates()
+            replaced = Path(ca_path).read_text()
+            self.assertNotEqual(replaced, old_ca)
+            proxy._GITHUB_CERT_CHECKED.clear()
+            proxy.ensure_github_certificates()
+            self.assertEqual(Path(ca_path).read_text(), replaced)
+
+    def test_a_fresh_set_that_fails_its_own_check_is_an_error_not_a_loop(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(proxy, "STATE_DIR", directory), \
+             patch.object(proxy.sys, "stderr"):
+            ca_path, _, _ = proxy.ensure_github_certificates()
+            live_ca = Path(ca_path).read_text()
+            proxy._GITHUB_CERT_CHECKED.clear()
+            # The live set needs renewal, but the replacement fails its check:
+            # the live CA must survive rather than be swapped for a bad one.
+            with patch.object(proxy, "github_certificate_problem", return_value="always broken"):
+                with self.assertRaisesRegex(RuntimeError, "newly generated"):
+                    proxy.ensure_github_certificates()
+            self.assertEqual(Path(ca_path).read_text(), live_ca)
+
+    def test_guest_update_script_installs_url_and_ca_and_keeps_ca_when_none_is_sent(self):
+        with tempfile.TemporaryDirectory() as home:
+            environment = {**os.environ, "HOME": home}
+            script = proxy._GITHUB_PROXY_URL_UPDATE_SCRIPT
+            pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+            subprocess.run(["bash", "-c", script], input="http://one@h:4141\n" + pem,
+                           text=True, check=True, env=environment)
+            state = Path(home) / ".devbox" / "gh-proxy"
+            self.assertEqual((state / "proxy-url").read_text(), "http://one@h:4141\n")
+            self.assertEqual((state / "certs" / "devbox-gh-proxy-ca.pem").read_text(), pem)
+            self.assertEqual((state / "proxy-url").stat().st_mode & 0o777, 0o600)
+            self.assertEqual((state / "certs" / "devbox-gh-proxy-ca.pem").stat().st_mode & 0o777, 0o644)
+            subprocess.run(["bash", "-c", script], input="http://two@h:4141\n",
+                           text=True, check=True, env=environment)
+            self.assertEqual((state / "proxy-url").read_text(), "http://two@h:4141\n")
+            self.assertEqual((state / "certs" / "devbox-gh-proxy-ca.pem").read_text(), pem)
+            self.assertEqual(sorted(path.name for path in (state / "certs").iterdir()), ["devbox-gh-proxy-ca.pem"])
+
+    def test_capability_is_still_delivered_when_the_ca_cannot_be_checked(self):
+        completed = Mock(returncode=0, stdout="", stderr="")
+        with patch.object(proxy, "issue_github_proxy_token", return_value="part.one"), \
+             patch.object(proxy, "ensure_github_certificates", side_effect=RuntimeError("no openssl")), \
+             patch.object(proxy.sys, "stderr"), \
+             patch.object(proxy.subprocess, "run", return_value=completed) as run:
+            proxy.deliver_github_proxy_capability("devbox-a", "http://host.lima.internal:4141")
+        self.assertEqual(run.call_args.kwargs["input"], "http://part.one@host.lima.internal:4141\n")
+
+    def test_github_certificate_problem_detects_expiry_and_key_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(proxy, "STATE_DIR", directory):
+            ca_path, certificate, private_key = proxy.ensure_github_certificates()
+            with patch.object(proxy, "GITHUB_CERT_RENEW_BEFORE_SECONDS", 900 * 24 * 60 * 60):
+                self.assertIn("expires", proxy.github_certificate_problem(ca_path, certificate, private_key))
+            other_key = Path(directory) / "other-key.pem"
+            proxy.subprocess.run(
+                ["openssl", "genpkey", "-algorithm", "RSA", "-out", str(other_key)],
+                check=True, capture_output=True,
+            )
+            self.assertIn("does not match", proxy.github_certificate_problem(ca_path, certificate, str(other_key)))
+
+    def test_daemon_pushes_a_regenerated_ca_before_the_renewal_interval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registrations = Path(directory) / "gh-proxy-boxes"
+            registrations.mkdir()
+            (registrations / "devbox-existing-1234.url").write_text("http://host.lima.internal:4141\n")
+            history = {}
+            with patch.object(proxy, "STATE_DIR", directory), \
+                 patch.object(proxy, "BIND_PORT", 4141), \
+                 patch.object(proxy, "GITHUB_PROXY_RENEW_SECONDS", 100), \
+                 patch.object(proxy, "running_lima_instances", return_value={"devbox-existing-1234"}), \
+                 patch.object(proxy, "deliver_github_proxy_capability") as deliver:
+                proxy.refresh_registered_github_proxy_boxes(history, now=1000)
+                unchanged = proxy.refresh_registered_github_proxy_boxes(history, now=1010)
+                ca_path = proxy.github_certificate_paths()[0]
+                stat = os.stat(ca_path)
+                os.utime(ca_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+                proxy._GITHUB_CERT_CHECKED.clear()
+                replaced = proxy.refresh_registered_github_proxy_boxes(history, now=1020)
+        self.assertEqual(unchanged["renewed"], 0)
+        self.assertEqual(replaced["renewed"], 1)
+        self.assertEqual(deliver.call_count, 2)
+
     def test_connect_upgrades_to_a_locally_trusted_github_tls_session(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(proxy, "STATE_DIR", directory), \
@@ -337,18 +487,24 @@ class GitHubCliProxyTests(TestCase):
 
     def test_capability_delivery_keeps_token_out_of_process_arguments(self):
         completed = Mock(returncode=0, stdout="", stderr="")
-        with patch.object(proxy, "issue_github_proxy_token", return_value="part.one"), \
-             patch.object(proxy.subprocess, "run", return_value=completed) as run:
-            proxy.deliver_github_proxy_capability(
-                "devbox-existing-1234",
-                "http://host.lima.internal:4141",
-            )
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(proxy, "STATE_DIR", directory):
+            ca_path, _, _ = proxy.ensure_github_certificates()
+            ca_certificate = Path(ca_path).read_text()
+            with patch.object(proxy, "issue_github_proxy_token", return_value="part.one"), \
+                 patch.object(proxy.subprocess, "run", return_value=completed) as run:
+                proxy.deliver_github_proxy_capability(
+                    "devbox-existing-1234",
+                    "http://host.lima.internal:4141",
+                )
 
         arguments = run.call_args.args[0]
         self.assertNotIn("part.one", " ".join(arguments))
+        # The URL line, then the current CA so a running guest follows a
+        # regenerated CA without waiting for its next `devbox` run.
         self.assertEqual(
             run.call_args.kwargs["input"],
-            "http://part.one@host.lima.internal:4141\n",
+            "http://part.one@host.lima.internal:4141\n" + ca_certificate,
         )
 
     def test_running_lima_instances_accepts_ndjson(self):
