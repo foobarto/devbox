@@ -388,6 +388,25 @@ print("" if d is None else d)' "$1"
   [ "$output" = "/data" ]
 }
 
+@test "mount arg uses the already-checked path and never re-resolves symlinks" {
+  mkdir -p "$BATS_TEST_TMPDIR/real"
+  ln -s "$HOME" "$BATS_TEST_TMPDIR/link"
+  run _lima_mount_arg "$BATS_TEST_TMPDIR/link:rw"
+  [ "$output" = "$BATS_TEST_TMPDIR/link:w" ]
+}
+
+@test "remembered proxy endpoints from older versions gain an explicit port" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR/config"
+  mkdir -p "$CONFIG_DIR/gh-proxy-boxes" "$CONFIG_DIR/traffic-proxy-boxes"
+  printf 'http://host.lima.internal\n' > "$CONFIG_DIR/gh-proxy-boxes/box.url"
+  printf 'http://host.lima.internal\n' > "$CONFIG_DIR/traffic-proxy-boxes/box.url"
+  [ "$(stored_gh_proxy_endpoint box)" = "http://host.lima.internal:4141" ]
+  [ "$(stored_traffic_proxy_endpoint box)" = "http://host.lima.internal:4141" ]
+  printf 'http://h:1;x\n' > "$CONFIG_DIR/gh-proxy-boxes/box.url"
+  run stored_gh_proxy_endpoint box
+  [ "$status" -ne 0 ]
+}
+
 @test "every clone mount is --mount-only, so no golden mount can leak through" {
   # --mount-only OVERRIDES the source golden's mounts; --mount would ADD to
   # them, letting an inherited ~ mount survive into the clone. Assert the
@@ -514,6 +533,88 @@ print("" if d is None else d)' "$1"
   run proxy_port http://host.lima.internal:4141; [ "$output" = "4141" ]
   run proxy_port http://host.lima.internal:5001; [ "$output" = "5001" ]
   run proxy_port http://host;                     [ "$output" = "4141" ]
+}
+
+@test "proxy endpoint admission and port probe reject shell metacharacters" {
+  valid_gh_proxy_endpoint "http://host.lima.internal:4141"
+  valid_gh_proxy_endpoint "http://host.lima.internal"
+  ! valid_gh_proxy_endpoint "http://host.lima.internal:0"
+  ! valid_gh_proxy_endpoint "http://host.lima.internal:65536"
+  ! valid_gh_proxy_endpoint "http://host.lima.internal:1;touch-marker"
+
+  marker="$BATS_TEST_TMPDIR/proxy-port-injection"
+  run proxy_port_open "1; touch $marker"
+  [ "$status" -ne 0 ]
+  [ ! -e "$marker" ]
+}
+
+@test "proxy endpoints are whole-string ASCII host:port URLs with an explicit port" {
+  for bad in "http://h:" "http://h:4141#" "http://h:4141?" "http://ĥ:4141" \
+             "http://[::1]:4141" "http://[v1.h]|;e touch pwned:4141" "http://h:4141/" \
+             "https://h:4141" "http://u@h:4141" "http://h:0" "http://h:65536"; do
+    ! valid_gh_proxy_endpoint "$bad" || { echo "accepted: $bad"; false; }
+  done
+  [ "$(proxy_endpoint http://host.lima.internal)" = "http://host.lima.internal:4141" ]
+  [ "$(proxy_endpoint http://host.lima.internal:5151)" = "http://host.lima.internal:5151" ]
+  ! proxy_endpoint "http://h:4141;x"
+
+  manifest="$BATS_TEST_TMPDIR/.devbox.toml"
+  printf 'proxy = "http://host.lima.internal"\n' > "$manifest"
+  [ "$(manifest_value "$(project_manifest "$manifest")" proxy)" = "http://host.lima.internal:4141" ]
+  printf 'proxy = "http://ĥ:4141"\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+}
+
+@test "a proxy-env template substitutes the URL as plain text, never as a sed program" {
+  mkdir -p "$BATS_TEST_TMPDIR/config"
+  CONFIG_DIR="$BATS_TEST_TMPDIR/config"
+  printf 'export ANTHROPIC_BASE_URL=__PROXY_URL__\nexport X="a&b|c"\n' > "$CONFIG_DIR/proxy-env"
+  rendered="$BATS_TEST_TMPDIR/rendered"
+  limactl() {
+    # Read stdin only for the profile under test: other calls may have none.
+    if [[ "$*" == *zz-devbox-10-proxy.sh* ]]; then cat > "$rendered"; fi
+    return 0
+  }
+  proxy_launcher() { return 1; }
+  run apply_proxy box 'http://host.lima.internal:4141'
+  [ "$(sed -n 1p "$rendered")" = 'export ANTHROPIC_BASE_URL=http://host.lima.internal:4141' ]
+  [ "$(sed -n 2p "$rendered")" = 'export X="a&b|c"' ]
+
+  # apply_proxy validates its own input too: a sed-program URL never renders.
+  rm -f "$rendered"
+  run apply_proxy box 'http://host.lima.internal:4141&|e touch pwned|'
+  [ "$status" -ne 0 ]
+  [ ! -e "$rendered" ]
+  [ ! -e pwned ]
+}
+
+@test "mount host paths with Lima delimiters are refused before review and before clone" {
+  project="$BATS_TEST_TMPDIR/project"
+  mkdir -p "$project" "$BATS_TEST_TMPDIR/opt/cache,$HOME:w"
+  manifest="$project/.devbox.toml"
+
+  printf 'mounts = ["./cache,%s:w"]\n' "$HOME" > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"mount host paths must not contain ':' or ','"* ]]
+
+  printf 'mounts = ["./data:w:ro"]\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+
+  ln -s "$BATS_TEST_TMPDIR/opt/cache,$HOME:w" "$project/cache"
+  printf 'mounts = ["./cache"]\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+
+  run require_mountable_path "/srv/a,/home/u:w"
+  [ "$status" -ne 0 ]
+  run require_mountable_path "/srv/a:b"
+  [ "$status" -ne 0 ]
+  require_mountable_path "/srv/plain dir"
+  mkdir -p "$BATS_TEST_TMPDIR/data"
+  [ "$(_mount_spec_path "$BATS_TEST_TMPDIR/data:rw")" = "$(readlink -f "$BATS_TEST_TMPDIR/data")" ]
 }
 
 @test "GitHub proxy URL carries its capability as HTTP proxy userinfo" {
@@ -707,6 +808,110 @@ print("" if d is None else d)' "$1"
   [ "$(manifest_json_value "$from_project" copies)" = "[\"$project/tooling:~/tooling\", \"$project/script\"]" ]
 }
 
+@test "manifest rejects multiline mount and copy entries before approval" {
+  manifest="$BATS_TEST_TMPDIR/.devbox.toml"
+
+  printf 'mounts = ["./reviewed\\n/etc:ro"]\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"mounts entries must not contain newlines"* ]]
+
+  printf 'copies = ["./reviewed\\n/etc/passwd:captured"]\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"copies entries must not contain newlines"* ]]
+}
+
+@test "manifest rejects delimiters introduced by resolving host-path symlinks" {
+  project="$BATS_TEST_TMPDIR/project"
+  newline_target="$(printf "%s\\n%s" "$BATS_TEST_TMPDIR/target" "with-newline")"
+  mkdir -p "$project" "$BATS_TEST_TMPDIR/target:rw" "$BATS_TEST_TMPDIR/copy:destination" "$newline_target"
+  manifest="$project/.devbox.toml"
+
+  ln -s "$BATS_TEST_TMPDIR/target:rw" "$project/mount-link"
+  printf 'mounts = ["./mount-link"]\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"mount host paths must not contain ':' or ','"* ]]
+
+  ln -s "$BATS_TEST_TMPDIR/copy:destination" "$project/copy-link"
+  printf 'copies = ["./copy-link"]\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"resolved host path contains a colon require an explicit destination"* ]]
+
+  ln -s "$newline_target" "$project/newline-link"
+  printf 'mounts = ["./newline-link:rw"]\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"resolved host paths must not contain newlines"* ]]
+
+  printf 'copies = ["./newline-link:captured"]\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"resolved host paths must not contain newlines"* ]]
+}
+
+@test "manifest rejects newline-bearing effective defaults" {
+  newline_path="$(printf "%s\\n%s" "$BATS_TEST_TMPDIR/api-keys" "tail")"
+  proxy_url="$(printf "%s\\n%s" "http://host.lima.internal:4141" "tail")"
+  manifest="$BATS_TEST_TMPDIR/.devbox.toml"
+
+  DEFAULT_KEYS_FILE="$newline_path"
+  printf 'api_keys = true\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"effective default API-key path must not contain newlines"* ]]
+
+  PROXY_DEFAULT_URL="$proxy_url"
+  printf 'proxy = true\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"effective proxy URL must not contain newlines"* ]]
+}
+
+@test "manifest rejects NUL in every string before review or execution" {
+  manifest="$BATS_TEST_TMPDIR/.devbox.toml"
+
+  printf '%s\n' 'start = "printf safe\u0000; printf dangerous"' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"manifest string values must not contain NUL bytes"* ]]
+
+  printf '%s\n' 'copies = ["./source:dest\u0000tail"]' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"manifest string values must not contain NUL bytes"* ]]
+}
+
+@test "manifest rejects a local image symlink whose resolved target loses its file type" {
+  project="$BATS_TEST_TMPDIR/project"
+  target="$BATS_TEST_TMPDIR/extensionless-image"
+  mkdir -p "$project"
+  touch "$target"
+  ln -s "$target" "$project/base.yaml"
+  manifest="$project/.devbox.toml"
+  printf 'image = "./base.yaml"\n' > "$manifest"
+
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"resolved local image paths must retain a supported image extension"* ]]
+}
+
+@test "manifest rejects multiline package names and injectable image digests" {
+  manifest="$BATS_TEST_TMPDIR/.devbox.toml"
+
+  printf 'packages = ["""reviewed\nsecond"""]\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"package names must not contain newlines"* ]]
+
+  printf '[image]\nlocation = "https://safe.example/base.qcow2"\ndigest = """sha512:deadbeef"\n- location: "https://evil.example/base.qcow2"\n  arch: "x86_64" #"""\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"image.digest must be sha256:HEX or sha512:HEX"* ]]
+}
+
 @test "manifest package transport handles a single package" {
   run manifest_package_lines '["hello"]'
   [ "$status" -eq 0 ]
@@ -719,6 +924,19 @@ print("" if d is None else d)' "$1"
   [ "$output" = $'node\ngo' ]
 }
 
+@test "manifest revalidation fails closed when an approved file disappears" {
+  manifest="$BATS_TEST_TMPDIR/.devbox.toml"
+  printf 'start = "true"\n' > "$manifest"
+  fingerprint="$(manifest_fingerprint "$manifest")"
+  normalized="$(project_manifest "$manifest")"
+  semantics="$(manifest_semantics_fingerprint "$normalized")"
+
+  rm -f "$manifest"
+  run require_manifest_unchanged "$manifest" "$fingerprint" "$semantics"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"could not re-read"* ]]
+}
+
 @test "manifest approval is owner-only host state and content changes invalidate it" {
   project="$BATS_TEST_TMPDIR/project"
   mkdir -p "$project"
@@ -727,20 +945,131 @@ print("" if d is None else d)' "$1"
   MANIFEST_APPROVAL_DIR="$BATS_TEST_TMPDIR/home-state/devbox/manifest-approvals"
 
   first="$(manifest_fingerprint "$manifest")"
-  ! manifest_approval_matches "$manifest" "$first"
-  record_manifest_approval "$manifest" "$first" claude true
-  manifest_approval_matches "$manifest" "$first"
+  normalized="$(project_manifest "$manifest")"
+  semantics="$(manifest_semantics_fingerprint "$normalized")"
+  ! manifest_approval_matches "$manifest" "$first" "$semantics"
+  record_manifest_approval "$manifest" "$first" "$semantics" claude true
+  manifest_approval_matches "$manifest" "$first" "$semantics"
 
   state="$(manifest_approval_path "$manifest")"
   [ "$(file_mode "$MANIFEST_APPROVAL_DIR")" = "700" ]
   [ "$(file_mode "$state")" = "600" ]
+  grep -q '"version": 2' "$state"
   grep -q '"ai_reviewer": "claude"' "$state"
   [ ! -e "$project/.devbox-approval" ]
 
   printf 'start = "false"\n' > "$manifest"
   second="$(manifest_fingerprint "$manifest")"
   [ "$first" != "$second" ]
-  ! manifest_approval_matches "$manifest" "$second"
+  ! manifest_approval_matches "$manifest" "$second" "$semantics"
+}
+
+@test "manifest approval is invalidated when a symlink changes a normalized host path" {
+  project="$BATS_TEST_TMPDIR/project"
+  safe="$BATS_TEST_TMPDIR/safe-cache"
+  other="$BATS_TEST_TMPDIR/other-host-directory"
+  mkdir -p "$project" "$safe" "$other"
+  manifest="$project/.devbox.toml"
+  printf 'mounts = ["./cache:rw"]\n' > "$manifest"
+  ln -s "$safe" "$project/cache"
+  MANIFEST_APPROVAL_DIR="$BATS_TEST_TMPDIR/manifest-approvals"
+
+  fingerprint="$(manifest_fingerprint "$manifest")"
+  first_manifest="$(project_manifest "$manifest")"
+  first_semantics="$(manifest_semantics_fingerprint "$first_manifest")"
+  record_manifest_approval "$manifest" "$fingerprint" "$first_semantics" none false
+  manifest_approval_matches "$manifest" "$fingerprint" "$first_semantics"
+
+  ln -sfn "$other" "$project/cache"
+  second_manifest="$(project_manifest "$manifest")"
+  second_semantics="$(manifest_semantics_fingerprint "$second_manifest")"
+
+  [ "$(manifest_fingerprint "$manifest")" = "$fingerprint" ]
+  [ "$(manifest_json_value "$first_manifest" mounts)" = "[\"$safe:rw\"]" ]
+  [ "$(manifest_json_value "$second_manifest" mounts)" = "[\"$other:rw\"]" ]
+  [ "$first_semantics" != "$second_semantics" ]
+  ! manifest_approval_matches "$manifest" "$fingerprint" "$second_semantics"
+
+  render_manifest_warning() { touch "$BATS_TEST_TMPDIR/review-required"; }
+  choose_manifest_reviewer() { printf -v "$1" '%s' none; }
+  read_manifest_answer() { return 1; }
+  run confirm_manifest_permissions \
+    "$manifest" "$fingerprint" "$second_semantics" "mount-rw|Mount $other"
+  [ "$status" -ne 0 ]
+  [ -e "$BATS_TEST_TMPDIR/review-required" ]
+}
+
+@test "manifest rejects unsafe explicit and default proxy endpoints before approval" {
+  manifest="$BATS_TEST_TMPDIR/.devbox.toml"
+
+  printf 'proxy = "http://host.lima.internal:1; touch marker"\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"proxy must be a bare http://host:port URL with a numeric port"* ]]
+
+  PROXY_DEFAULT_URL="http://host.lima.internal:70000"
+  printf 'proxy = true\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"proxy must be a bare http://host:port URL with a numeric port"* ]]
+}
+
+@test "manifest semantics bind effective defaults and resolve the default API-key path" {
+  project="$BATS_TEST_TMPDIR/project"
+  safe="$BATS_TEST_TMPDIR/safe-keys.env"
+  other="$BATS_TEST_TMPDIR/other-keys.env"
+  mkdir -p "$project"
+  touch "$safe" "$other"
+  manifest="$project/.devbox.toml"
+  printf 'proxy = true\napi_keys = true\n' > "$manifest"
+  ln -s "$safe" "$project/api-keys.env"
+  DEFAULT_KEYS_FILE="$project/api-keys.env"
+  PROXY_DEFAULT_URL="http://safe.example:4141"
+
+  first_manifest="$(project_manifest "$manifest")"
+  first_semantics="$(manifest_semantics_fingerprint "$first_manifest")"
+  [ "$(manifest_value "$first_manifest" api_keys)" = "$safe" ]
+  [ "$(manifest_value "$first_manifest" proxy)" = "http://safe.example:4141" ]
+
+  ln -sfn "$other" "$project/api-keys.env"
+  second_manifest="$(project_manifest "$manifest")"
+  second_semantics="$(manifest_semantics_fingerprint "$second_manifest")"
+  [ "$(manifest_value "$second_manifest" api_keys)" = "$other" ]
+  [ "$first_semantics" != "$second_semantics" ]
+
+  PROXY_DEFAULT_URL="http://other.example:4141"
+  third_manifest="$(project_manifest "$manifest")"
+  third_semantics="$(manifest_semantics_fingerprint "$third_manifest")"
+  [ "$(manifest_value "$third_manifest" proxy)" = "http://other.example:4141" ]
+  [ "$second_semantics" != "$third_semantics" ]
+}
+
+@test "legacy content-only manifest approvals are invalidated" {
+  project="$BATS_TEST_TMPDIR/project"
+  mkdir -p "$project"
+  manifest="$project/.devbox.toml"
+  printf 'start = "true"\n' > "$manifest"
+  MANIFEST_APPROVAL_DIR="$BATS_TEST_TMPDIR/manifest-approvals"
+
+  fingerprint="$(manifest_fingerprint "$manifest")"
+  normalized="$(project_manifest "$manifest")"
+  semantics="$(manifest_semantics_fingerprint "$normalized")"
+  record_manifest_approval "$manifest" "$fingerprint" "$semantics" none false
+  state="$(manifest_approval_path "$manifest")"
+  python3 - "$state" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as approval_file:
+    approval = json.load(approval_file)
+approval["version"] = 1
+approval.pop("normalized_fingerprint")
+with open(path, "w", encoding="utf-8") as approval_file:
+    json.dump(approval, approval_file)
+PY
+
+  ! manifest_approval_matches "$manifest" "$fingerprint" "$semantics"
 }
 
 @test "manifest warning uses category icons and preserves multiline startup formatting" {
@@ -913,12 +1242,14 @@ PY
   manifest="$BATS_TEST_DIRNAME/fixtures/project.devbox.toml"
   MANIFEST_APPROVAL_DIR="$BATS_TEST_TMPDIR/manifest-approvals"
   fingerprint="$(manifest_fingerprint "$manifest")"
-  record_manifest_approval "$manifest" "$fingerprint" none false
+  normalized="$(project_manifest "$manifest")"
+  semantics="$(manifest_semantics_fingerprint "$normalized")"
+  record_manifest_approval "$manifest" "$fingerprint" "$semantics" none false
   render_manifest_warning() { return 99; }
   read_manifest_answer() { return 99; }
   review_manifest_with_ai() { return 99; }
 
-  run confirm_manifest_permissions "$manifest" "$fingerprint" "start|printf ready"
+  run confirm_manifest_permissions "$manifest" "$fingerprint" "$semantics" "start|printf ready"
 
   [ "$status" -eq 0 ]
   [ -z "$output" ]
@@ -937,10 +1268,10 @@ PY
     touch "$BATS_TEST_TMPDIR/review-ran"
   }
   require_manifest_unchanged() { :; }
-  record_manifest_approval() { printf '%s %s\n' "$3" "$4" > "$BATS_TEST_TMPDIR/review-state"; }
+  record_manifest_approval() { printf '%s %s\n' "$4" "$5" > "$BATS_TEST_TMPDIR/review-state"; }
   manifest_approval_matches() { return 1; }
 
-  run confirm_manifest_permissions /project/.devbox.toml fingerprint "start|true"
+  run confirm_manifest_permissions /project/.devbox.toml fingerprint normalized-fingerprint "start|true"
 
   [ "$status" -eq 0 ]
   [ -e "$BATS_TEST_TMPDIR/review-ran" ]

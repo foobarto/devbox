@@ -417,13 +417,15 @@ the service configured for that CLI; the selected host CLI must already be
 installed and authenticated. The AI review is advisory: Devbox still requires
 an explicit `y` before it uses the manifest.
 
-After approval, Devbox stores only the manifest path, its SHA-256 fingerprint,
-the selected reviewer, review outcome, and approval time under
+After approval, Devbox stores only the manifest path, SHA-256 fingerprints of
+its exact contents and normalized meaning (including effective defaults and
+resolved host paths), the selected reviewer, review outcome, and approval time under
 `${XDG_STATE_HOME:-~/.local/state}/devbox/manifest-approvals/`. Files are mode
 `0600` in a mode-`0700` directory; nothing is written to the project. The
-warning and prompts are skipped on later runs and return after any change to
-the manifest. Command-line flags remain explicit user choices and are not
-included in that confirmation. See the complete annotated template:
+warning and prompts are skipped on later runs and return after any content or
+resolved-path change. Older content-only approval records are ignored, causing
+a one-time reapproval. Command-line flags remain explicit user choices and are
+not included in that confirmation. See the complete annotated template:
 [`examples/.devbox.toml`](examples/.devbox.toml).
 
 The old executable `.devbox` hook is no longer run; Devbox emits a migration

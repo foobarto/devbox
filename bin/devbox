@@ -873,6 +873,7 @@ proxy_port() {
 # $1 bare http proxy URL; capability token arrives on stdin so it never appears
 # in the host process list. HTTP proxy URLs encode userinfo as Basic auth.
 capability_proxy_url() {
+  valid_gh_proxy_endpoint "$1" || return 1
   python3 -c '
 import sys
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -895,14 +896,23 @@ gh_proxy_state_path() { # $1 Lima instance name
   printf '%s/gh-proxy-boxes/%s.url' "$CONFIG_DIR" "$1"
 }
 
+# A proxy endpoint is matched as a whole, ASCII-only string rather than through
+# urlsplit, whose host parsing has differed across Python patch releases. The
+# value later reaches guest profiles and the host port probe, so nothing but a
+# hostname and an optional numeric port may pass.
 valid_gh_proxy_endpoint() { # $1 bare http proxy URL
   python3 -c '
-import sys
-from urllib.parse import urlsplit
-
-source = urlsplit(sys.argv[1])
-sys.exit(0 if source.scheme == "http" and source.netloc and not source.username and not source.password and not source.path and not source.query and not source.fragment else 1)
+import re, sys
+match = re.fullmatch(r"http://[A-Za-z0-9.-]+(?::([0-9]{1,5}))?", sys.argv[1])
+raise SystemExit(0 if match and (match.group(1) is None or 1 <= int(match.group(1)) <= 65535) else 1)
 ' "$1"
+}
+
+# Validate a proxy endpoint and make its port explicit. Without one, the host
+# proxy listens on 4141 while guest clients would default to port 80.
+proxy_endpoint() { # $1 bare http proxy URL -> URL with an explicit port
+  valid_gh_proxy_endpoint "$1" || return 1
+  if [[ "${1#http://}" == *:* ]]; then printf '%s' "$1"; else printf '%s:4141' "$1"; fi
 }
 
 traffic_proxy_state_path() { # $1 Lima instance name
@@ -928,7 +938,8 @@ stored_traffic_proxy_endpoint() { # $1 Lima instance; prints host-owned remember
   path="$(traffic_proxy_state_path "$1")"
   [[ -r "$path" ]] || return 1
   value="$(<"$path")"
-  if ! valid_gh_proxy_endpoint "$value"; then
+  # Normalized on read too: older versions remembered port-less endpoints.
+  if ! value="$(proxy_endpoint "$value")"; then
     warn "ignoring invalid remembered traffic proxy endpoint for $1"
     return 1
   fi
@@ -957,7 +968,8 @@ stored_gh_proxy_endpoint() { # $1 Lima instance; prints host-owned remembered en
   path="$(gh_proxy_state_path "$1")"
   [[ -r "$path" ]] || return 1
   value="$(<"$path")"
-  if ! valid_gh_proxy_endpoint "$value"; then
+  # Normalized on read too: older versions remembered port-less endpoints.
+  if ! value="$(proxy_endpoint "$value")"; then
     warn "ignoring invalid remembered GitHub CLI proxy endpoint for $1"
     return 1
   fi
@@ -1012,7 +1024,12 @@ renew_gh_proxy_capability() { # $1 Lima instance $2 bare http proxy URL
 proxy_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -q 'devbox-ai-proxy'; }
 proxy_self_renewal_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -q 'gh-self-renewal'; }
 # is anything at all listening on the port?
-proxy_port_open() { timeout 1 bash -c ">/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
+proxy_port_open() {
+  local port="${1:-}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 2
+  (( 10#$port >= 1 && 10#$port <= 65535 )) || return 2
+  timeout 1 bash -c ">/dev/tcp/127.0.0.1/$port" 2>/dev/null
+}
 # locate a proxy asset across source (../proxy) and brew (../libexec/proxy)
 # layouts. This keeps the guest-side gh wrapper versioned with the host proxy.
 proxy_asset() {
@@ -1054,6 +1071,7 @@ proxy_stop_process() {
 # start the host proxy if it isn't already up (idempotent). Shared across boxes.
 proxy_ensure() {
   local url="$1" port launcher logf i
+  valid_gh_proxy_endpoint "$url" || { warn "invalid credential proxy URL: $url"; return 1; }
   port="$(proxy_port "$url")"
   if proxy_health "$port"; then
     if proxy_self_renewal_health "$port"; then
@@ -1083,9 +1101,16 @@ proxy_ensure() {
 
 apply_proxy() {
   local name="$1" url="$2" tmpl="$CONFIG_DIR/proxy-env" launcher gh_wrapper ca_path
+  valid_gh_proxy_endpoint "$url" || die "proxy must be a bare http://host:port URL with a numeric port"
   log "Wiring AI and GitHub CLIs → proxy $url"
   if [[ -f "$tmpl" ]]; then
-    sed "s|__PROXY_URL__|$url|g" "$tmpl" \
+    # Plain string substitution: the URL must never become part of a sed
+    # program, where a crafted value could run a host command.
+    local template
+    template="$(<"$tmpl")"
+    # Unquoted replacement on purpose: bash 4.0-4.2 would keep inner quotes
+    # literally, and the validated URL cannot contain `&` for 5.2's patsub.
+    printf '%s\n' "${template//__PROXY_URL__/$url}" \
       | limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-10-proxy.sh >/dev/null'
   else
     limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-10-proxy.sh >/dev/null' <<EOF
@@ -1429,13 +1454,25 @@ run_gui_shell() { # $1 Lima instance $2 guest workdir
     bash -lc "$remote_command"
 }
 
-# PATH[:ro|:rw] -> a Lima --mount value (bare = read-only, :w suffix = writable).
+# Lima splits a --mount value on "," and reads ":" as its mode delimiter, so a
+# host path containing either could smuggle in another, writable mount.
+require_mountable_path() { # $1 resolved host path
+  [[ "$1" != *[:,]* ]] || die "cannot mount a host path containing ':' or ',': $1"
+}
+_mount_spec_path() { # PATH[:ro|:rw] -> resolved host path
+  local spec="$1"
+  case "$spec" in *:rw|*:ro) spec="${spec%:*}";; esac
+  abspath "$spec"
+}
+# Resolved PATH[:ro|:rw] -> a Lima --mount value (bare = read-only, :w suffix =
+# writable). Callers pass paths already resolved and checked by
+# require_mountable_path, so a symlink swapped afterwards cannot change them.
 _lima_mount_arg() {
   local spec="$1"
   case "$spec" in
-    *:rw) printf '%s:w' "$(abspath "${spec%:rw}")";;
-    *:ro) printf '%s'   "$(abspath "${spec%:ro}")";;
-    *)    printf '%s'   "$(abspath "$spec")";;
+    *:rw) printf '%s:w' "${spec%:rw}";;
+    *:ro) printf '%s'   "${spec%:ro}";;
+    *)    printf '%s'   "$spec";;
   esac
 }
 # The clone's mount flags, one token per line. Every mount is `--mount-only`,
@@ -1894,7 +1931,7 @@ seed_agent_trust() { # $1 Lima instance $2 mounted project dir
 
 # --------------------------------------------------------- project manifest --
 project_manifest() { # $1 .devbox.toml -> normalized JSON
-  python3 - "$1" <<'PY'
+  python3 - "$1" "$PROXY_DEFAULT_URL" "$DEFAULT_KEYS_FILE" <<'PY'
 import json
 import os
 import re
@@ -1907,11 +1944,27 @@ except ImportError:
     raise SystemExit("Python 3.11+ is required to read .devbox.toml")
 
 path = Path(sys.argv[1])
+proxy_default = sys.argv[2]
+keys_default = os.path.realpath(os.path.abspath(os.path.expanduser(sys.argv[3])))
 manifest_dir = os.path.realpath(os.path.dirname(os.path.abspath(path)))
 try:
     data = tomllib.loads(path.read_text())
 except (OSError, tomllib.TOMLDecodeError) as exc:
     raise SystemExit(f"could not read {path}: {exc}")
+
+def reject_nul(value):
+    if isinstance(value, str):
+        if "\0" in value:
+            raise SystemExit("manifest string values must not contain NUL bytes")
+    elif isinstance(value, list):
+        for item in value:
+            reject_nul(item)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            reject_nul(key)
+            reject_nul(item)
+
+reject_nul(data)
 
 allowed = {
     "image", "packages", "start", "ssh_agent", "keep", "proxy", "api_keys",
@@ -1940,25 +1993,35 @@ if isinstance(image, dict):
     if location is None:
         raise SystemExit("[image] requires a location")
     image_digest = image.get("digest") or ""
+    if image_digest and not re.fullmatch(r"sha(?:256|512):[0-9a-fA-F]+", image_digest):
+        raise SystemExit("image.digest must be sha256:HEX or sha512:HEX")
     image_provision = image.get("provision") or ""
     image_provision_user = image.get("provision_user") or ""
     image = location
 elif image is not None and (not isinstance(image, str) or not image):
     raise SystemExit("image must be a non-empty string or an [image] table")
+if image and ("\n" in image or "\r" in image or chr(34) in image or chr(92) in image):
+    raise SystemExit("image location must not contain newlines, double quotes, or backslashes")
 
 def resolve_host_path(value):
     value = os.path.expanduser(value)
     if not os.path.isabs(value):
         value = os.path.join(manifest_dir, value)
-    return os.path.realpath(value)
+    resolved = os.path.realpath(value)
+    if "\n" in resolved or "\r" in resolved:
+        raise SystemExit("resolved host paths must not contain newlines")
+    return resolved
 
 # Host paths in a repository manifest are relative to that manifest, never to
 # the shell directory from which Devbox happened to be invoked. Normalize them
 # before both consent rendering and execution so a cached approval always
 # describes the same host objects.
-if image and not image.startswith(("http://", "https://", "template:")) \
-        and image.lower().endswith((".yaml", ".yml", ".qcow2", ".img", ".raw")):
+if image and not image.startswith(("http://", "https://", "template:")) and image.lower().endswith((".yaml", ".yml", ".qcow2", ".img", ".raw")):
     image = resolve_host_path(image)
+    if chr(34) in image or chr(92) in image:
+        raise SystemExit("resolved local image paths must not contain double quotes or backslashes")
+    if not image.lower().endswith((".yaml", ".yml", ".qcow2", ".img", ".raw")):
+        raise SystemExit("resolved local image paths must retain a supported image extension")
 
 resources = data.get("resources", {})
 if not isinstance(resources, dict):
@@ -1980,6 +2043,8 @@ for key in ("memory", "disk"):
 packages = data.get("packages", [])
 if not isinstance(packages, list) or any(not isinstance(p, str) or not p for p in packages):
     raise SystemExit("packages must be an array of non-empty Homebrew formula names")
+if any("\n" in package or "\r" in package for package in packages):
+    raise SystemExit("package names must not contain newlines")
 
 start = data.get("start")
 if start is not None and (not isinstance(start, str) or not start):
@@ -1993,14 +2058,36 @@ for key in ("proxy", "api_keys"):
     value = data.get(key, False)
     if not isinstance(value, (bool, str)) or isinstance(value, str) and not value:
         raise SystemExit(f"{key} must be true, false, or a non-empty path/URL string")
+    if isinstance(value, str) and ("\n" in value or "\r" in value):
+        raise SystemExit(f"{key} must not contain newlines")
 
 for key in ("mounts", "copies"):
     value = data.get(key, [])
     if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
         raise SystemExit(f"{key} must be an array of non-empty strings")
+    if any("\n" in item or "\r" in item for item in value):
+        raise SystemExit(f"{key} entries must not contain newlines")
+
+proxy = data.get("proxy", False)
+if proxy is True:
+    if "\n" in proxy_default or "\r" in proxy_default:
+        raise SystemExit("the effective proxy URL must not contain newlines")
+    proxy = proxy_default
+
+if proxy is not False:
+    # Same whole-string, ASCII-only rule as valid_gh_proxy_endpoint.
+    match = re.fullmatch(r"http://[A-Za-z0-9.-]+(?::([0-9]{1,5}))?", proxy)
+    if not match or match.group(1) is not None and not 1 <= int(match.group(1)) <= 65535:
+        raise SystemExit("proxy must be a bare http://host:port URL with a numeric port")
+    if match.group(1) is None:
+        proxy += ":4141"
 
 api_keys = data.get("api_keys", False)
-if isinstance(api_keys, str):
+if api_keys is True:
+    if "\n" in keys_default or "\r" in keys_default:
+        raise SystemExit("the effective default API-key path must not contain newlines")
+    api_keys = keys_default
+elif isinstance(api_keys, str):
     api_keys = resolve_host_path(api_keys)
 
 mounts = []
@@ -2009,7 +2096,12 @@ for item in data.get("mounts", []):
     source = item[:-len(suffix)] if suffix else item
     if not source:
         raise SystemExit("mount entries require a host path")
-    mounts.append(resolve_host_path(source) + suffix)
+    resolved_source = resolve_host_path(source)
+    # Lima splits a --mount value on "," and reads ":" as a mode delimiter, so
+    # either one in the resolved path could add a different, writable mount.
+    if ":" in resolved_source or "," in resolved_source:
+        raise SystemExit("mount host paths must not contain ':' or ',' (after resolving symlinks)")
+    mounts.append(resolved_source + suffix)
 
 copies = []
 for item in data.get("copies", []):
@@ -2019,7 +2111,10 @@ for item in data.get("copies", []):
             raise SystemExit("copy entries require SRC[:DEST]")
         copies.append(f"{resolve_host_path(source)}:{destination}")
     else:
-        copies.append(resolve_host_path(item))
+        resolved_source = resolve_host_path(item)
+        if ":" in resolved_source:
+            raise SystemExit("copy entries whose resolved host path contains a colon require an explicit destination")
+        copies.append(resolved_source)
 
 if data.get("no_auth") and (data.get("proxy") or data.get("api_keys") or data.get("with_creds")):
     raise SystemExit("no_auth cannot be combined with proxy, api_keys, or with_creds")
@@ -2032,7 +2127,7 @@ print(json.dumps({
     "cpus": cpus or "", "memory": resources.get("memory", ""),
     "disk": resources.get("disk", ""),
     "ssh_agent": data.get("ssh_agent", False), "keep": data.get("keep", False),
-    "proxy": data.get("proxy", False), "api_keys": api_keys,
+    "proxy": proxy, "api_keys": api_keys,
     "with_creds": data.get("with_creds", False),
     "with_agent_config": data.get("with_agent_config", False),
     "no_auth": data.get("no_auth", False),
@@ -2054,12 +2149,11 @@ manifest_package_lines() { # $1 normalized package JSON -> one package per line
 }
 
 manifest_request_records() { # $1 normalized JSON -> NUL-delimited type|detail records
-  python3 - "$PROXY_DEFAULT_URL" "$DEFAULT_KEYS_FILE" 3<<< "$1" <<'PY'
+  python3 - 3<<< "$1" <<'PY'
 import json
 import os
 import sys
 
-proxy_default, keys_default = sys.argv[1:]
 data = json.load(os.fdopen(3))
 
 def emit(kind, detail):
@@ -2096,10 +2190,10 @@ if data["with_agent_config"]:
 
 proxy = data["proxy"]
 if proxy is not False:
-    emit("proxy", f"Enable the host-side AI authentication proxy: {proxy_default if proxy is True else proxy}")
+    emit("proxy", f"Enable the host-side AI authentication proxy: {proxy}")
 api_keys = data["api_keys"]
 if api_keys is not False:
-    emit("credentials", f"Copy API keys into the box from: {keys_default if api_keys is True else api_keys}")
+    emit("credentials", f"Copy API keys into the box from: {api_keys}")
 if data["with_creds"]:
     emit("credentials", "Copy host AI credential files into the box")
 if data["no_auth"]:
@@ -2134,6 +2228,20 @@ except OSError as exc:
 PY
 }
 
+manifest_semantics_fingerprint() { # $1 normalized manifest JSON -> SHA-256
+  python3 -c '
+import hashlib
+import json
+import sys
+
+data = json.load(sys.stdin)
+canonical = json.dumps(
+    data, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+).encode()
+print(hashlib.sha256(canonical).hexdigest())
+' <<< "$1"
+}
+
 manifest_approval_path() { # $1 .devbox.toml -> host-side per-project state file
   python3 - "$MANIFEST_APPROVAL_DIR" "$1" <<'PY'
 import hashlib
@@ -2153,37 +2261,38 @@ print(os.path.join(state_dir, f"{key}.json"))
 PY
 }
 
-manifest_approval_matches() { # $1 manifest path $2 current fingerprint
+manifest_approval_matches() { # $1 path $2 content fp $3 normalized fp
   local state
   state="$(manifest_approval_path "$1")"
   [[ -f "$state" ]] || return 1
-  python3 - "$state" "$1" "$2" <<'PY' >/dev/null 2>&1
+  python3 - "$state" "$1" "$2" "$3" <<'PY' >/dev/null 2>&1
 import json
 import os
 import sys
 
-state_path, manifest, fingerprint = sys.argv[1:]
+state_path, manifest, fingerprint, normalized_fingerprint = sys.argv[1:]
 try:
     data = json.loads(open(state_path, encoding="utf-8").read())
 except (OSError, ValueError):
     raise SystemExit(1)
 expected = {
-    "version": 1,
+    "version": 2,
     "manifest": os.path.join(
         os.path.realpath(os.path.dirname(os.path.abspath(manifest))),
         os.path.basename(manifest),
     ),
     "fingerprint": fingerprint,
+    "normalized_fingerprint": normalized_fingerprint,
     "approved": True,
 }
 raise SystemExit(0 if all(data.get(key) == value for key, value in expected.items()) else 1)
 PY
 }
 
-record_manifest_approval() { # $1 path $2 fingerprint $3 AI reviewer/none $4 AI completed
+record_manifest_approval() { # $1 path $2 content fp $3 normalized fp $4 reviewer $5 completed
   local state
   state="$(manifest_approval_path "$1")"
-  python3 - "$state" "$1" "$2" "$3" "$4" <<'PY'
+  python3 - "$state" "$1" "$2" "$3" "$4" "$5" <<'PY'
 import json
 import os
 import tempfile
@@ -2191,17 +2300,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
-state_path, manifest, fingerprint, ai_reviewer, ai_completed = sys.argv[1:]
+state_path, manifest, fingerprint, normalized_fingerprint, ai_reviewer, ai_completed = sys.argv[1:]
 state_path = Path(state_path)
 state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 os.chmod(state_path.parent, 0o700)
 data = {
-    "version": 1,
+    "version": 2,
     "manifest": os.path.join(
         os.path.realpath(os.path.dirname(os.path.abspath(manifest))),
         os.path.basename(manifest),
     ),
     "fingerprint": fingerprint,
+    "normalized_fingerprint": normalized_fingerprint,
     "approved": True,
     "ai_review_requested": ai_reviewer != "none",
     "ai_reviewer": ai_reviewer,
@@ -2231,11 +2341,16 @@ except BaseException:
 PY
 }
 
-require_manifest_unchanged() { # $1 path $2 previously reviewed fingerprint
-  local current
+require_manifest_unchanged() { # $1 path $2 content fp $3 normalized fp
+  local current normalized current_normalized
   current="$(manifest_fingerprint "$1")" || die "could not re-read $PROJECT_MANIFEST_NAME"
   [[ "$current" == "$2" ]] \
     || die "$PROJECT_MANIFEST_NAME changed while it was being reviewed; run devbox again"
+  normalized="$(project_manifest "$1")" || die "could not re-read $PROJECT_MANIFEST_NAME"
+  current_normalized="$(manifest_semantics_fingerprint "$normalized")" \
+    || die "could not normalize $PROJECT_MANIFEST_NAME"
+  [[ "$current_normalized" == "$3" ]] \
+    || die "$PROJECT_MANIFEST_NAME host paths changed while it was being reviewed; run devbox again"
 }
 
 manifest_request_style() { # $1 request type -> icon<TAB>heading
@@ -2500,10 +2615,11 @@ run_project_start() { # $1 box name $2 workdir $3 command
     || warn "$PROJECT_MANIFEST_NAME start command exited non-zero"
 }
 
-confirm_manifest_permissions() { # $1 path $2 fingerprint; remaining args are type|detail
-  local path="$1" fingerprint="$2" answer="" reviewer="none" ai_completed=false
-  shift 2
-  manifest_approval_matches "$path" "$fingerprint" && return 0
+confirm_manifest_permissions() { # $1 path $2 content fp $3 normalized fp; remaining args are type|detail
+  local path="$1" fingerprint="$2" normalized_fingerprint="$3"
+  local answer="" reviewer="none" ai_completed=false
+  shift 3
+  manifest_approval_matches "$path" "$fingerprint" "$normalized_fingerprint" && return 0
   render_manifest_warning "$path" "$@"
 
   choose_manifest_reviewer reviewer
@@ -2514,8 +2630,9 @@ confirm_manifest_permissions() { # $1 path $2 fingerprint; remaining args are ty
   read_manifest_answer answer $'\n✅ Approve this .devbox.toml? [y/N] ' \
     || die "$PROJECT_MANIFEST_NAME is not approved and no terminal is available"
   [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]] || die "declined $PROJECT_MANIFEST_NAME request"
-  require_manifest_unchanged "$path" "$fingerprint"
-  record_manifest_approval "$path" "$fingerprint" "$reviewer" "$ai_completed" \
+  require_manifest_unchanged "$path" "$fingerprint" "$normalized_fingerprint"
+  record_manifest_approval "$path" "$fingerprint" "$normalized_fingerprint" \
+    "$reviewer" "$ai_completed" \
     || die "could not save $PROJECT_MANIFEST_NAME approval"
   log "Saved manifest approval: $(manifest_approval_path "$path")"
 }
@@ -2523,7 +2640,7 @@ confirm_manifest_permissions() { # $1 path $2 fingerprint; remaining args are ty
 # --------------------------------------------------------------- subcommands --
 cmd_build() {
   local image="" force=0 assume_yes=0 manifest_path="" cli_cpus="" cli_memory="" cli_disk=""
-  local manifest_digest="" manifest_digest_after="" manifest_image="" item
+  local manifest_digest="" manifest_digest_after="" manifest_semantics="" manifest_image="" item
   local manifest_requests=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2553,15 +2670,18 @@ cmd_build() {
   if [[ -n "$manifest_path" && -f "$manifest_path" ]]; then
     manifest_digest="$(manifest_fingerprint "$manifest_path")" \
       || die "could not read $manifest_path"
-    if [[ "${_DB_MANIFEST_CONFIRMED:-0}" -eq 1 ]]; then
-      [[ "$manifest_digest" == "${_DB_MANIFEST_DIGEST:-}" ]] \
-        || die "$PROJECT_MANIFEST_NAME changed after it was approved; run devbox again"
-    fi
     manifest="$(project_manifest "$manifest_path")" || die "invalid $manifest_path"
     manifest_digest_after="$(manifest_fingerprint "$manifest_path")" \
       || die "could not re-read $manifest_path"
     [[ "$manifest_digest" == "$manifest_digest_after" ]] \
       || die "$PROJECT_MANIFEST_NAME changed while it was being read; run devbox again"
+    manifest_semantics="$(manifest_semantics_fingerprint "$manifest")" \
+      || die "could not normalize $manifest_path"
+    if [[ "${_DB_MANIFEST_CONFIRMED:-0}" -eq 1 ]]; then
+      [[ "$manifest_digest" == "${_DB_MANIFEST_DIGEST:-}" \
+        && "$manifest_semantics" == "${_DB_MANIFEST_SEMANTICS:-}" ]] \
+        || die "$PROJECT_MANIFEST_NAME changed after it was approved; run devbox again"
+    fi
     manifest_image="$(manifest_value "$manifest" image)"
     if [[ -z "$image" && -n "$manifest_image" ]]; then
       image="$manifest_image"
@@ -2576,7 +2696,8 @@ cmd_build() {
     # consent as running one. cmd_run has already asked by the time it delegates
     # here, so only a direct `devbox build` prompts.
     if [[ $assume_yes -eq 0 && "${_DB_MANIFEST_CONFIRMED:-0}" -ne 1 ]]; then
-      confirm_manifest_permissions "$manifest_path" "$manifest_digest" "${manifest_requests[@]}"
+      confirm_manifest_permissions "$manifest_path" "$manifest_digest" \
+        "$manifest_semantics" "${manifest_requests[@]}"
     fi
   fi
   [[ -n "$image" ]] || image="$DEFAULT_IMAGE"
@@ -2591,6 +2712,7 @@ cmd_build() {
   hash="$(golden_spec_hash "$image" "$digest" "$provision" "$provision_user")"
   golden="$(golden_name "$image" "$hash")"; gy="$CONFIG_DIR/${golden}.yaml"
   mkdir -p "$CONFIG_DIR"
+  [[ -z "$manifest_digest" ]] || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
   emit_golden_yaml "$image" "$gy" "$cpus" "$memory" "$disk" \
     "$digest" "$provision" "$provision_user"
   if instance_exists "$golden"; then
@@ -2666,7 +2788,7 @@ cmd_run() {
   local extra_mounts=() extra_copies=() manifest_requests=() gui_command=()
   local cli_cpus="" cli_memory="" cli_disk=""
   local golden_digest="" golden_provision="" golden_provision_user=""
-  local manifest_digest="" manifest_digest_after="" manifest_packages=""
+  local manifest_digest="" manifest_digest_after="" manifest_semantics="" manifest_packages=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --image|-i) shift; image="${1:?--image needs a value}"; image_set=1;;
@@ -2722,6 +2844,8 @@ cmd_run() {
       || die "could not re-read $PROJECT_MANIFEST_NAME"
     [[ "$manifest_digest" == "$manifest_digest_after" ]] \
       || die "$PROJECT_MANIFEST_NAME changed while it was being read; run devbox again"
+    manifest_semantics="$(manifest_semantics_fingerprint "$manifest")" \
+      || die "could not normalize $PROJECT_MANIFEST_NAME"
     local manifest_image manifest_proxy manifest_api_keys manifest_mounts manifest_copies item
     manifest_image="$(manifest_value "$manifest" image)"
     if [[ $image_set -eq 0 && -n "$manifest_image" ]]; then
@@ -2752,11 +2876,11 @@ cmd_run() {
     if [[ $no_auth -eq 0 ]]; then
       manifest_proxy="$(manifest_value "$manifest" proxy)"
       if [[ -z "$proxy" && "$manifest_proxy" != False ]]; then
-        if [[ "$manifest_proxy" == True ]]; then proxy="$PROXY_DEFAULT_URL"; else proxy="$manifest_proxy"; fi
+        proxy="$manifest_proxy"
       fi
       manifest_api_keys="$(manifest_value "$manifest" api_keys)"
       if [[ -z "$api_keys" && "$manifest_api_keys" != False ]]; then
-        if [[ "$manifest_api_keys" == True ]]; then api_keys="$DEFAULT_KEYS_FILE"; else api_keys="$(abspath "$manifest_api_keys")"; fi
+        api_keys="$manifest_api_keys"
       fi
       if [[ "$(manifest_value "$manifest" with_creds)" == True && $with_creds -eq 0 ]]; then
         with_creds=1
@@ -2780,10 +2904,16 @@ cmd_run() {
   if [[ $no_auth -eq 1 && ( -n "$proxy" || -n "$api_keys" || $with_creds -eq 1 ) ]]; then
     die "--no-auth cannot be combined with --proxy, --api-keys, or --with-creds"
   fi
+  if [[ -n "$proxy" ]]; then
+    proxy="$(proxy_endpoint "$proxy")" \
+      || die "proxy must be a bare http://host:port URL with a numeric port"
+  fi
   if [[ -n "$manifest" ]]; then
-    confirm_manifest_permissions "$manifest_path" "$manifest_digest" "${manifest_requests[@]}"
+    confirm_manifest_permissions "$manifest_path" "$manifest_digest" \
+      "$manifest_semantics" "${manifest_requests[@]}"
     _DB_MANIFEST_CONFIRMED=1   # do not re-prompt when cmd_build is delegated to below
     _DB_MANIFEST_DIGEST="$manifest_digest"
+    _DB_MANIFEST_SEMANTICS="$manifest_semantics"
   fi
   [[ $ssh_agent -eq 1 ]] && require_ssh_agent
 
@@ -2818,10 +2948,25 @@ cmd_run() {
       [[ -f "$manifest_path" ]] && build_args+=(--manifest "$manifest_path")
       cmd_build "${build_args[@]}"
     fi
+    [[ -z "$manifest" ]] \
+      || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
     ensure_golden_stopped "$golden"
-    local clone_args=() sess=""
+    local clone_args=() sess="" mount_spec mount_path resolved_mounts=()
     [[ $ephemeral_sessions -eq 1 ]] || sess="$session_state"
-    mapfile -t clone_args < <(_clone_mount_args "$dir" "$sess" "${extra_mounts[@]}")
+    # Resolved and checked once, here: _clone_mount_args runs in a process
+    # substitution, where `die` could not stop the clone, and resolving again
+    # there would let a symlink change between the check and the use.
+    require_mountable_path "$dir"
+    [[ -z "$sess" ]] || require_mountable_path "$sess"
+    for mount_spec in "${extra_mounts[@]}"; do
+      mount_path="$(_mount_spec_path "$mount_spec")"
+      require_mountable_path "$mount_path"
+      case "$mount_spec" in
+        *:rw) resolved_mounts+=("$mount_path:rw");;
+        *)    resolved_mounts+=("$mount_path:ro");;
+      esac
+    done
+    mapfile -t clone_args < <(_clone_mount_args "$dir" "$sess" "${resolved_mounts[@]}")
     # CPU/memory are per-box: applied to the clone so a project can be sized
     # without rebuilding the shared golden.
     clone_args+=(--cpus "$cpus" --memory "$(size_to_gib "$memory")")
@@ -2843,6 +2988,7 @@ cmd_run() {
     # enable_ssh_agent below and restart only if their persisted config changes.
     [[ $ssh_agent -eq 1 ]] && clone_args+=(--set '.ssh.forwardAgent = true')
     log "Cloning $golden → $name (mount: $dir${extra_mounts:+, +${#extra_mounts[@]} extra mount(s)})"
+    [[ -z "$manifest" ]] || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
     limactl --tty=false clone "$golden" "$name" "${clone_args[@]}"
   fi
   [[ $ephemeral_sessions -eq 1 || $preexisting -eq 0 ]] || ensure_session_mount "$name" "$session_state"
@@ -2861,6 +3007,9 @@ cmd_run() {
   fi
   [[ $ssh_agent -eq 1 ]] && apply_git_signing "$name"
 
+  [[ -z "$manifest" ]] \
+    || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
+
   local managed_proxy=""
   if [[ $no_auth -eq 1 ]]; then
     clear_auth "$name"
@@ -2871,10 +3020,13 @@ cmd_run() {
       [[ -z "$managed_proxy" ]] || log "Refreshing remembered GitHub CLI proxy for $name"
     fi
     [[ -z "$managed_proxy" ]] || {
-      proxy_ensure "$managed_proxy"
+      proxy_ensure "$managed_proxy" || die "could not start credential proxy"
       apply_proxy "$name" "$managed_proxy"
     }
-    [[ -n "$api_keys"  ]] && apply_api_keys "$name" "$api_keys"
+    if [[ -n "$api_keys" ]]; then
+      [[ -z "$manifest" ]] || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
+      apply_api_keys "$name" "$api_keys"
+    fi
     [[ $with_creds -eq 1 ]] && apply_creds  "$name"
   fi
 
@@ -2890,13 +3042,17 @@ cmd_run() {
     off) clear_connect_traffic_audit "$name";;
     connect)
       [[ -n "$traffic_proxy_endpoint" ]] || \
-        traffic_proxy_endpoint="${proxy:-$PROXY_DEFAULT_URL}"
+        traffic_proxy_endpoint="$(proxy_endpoint "${proxy:-$PROXY_DEFAULT_URL}")" \
+        || die "proxy must be a bare http://host:port URL with a numeric port"
       proxy_ensure "$traffic_proxy_endpoint" || die "could not start traffic proxy"
       apply_connect_traffic_audit "$name" "$traffic_proxy_endpoint";;
   esac
   [[ $with_agent_config -eq 1 ]] && apply_agent_config "$name"
   if [[ ${#extra_copies[@]} -gt 0 ]]; then
-    local c; for c in "${extra_copies[@]}"; do apply_copy "$name" "$c"; done
+    local c; for c in "${extra_copies[@]}"; do
+      [[ -z "$manifest" ]] || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
+      apply_copy "$name" "$c"
+    done
   fi
   if [[ $ephemeral_sessions -eq 1 ]]; then
     if [[ $preexisting -eq 1 ]]; then
@@ -2912,7 +3068,7 @@ cmd_run() {
   seed_agent_trust "$name" "$dir"
 
   if [[ -n "$manifest" ]]; then
-    require_manifest_unchanged "$manifest_path" "$manifest_digest"
+    require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
     apply_project_packages "$name" "$manifest_packages"
     run_project_start "$name" "$dir" "$manifest_start"
   elif [[ -f "$dir/.devbox" ]]; then

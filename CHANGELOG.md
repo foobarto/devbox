@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Invalidate cached `.devbox.toml` approval when a symlink or contextual default
+  changes the resolved meaning of a host path, even if the manifest bytes are
+  unchanged.
+- Reject a `.devbox.toml`, `--proxy`, or `DEVBOX_PROXY_URL` value that is not a
+  bare ASCII `http://host[:port]`; a crafted value could run a command on the
+  host. A URL without a port now means port 4141 in the guest too.
+- Refuse mount paths containing `,` or `:`, which Lima could read as an extra,
+  writable mount that the approval prompt showed as read-only.
+- Stop with an error when `--proxy` cannot start the credential proxy.
+- Reject NUL bytes, newlines, and non-hex `image.digest` values in
+  `.devbox.toml` that could alter the generated golden config.
+
 ## v1.4.0 - 2026-08-28
 
 - Make `.devbox.toml` consent easier to review with per-category Unicode icons
