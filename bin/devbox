@@ -1529,19 +1529,50 @@ _clone_mount_args() { # $1 project dir  $2 session store ("" to skip)  $3.. extr
 _copy_src()  { local s="$1"; if [[ "$s" == *:* ]]; then printf '%s' "${s%:*}"; else printf '%s' "$s"; fi; }
 _copy_dest() { local s="$1"; if [[ "$s" == *:* ]]; then printf '%s' "${s##*:}"; else basename -- "$s"; fi; }
 
+# Prepare DEST's parent in the guest. DEST travels as an argument, never inside
+# the script text, so no quote in a path can change the guest command.
+# shellcheck disable=SC2016 # Expanded by the guest shell.
+_COPY_PREPARE_PARENT='cd; parent="$(dirname -- "$1")"
+case "$1" in
+  /*) sudo install -d -o "$(id -un)" -g "$(id -gn)" -- "$parent" ;;
+  *) mkdir -p -- "$parent" ;;
+esac'
+
 apply_copy() {
-  local name="$1" spec="$2" src dest parent rflag=()
+  local name="$1" spec="$2" src dest
   src="$(_copy_src "$spec")"; dest="$(_copy_dest "$spec")"
   [[ -e "$src" ]] || { warn "--copy source not found: $src"; return 0; }
-  src="$(abspath "$src")"; parent="$(dirname "$dest")"
-  [[ -d "$src" ]] && rflag=(-r)   # -r only for dirs; on a file it makes dest a dir
+  # The named source itself is resolved (the operator named it). Say so when
+  # it is a link: a kept box can replace a project path with one.
+  [[ ! -L "$src" ]] || warn "--copy source $src is a symlink to $(abspath "$src")"
+  src="$(abspath "$src")"
+  # A literal ~ is not expanded once DEST is an argument; it means $HOME.
+  # shellcheck disable=SC2088 # The literal ~ is matched, not expanded.
+  case "$dest" in "~") dest=".";; "~/"*) dest="${dest#"~/"}";; esac
   log "Copying $src → $name:$dest"
-  if [[ "$dest" == /* ]]; then
-    limactl shell "$name" -- bash -c "sudo install -d -o \"\$(id -un)\" -g \"\$(id -gn)\" '$parent'" </dev/null 2>/dev/null || true
-  else
-    limactl shell "$name" -- bash -c "cd && mkdir -p '$parent'" </dev/null 2>/dev/null || true
+  limactl shell "$name" -- bash -c "$_COPY_PREPARE_PARENT" _ "$dest" </dev/null 2>/dev/null || true
+  if [[ ! -d "$src" ]]; then
+    limactl copy "$src" "$name:$dest" 2>/dev/null || warn "copy failed: $src → $dest"
+    return 0
   fi
-  limactl copy "${rflag[@]}" "$src" "$name:$dest" 2>/dev/null || warn "copy failed: $src → $dest"
+  # Directories are streamed through tar rather than `limactl copy -r`: Lima
+  # falls back to scp when either side lacks rsync, and scp follows symlinks.
+  # A guest that can write into a copied directory (a project subdirectory on
+  # a kept box) could then plant a link and have the next run copy that host
+  # file or directory into the box. tar stores links as links. The contents
+  # are merged into DEST, so a repeated copy never nests DEST/SRC.
+  # macOS bsdtar would otherwise add AppleDouble `._*` files and extended
+  # attribute headers the guest's GNU tar warns about. --no-overwrite-dir keeps
+  # an existing DEST's (or $HOME's) own mode and times.
+  local tar_create=(tar)
+  if tar --version 2>/dev/null | grep -q bsdtar; then
+    tar_create=(env COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs)
+  fi
+  # shellcheck disable=SC2016 # Expanded by the guest shell.
+  if ! "${tar_create[@]}" -C "$src" -cf - . \
+      | limactl shell "$name" -- bash -c 'cd && mkdir -p -- "$1" && tar -C "$1" --no-overwrite-dir -xf -' _ "$dest"; then
+    warn "copy failed: $src → $dest"
+  fi
 }
 
 apply_creds() {
@@ -1550,7 +1581,7 @@ apply_creds() {
   for p in "${CRED_PATHS[@]}"; do
     [[ -e "$p" ]] || continue
     case "$p" in "$HOME/"*) rel="${p#"$HOME"/}";; *) continue;; esac
-    limactl shell "$name" -- bash -c "cd; mkdir -p '$(dirname "$rel")'" </dev/null 2>/dev/null || true
+    limactl shell "$name" -- bash -c "$_COPY_PREPARE_PARENT" _ "$rel" </dev/null 2>/dev/null || true
     # Lima's recursive mode makes a file destination into a directory.  The
     # credential list intentionally contains both files and directories.
     rflag=()
@@ -1590,7 +1621,7 @@ agent_config_contains_credential() { # $1 config file; never prints its content
 }
 
 apply_agent_config() {
-  local name="$1" file rel parent copied=0 skipped=0
+  local name="$1" file rel copied=0 skipped=0
   log "Copying non-secret host AI agent configuration into $name…"
   while IFS= read -r -d '' file; do
     case "$file" in "$HOME/"*) rel="${file#"$HOME"/}";; *) continue;; esac
@@ -1599,8 +1630,7 @@ apply_agent_config() {
       skipped=$((skipped+1))
       continue
     fi
-    parent="$(dirname "$rel")"
-    limactl shell "$name" -- bash -c "cd; mkdir -p '$parent'" </dev/null 2>/dev/null || true
+    limactl shell "$name" -- bash -c "$_COPY_PREPARE_PARENT" _ "$rel" </dev/null 2>/dev/null || true
     if limactl copy "$file" "$name:$rel" 2>/dev/null; then
       copied=$((copied+1))
     else

@@ -726,6 +726,45 @@ print("" if d is None else d)' "$1"
   [[ "$output" == *"\"${key: -20}\""* ]]
 }
 
+@test "directory copies keep planted symlinks as links and never copy their targets" {
+  # Executes the real guest-side commands against a fake guest home. The stub's
+  # `copy` behaves like Lima's scp fallback, which follows symlinks.
+  GUEST_HOME="$BATS_TEST_TMPDIR/guest"; mkdir -p "$GUEST_HOME"
+  limactl() {
+    case "$1" in
+      shell) shift 2; [[ "$1" == -- ]] && shift; (cd "$GUEST_HOME" && HOME="$GUEST_HOME" "$@");;
+      copy) shift; local dest="${*: -1}" flags=(-L); [[ " $* " == *" -r "* ]] && flags=(-rL)
+            (cd "$GUEST_HOME" && cp "${flags[@]}" "${@: -2:1}" "${dest#*:}");;
+    esac
+  }
+  src="$BATS_TEST_TMPDIR/project/tooling"; mkdir -p "$src/sub"
+  echo ok > "$src/sub/ok.txt"
+  echo HOST-SECRET-CANARY > "$BATS_TEST_TMPDIR/outside-secret"
+  ln -s "$BATS_TEST_TMPDIR/outside-secret" "$src/link-file"
+  ln -s "$BATS_TEST_TMPDIR" "$src/link-dir"
+
+  apply_copy box "$src:~/tooling"
+  [ "$(cat "$GUEST_HOME/tooling/sub/ok.txt")" = ok ]
+  [ -L "$GUEST_HOME/tooling/link-file" ]
+  [ -L "$GUEST_HOME/tooling/link-dir" ]
+  ! grep -rq HOST-SECRET-CANARY "$GUEST_HOME"
+
+  # Copying again merges rather than nesting tooling/tooling.
+  apply_copy box "$src:~/tooling"
+  [ ! -e "$GUEST_HOME/tooling/tooling" ]
+
+  # A quote in the destination is data, not guest shell syntax.
+  marker="$BATS_TEST_TMPDIR/injected"
+  apply_copy box "$src:it's'; touch $marker; echo '"
+  [ ! -e "$marker" ]
+  [ -e "$GUEST_HOME/it's'; touch $marker; echo '/sub/ok.txt" ]
+
+  # Single files still go through limactl copy, into a prepared parent.
+  echo single > "$BATS_TEST_TMPDIR/netrc"
+  apply_copy box "$BATS_TEST_TMPDIR/netrc:~/conf/netrc"
+  [ "$(cat "$GUEST_HOME/conf/netrc")" = single ]
+}
+
 @test "GitHub proxy URL carries its capability as HTTP proxy userinfo" {
   run bash -c 'printf %s "$2" | { source "$1"; github_proxy_url "$3"; }' _ "$DEVBOX" "part.one" "http://host.lima.internal:4141"
   [ "$status" -eq 0 ]

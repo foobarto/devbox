@@ -30,6 +30,9 @@
   login. A 403 retries once only if the host already replaced the token.
 - Forward chunked request bodies through the proxy instead of dropping them,
   refuse malformed or ambiguous body framing, and time out stalled clients.
+- Copy directories into a box without following symlinks inside them, so a
+  link planted in a copied project directory cannot pull host files in; a
+  repeated copy merges instead of nesting, and destinations may contain quotes.
 
 ## v1.4.0 - 2026-08-28
 
