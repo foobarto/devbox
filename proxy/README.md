@@ -139,7 +139,11 @@ registrations once a minute and renews due capabilities every seven hours.
 Renewal uses the recorded Lima box name directly: it does not depend on a
 `devbox` terminal remaining open, re-read `.devbox.toml`, start a stopped box,
 or restart a running guest. The wrapper reads the atomically replaced
-capability file for every invocation.
+capability file for every invocation. The CA's private key is discarded after it signs
+the GitHub leaf, so it cannot issue certificates for other hosts. When the CA or
+leaf nears expiry or no longer passes strict X.509 checks, the proxy replaces
+both and delivers the new CA certificate to running boxes with their next
+renewal check.
 GitHub-owned download hosts are tunnelled without TLS interception.
 
 `--proxy` also moves the usable Homebrew `gh` binary into the wrapper's managed

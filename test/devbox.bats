@@ -644,6 +644,22 @@ print("" if d is None else d)' "$1"
   [ "$(_mount_spec_path "$BATS_TEST_TMPDIR/data:rw")" = "$(readlink -f "$BATS_TEST_TMPDIR/data")" ]
 }
 
+@test "proxy_ensure restarts an older running proxy once and keeps a current one" {
+  stop_log="$BATS_TEST_TMPDIR/stopped"
+  proxy_stop_process() { echo stopped >> "$stop_log"; return 0; }
+  proxy_port_open() { return 1; }
+  proxy_launcher() { return 1; }   # no relaunch in this unit test
+  curl() { printf 'devbox-ai-proxy ok gh-self-renewal %s\n' "$PROXY_FEATURES"; }
+
+  PROXY_FEATURES="$PROXY_REQUIRED_FEATURE" run proxy_ensure http://host.lima.internal:4141
+  [ "$status" -eq 0 ]
+  [ ! -e "$stop_log" ]
+
+  PROXY_FEATURES="" run proxy_ensure http://host.lima.internal:4141
+  [ -e "$stop_log" ]
+  [[ "$output" == *"Restarting the older host credential proxy"* ]]
+}
+
 @test "GitHub proxy URL carries its capability as HTTP proxy userinfo" {
   run bash -c 'printf %s "$2" | { source "$1"; github_proxy_url "$3"; }' _ "$DEVBOX" "part.one" "http://host.lima.internal:4141"
   [ "$status" -eq 0 ]
