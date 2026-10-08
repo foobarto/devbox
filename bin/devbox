@@ -2078,7 +2078,7 @@ seed_agent_trust() { # $1 Lima instance $2 mounted project dir
 # --------------------------------------------------------- project manifest --
 project_manifest() { # $1 .devbox.toml -> normalized JSON
   python3 - "$1" "$PROXY_DEFAULT_URL" "$DEFAULT_KEYS_FILE" "$CONFIG_DIR/policies" "$GLOBAL_CONFIG" \
-    "${_DB_MANIFEST_GRANTS_REPLACED:-0}" <<'PY'
+    "${_DB_MANIFEST_GRANTS_REPLACED:-0}" "${_DB_POLICY_LOOKUP:-0}" <<'PY'
 import json
 import os
 import re
@@ -2098,6 +2098,9 @@ global_config = sys.argv[5]
 # `devbox --policy` replaces the manifest's grants for the run, so they are not
 # resolved at all: a policy this host does not have cannot block the override.
 grants_replaced = sys.argv[6] == "1"
+# Set by policy_manifest: the operator's own --policy or machine default, which
+# the machine default's egress floor does not bind.
+policy_lookup = sys.argv[7] == "1"
 manifest_dir = os.path.realpath(os.path.dirname(os.path.abspath(path)))
 try:
     data = tomllib.loads(path.read_text())
@@ -2346,6 +2349,11 @@ policy_source = ""
 default_policy = ""
 if legacy_keys and ("policy" in data or "grants" in data):
     raise SystemExit(f"declare {', '.join(legacy_keys)} inside [grants] when using policy or [grants]")
+# The machine owner's audited egress is a restriction, not a grant: whatever
+# this manifest declares (its own policy, [grants], or legacy keys), it cannot
+# lift a machine default that requires egress = "audit".
+host_default = "" if grants_replaced or policy_lookup else machine_default_policy()
+egress_floor = bool(host_default) and load_policy(host_default)[0].get("egress") == "audit"
 if grants_replaced:
     grants = {}
     policy_name = ""
@@ -2363,12 +2371,9 @@ else:
         default_policy = machine_default_policy()
         if default_policy:
             grants, policy_source = load_policy(default_policy)
-    default_egress = grants.get("egress") if default_policy else None
     grants.update(normalize_grants(data.get("grants", {}), manifest_dir, "[grants]"))
-    # The machine owner's audited egress is a restriction, not a grant: a
-    # repository manifest cannot relax it.
-    if default_egress == "audit":
-        grants["egress"] = "audit"
+if egress_floor:
+    grants["egress"] = "audit"
 
 proxy = grants.get("ai_proxy", False)
 gh_proxy = grants.get("github", False)
@@ -2399,6 +2404,7 @@ print(json.dumps({
     # set (docs/policies.md).
     "grants_declared": not grants_replaced and ("policy" in data or "grants" in data or bool(default_policy)),
     "grants_replaced": grants_replaced,
+    "egress_floor": egress_floor,
     "legacy_grant_keys": legacy_keys,
 }))
 PY
@@ -2413,7 +2419,7 @@ policy_manifest() { # $1 policy name -> normalized JSON
   # an empty manifest would silently mean "no grants".
   if ! python3 -c 'import json, sys; print("policy = " + json.dumps(sys.argv[1]))' "$1" > "$tmp/$PROJECT_MANIFEST_NAME" \
       || [[ ! -s "$tmp/$PROJECT_MANIFEST_NAME" ]] \
-      || ! out="$(_DB_MANIFEST_GRANTS_REPLACED=0 project_manifest "$tmp/$PROJECT_MANIFEST_NAME")"; then
+      || ! out="$(_DB_MANIFEST_GRANTS_REPLACED=0 _DB_POLICY_LOOKUP=1 project_manifest "$tmp/$PROJECT_MANIFEST_NAME")"; then
     rm -rf -- "$tmp"
     return 1
   fi
@@ -2497,7 +2503,8 @@ if data["with_creds"]:
 if data["no_auth"]:
     emit("no-auth", "Disable Devbox-managed authentication")
 if data.get("traffic_audit"):
-    emit("egress", "Send ordinary web traffic only through the audited host proxy (egress = audit)")
+    floor = " (required by this machine's default policy)" if data.get("egress_floor") else ""
+    emit("egress", f"Send ordinary web traffic only through the audited host proxy (egress = audit){floor}")
 
 for item in data["mounts"]:
     if item.endswith(":rw"):
