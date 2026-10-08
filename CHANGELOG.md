@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v2.0.0 - 2026-10-08
 
 - Invalidate cached `.devbox.toml` approval when a symlink or contextual default
   changes the resolved meaning of a host path, even if the manifest bytes are

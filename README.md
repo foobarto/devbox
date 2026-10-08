@@ -48,7 +48,7 @@ brew install foobarto/tap/devbox
 
 Installs `devbox` and `devbox-ai-proxy` on your `PATH`. The current stable
 GitHub release is
-[`v1.4.0`](https://github.com/foobarto/devbox/releases/tag/v1.4.0); source
+[`v2.0.0`](https://github.com/foobarto/devbox/releases/tag/v2.0.0); source
 archives are available from that release. Config lives under `~/.config/devbox/`
 (or `$XDG_CONFIG_HOME/devbox`).
 
