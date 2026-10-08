@@ -1046,6 +1046,110 @@ class GuestProvokedRefreshTests(TestCase):
         self.assertEqual(self.seen_tokens, ["Bearer same"])
 
 
+class RequestBodyTests(TestCase):
+    def _read(self, raw_headers: bytes, body: bytes):
+        import io
+        headers = http.client.parse_headers(io.BytesIO(raw_headers + b"\r\n"))
+        return proxy.read_request_body(headers, io.BytesIO(body))
+
+    def test_content_length_and_chunked_framing(self):
+        self.assertEqual(self._read(b"Content-Length: 5\r\n", b"helloEXTRA"), b"hello")
+        self.assertIsNone(self._read(b"", b"ignored"))
+        self.assertIsNone(self._read(b"Content-Length: 0\r\n", b""))
+        self.assertEqual(
+            self._read(b"Transfer-Encoding: chunked\r\n",
+                       b"5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: t\r\n\r\n"),
+            b"hello world",
+        )
+
+    def test_ambiguous_or_malformed_framing_is_refused(self):
+        cases = {
+            b"Content-Length: -1\r\n": 400,
+            b"Content-Length: 5x\r\n": 400,
+            b"Content-Length: \xd9\xa1\r\n": 400,
+            b"Content-Length: 5\r\nContent-Length: 6\r\n": 400,
+            b"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n": 400,
+            b"Transfer-Encoding: gzip, chunked\r\n": 501,
+            b"Content-Length: 99999999999\r\n": 413,
+            b"Content-Length: " + b"9" * 5000 + b"\r\n": 413,
+            b"Content-Length: 0000000000000000000000000006\r\n": 400,
+            b"Content-Length: 10\r\n": 400,
+        }
+        for raw, status in cases.items():
+            with self.assertRaises(proxy.RequestBodyError, msg=raw) as caught:
+                self._read(raw, b"short")
+            self.assertEqual(caught.exception.status, status, raw)
+        for bad in (b"zz\r\nhello\r\n0\r\n\r\n", b"5\r\nhelloXX0\r\n\r\n", b"5\r\nhel"):
+            with self.assertRaises(proxy.RequestBodyError):
+                self._read(b"Transfer-Encoding: chunked\r\n", bad)
+
+    def _proxied(self, send):
+        received = {}
+
+        class UpstreamHandler(proxy.BaseHTTPRequestHandler):
+            def do_POST(self):
+                received["length"] = self.headers.get("Content-Length")
+                received["te"] = self.headers.get("Transfer-Encoding")
+                received["trailer"] = self.headers.get("Trailer")
+                received["body"] = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(proxy, "STATE_DIR", directory), \
+             patch.object(proxy.Handler, "log_message"), \
+             patch.object(proxy.Handler, "log_error"):
+            capability = proxy.issue_ai_proxy_token("devbox-body")
+            upstream = proxy.ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+            threading.Thread(target=upstream.serve_forever, daemon=True).start()
+            route = {"match": "/v1/", "upstream": f"http://127.0.0.1:{upstream.server_address[1]}"}
+            server = proxy.ThreadingHTTPServer(("127.0.0.1", 0), proxy.Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                with patch.object(proxy, "ROUTES", [route]), \
+                     patch.object(proxy, "AUDIT_PATH", str(Path(directory) / "audit.jsonl")):
+                    status = send(server.server_address, capability)
+            finally:
+                server.shutdown()
+                server.server_close()
+                upstream.shutdown()
+                upstream.server_close()
+        return status, received
+
+    def test_a_chunked_upload_reaches_upstream_intact(self):
+        def send(address, capability):
+            connection = http.client.HTTPConnection(*address, timeout=5)
+            connection.request("POST", "/v1/upload", body=iter([b"part-one|", b"part-two"]),
+                               headers={"x-api-key": capability, "Trailer": "Digest"}, encode_chunked=True)
+            status = connection.getresponse().status
+            connection.close()
+            return status
+
+        status, received = self._proxied(send)
+        self.assertEqual(status, 200)
+        self.assertEqual(received["body"], b"part-one|part-two")
+        self.assertEqual(received["length"], str(len(b"part-one|part-two")))
+        self.assertIsNone(received["te"])
+        self.assertIsNone(received["trailer"])
+
+    def test_a_negative_content_length_is_refused_promptly(self):
+        def send(address, capability):
+            raw = socket.create_connection(address, timeout=5)
+            raw.sendall(("POST /v1/x HTTP/1.1\r\nHost: h\r\nx-api-key: " + capability
+                         + "\r\nContent-Length: -1\r\n\r\n").encode())
+            status_line = raw.recv(4096).split(b"\r\n", 1)[0]
+            raw.close()
+            return status_line
+
+        status_line, received = self._proxied(send)
+        self.assertIn(b" 400 ", status_line)
+        self.assertEqual(received, {})
+
+
 class RouteScopeTests(TestCase):
     def test_codex_route_reaches_only_codex_paths_on_chatgpt(self):
         # The default table is the bundled example (the suite unsets

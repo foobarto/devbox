@@ -173,9 +173,12 @@ mv -f "$tmp" "$state_dir/proxy-url"
 '''
 
 # hop-by-hop + length/host headers we never forward verbatim
+# `trailer` (the request header naming trailer fields) is dropped as well:
+# chunked bodies are re-framed with a Content-Length and their trailers are
+# not forwarded, so the upstream must not be promised fields it will not get.
 DROP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade", "content-length", "host",
+    "te", "trailer", "trailers", "transfer-encoding", "upgrade", "content-length", "host",
 }
 
 # Audit records intentionally omit all request headers. Redact the credential
@@ -1662,9 +1665,98 @@ def build_connect_audit_event(
     }
 
 
+# Request bodies are buffered (for audit and for replay after an OAuth
+# refresh), so cap them. Large enough for GitHub release-asset uploads.
+MAX_REQUEST_BODY_BYTES = 256 * 1024 * 1024
+
+
+class RequestBodyError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+def read_request_body(headers, stream) -> bytes | None:
+    """Read a request body framed by Content-Length or chunked encoding.
+
+    Transfer-Encoding was dropped while only Content-Length was read, so a
+    chunked upload reached the upstream with no body at all, and a negative
+    length blocked the handler thread until the client went away. Ambiguous
+    framing (both headers, repeated or malformed lengths, other codings) is
+    refused rather than guessed at.
+    """
+    transfer_encodings = headers.get_all("Transfer-Encoding") or []
+    lengths = headers.get_all("Content-Length") or []
+    if transfer_encodings:
+        if lengths:
+            raise RequestBodyError(400, "both Content-Length and Transfer-Encoding")
+        codings = [c.strip().lower() for value in transfer_encodings for c in value.split(",") if c.strip()]
+        if codings != ["chunked"]:
+            raise RequestBodyError(501, "unsupported Transfer-Encoding")
+        return _read_chunked_body(stream)
+    if not lengths:
+        return None
+    if len(set(value.strip() for value in lengths)) != 1:
+        raise RequestBodyError(400, "conflicting Content-Length")
+    value = lengths[0].strip()
+    if not value.isascii() or not value.isdigit():
+        raise RequestBodyError(400, "invalid Content-Length")
+    # Checked before int(): Python refuses to convert digit strings longer
+    # than 4300 characters, which would surface as an unhandled ValueError.
+    if len(value.lstrip("0")) > len(str(MAX_REQUEST_BODY_BYTES)):
+        raise RequestBodyError(413, "request body too large")
+    length = int(value)
+    if length > MAX_REQUEST_BODY_BYTES:
+        raise RequestBodyError(413, "request body too large")
+    if length == 0:
+        return None
+    body = stream.read(length)
+    if len(body) != length:
+        raise RequestBodyError(400, "request body ended early")
+    return body
+
+
+def _read_chunked_body(stream) -> bytes:
+    body = bytearray()
+    while True:
+        line = stream.readline(1026)
+        if not line.endswith(b"\n"):
+            raise RequestBodyError(400, "invalid chunk size line")
+        size_text = line.split(b";", 1)[0].strip()
+        if not size_text or any(ch not in b"0123456789abcdefABCDEF" for ch in size_text):
+            raise RequestBodyError(400, "invalid chunk size")
+        if len(size_text.lstrip(b"0")) > 16:
+            raise RequestBodyError(413, "request body too large")
+        size = int(size_text, 16)
+        if size == 0:
+            break
+        if len(body) + size > MAX_REQUEST_BODY_BYTES:
+            raise RequestBodyError(413, "request body too large")
+        chunk = stream.read(size)
+        if len(chunk) != size or stream.read(2) != b"\r\n":
+            raise RequestBodyError(400, "invalid chunk data")
+        body.extend(chunk)
+    # Trailer fields are not forwarded; consume them up to the blank line.
+    for _ in range(100):
+        line = stream.readline(8192)
+        if line in (b"\r\n", b"\n"):
+            return bytes(body)
+        if not line:
+            break
+    raise RequestBodyError(400, "invalid chunked trailer")
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "devbox-ai-proxy"
+    # Bound every blocking read/write on a client connection, so a client that
+    # stalls mid-request cannot hold a thread forever. Streaming relays use
+    # select() and are unaffected while idle.
+    timeout = 300
+
+    def _reject_body(self, error: "RequestBodyError") -> None:
+        self.send_error(error.status, str(error))
+        self.close_connection = True
 
     def handle(self):
         # A CLI can close just after a successful CONNECT/TLS handshake. The
@@ -1897,8 +1989,11 @@ class Handler(BaseHTTPRequestHandler):
                     sys.stderr.write(f"[devbox-ai-proxy] audit write failed: {exc}\n")
                 return
 
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        body = self.rfile.read(length) if length else None
+        try:
+            body = read_request_body(self.headers, self.rfile)
+        except RequestBodyError as error:
+            self._reject_body(error)
+            return
         audit_started = time.monotonic()
         audit_source = "github-connect" if github_host else "auth-proxy"
         client = self.client_address[0] if self.client_address else ""
@@ -2100,8 +2195,11 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.close_connection = True
             return
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        body = self.rfile.read(length) if length else None
+        try:
+            body = read_request_body(self.headers, self.rfile)
+        except RequestBodyError as error:
+            self._reject_body(error)
+            return
         started = time.monotonic()
         client = self.client_address[0] if self.client_address else ""
         upstream_url = urlsplit(f"http://{hostname}:{port}")

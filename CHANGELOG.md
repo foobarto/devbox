@@ -28,6 +28,8 @@
   across all proxies and not for 15 minutes after a refresh failed to help, and
   serialize Claude refreshes, limiting how often a guest can rotate the host
   login. A 403 retries once only if the host already replaced the token.
+- Forward chunked request bodies through the proxy instead of dropping them,
+  refuse malformed or ambiguous body framing, and time out stalled clients.
 
 ## v1.4.0 - 2026-08-28
 
