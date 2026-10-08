@@ -1020,7 +1020,18 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
   DEVBOX_CONFIG_DIR="$AUTH_CONFIG_DIR" run bash -c 'source "$1"; set +u
     manifest_request_records "$(project_manifest "$2/.devbox.toml")" | tr "\0" "\n"' _ "$DEVBOX" "$AUTH_PROJECT"
   [[ "$output" == *"policy|Builds on this machine's default grant policy audited"* ]]
-  [[ "$output" == *"egress|"* ]]
+  [[ "$output" == *"egress|"*"required by this machine's default policy"* ]]
+
+  # Naming its own policy, or using legacy top-level keys, does not escape it.
+  printf 'policy = "none"\n[grants]\nai_proxy = true\n' > "$AUTH_PROJECT/.devbox.toml"
+  run_auth_grants
+  [[ "$output" == *"traffic http"* && "$output" == *"ai http"* ]]
+  printf 'proxy = true\n' > "$AUTH_PROJECT/.devbox.toml"
+  run_auth_grants
+  [[ "$output" == *"traffic http"* ]]
+  # The operator's own --policy is not bound by it.
+  run_auth_grants --policy none
+  [[ "$output" != *"traffic http"* ]]
   unset AUTH_CONFIG_DIR AUTH_PROJECT
 }
 
