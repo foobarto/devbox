@@ -41,7 +41,7 @@ import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit, urlunsplit
 
 CONFIG_PATH = os.environ.get(
     "DEVBOX_PROXY_CONFIG",
@@ -811,7 +811,34 @@ def add_header_value(headers: dict, name: str, value: str) -> None:
         headers[existing_name] = f"{existing},{value}"
 
 
+def route_path_is_safe(path: str) -> bool:
+    """Reject request targets that could leave a route's prefix upstream.
+
+    Routes are matched by prefix and the target is forwarded verbatim, so
+    `/backend-api/codex/../conversations` would match the Codex route while the
+    upstream normalizes it to a path the route was never meant to reach. Real
+    API clients send plain ASCII paths, so anything an upstream might
+    normalize differently is refused: fragments, backslashes, remaining or
+    nested percent-encoding, control or non-ASCII characters, and any path
+    segment beginning with a dot-dot (`..`, `..;`, `..%3b`) or equal to `.`.
+    """
+    if "#" in path or "\\" in path:
+        return False
+    target = path.split("?", 1)[0]
+    if not target.startswith("/"):
+        return False
+    try:
+        decoded = unquote(target, errors="strict") if "%" in target else target
+    except UnicodeDecodeError:
+        return False
+    if "%" in decoded or "\\" in decoded or not decoded.isascii() or not decoded.isprintable():
+        return False
+    return not any(segment == "." or segment.startswith("..") for segment in decoded.split("/"))
+
+
 def match_route(path: str):
+    if not route_path_is_safe(path):
+        return None
     for route in ROUTES:
         if path.startswith(route.get("match", "")):
             return route

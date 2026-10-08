@@ -864,6 +864,39 @@ class AiClientAuthTests(TestCase):
         self.assertEqual(proxy.AI_CLIENT_AUTH, "devbox")
 
 
+class RouteScopeTests(TestCase):
+    def test_codex_route_reaches_only_codex_paths_on_chatgpt(self):
+        # The default table is the bundled example (the suite unsets
+        # DEVBOX_PROXY_CONFIG), i.e. what a stock `devbox --proxy` serves.
+        codex = proxy.match_route("/backend-api/codex/responses")
+        self.assertEqual(codex["upstream"], "https://chatgpt.com")
+        self.assertEqual(proxy.match_route("/backend-api/codex/models?client_version=1")["upstream"],
+                         "https://chatgpt.com")
+        for outside in ("/backend-api/conversations", "/backend-api/wham/usage",
+                        "/backend-api/accounts/check", "/backend-api/me"):
+            self.assertIsNone(proxy.match_route(outside), outside)
+
+    def test_dot_segments_and_encoded_separators_cannot_escape_a_prefix(self):
+        for target in ("/backend-api/codex/../conversations",
+                       "/backend-api/codex/./../me",
+                       "/backend-api/codex/%2e%2e/conversations",
+                       "/backend-api/codex/%2E%2E/conversations",
+                       "/backend-api/codex/..%2fconversations",
+                       "/backend-api/codex/%252e%252e/conversations",
+                       "/backend-api/codex/..\\conversations",
+                       "/v1/messages/../../backend-api/conversations",
+                       "/backend-api/codex/#/../../conversations",
+                       "/backend-api/codex/..;/conversations",
+                       "/backend-api/codex/..%3b/conversations",
+                       "/backend-api/codex/.%00./conversations",
+                       "/backend-api/codex/..%09/conversations",
+                       "/backend-api/codex/%c0%ae%c0%ae/conversations",
+                       "/backend-api/codex/%25252e%25252e/conversations"):
+            self.assertFalse(proxy.route_path_is_safe(target), target)
+            self.assertIsNone(proxy.match_route(target), target)
+        self.assertTrue(proxy.route_path_is_safe("/v1/messages?beta=true&next=../x"))
+
+
 class TrafficProxyTests(TestCase):
     def test_traffic_capability_is_separate_from_github_and_limited_to_web_ports(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(proxy, "STATE_DIR", directory):

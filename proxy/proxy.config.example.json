@@ -38,8 +38,8 @@
     },
 
     {
-      "_comment": "Codex logged in with ChatGPT uses this backend endpoint, rather than the public OpenAI API. The devbox profile selects it without storing host credentials in the guest.",
-      "match": "/backend-api/",
+      "_comment": "Codex logged in with ChatGPT uses this backend endpoint, rather than the public OpenAI API. The devbox profile selects it without storing host credentials in the guest. Only Codex's own API is routed: the rest of chatgpt.com/backend-api (conversation history, account, billing, cloud tasks) never receives the host login.",
+      "match": "/backend-api/codex/",
       "upstream": "https://chatgpt.com",
       "auth": { "source": "auto:codex" },
       "strip_headers": ["x-api-key"]
