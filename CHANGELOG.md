@@ -50,6 +50,9 @@
   now sets that default.
 - The per-grant flags, `-a`, and top-level manifest grant keys are deprecated in
   favour of policies and `[grants]`; they keep working.
+- Let proxy-aware AI clients reach the credential proxy, and guest services on
+  loopback, while audited egress is on; both were sent through the egress
+  proxy and refused.
 
 ## v1.4.0 - 2026-08-28
 

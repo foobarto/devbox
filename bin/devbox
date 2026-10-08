@@ -1444,6 +1444,11 @@ apply_connect_traffic_audit() { # $1 Lima instance $2 bare host proxy URL
   # This is a short-lived network capability, not a host credential. It must
   # be readable by guest applications through their login-shell profile;
   # applications which ignore it still hit the direct-port firewall and fail.
+  #
+  # NO_PROXY names only guest loopback and the Devbox proxy itself: the
+  # firewall already lets both through directly, and sending a request for the
+  # credential proxy's own AI routes through its generic HTTP proxy path made
+  # proxy-aware AI clients (Codex honours HTTP_PROXY) fail under --proxy.
   printf '%s' "$traffic_url" | python3 -c '
 import shlex
 import sys
@@ -1451,12 +1456,13 @@ url = sys.stdin.read().strip()
 if not url:
     raise SystemExit("empty traffic proxy URL")
 quoted = shlex.quote(url)
+no_proxy = shlex.quote(",".join(("localhost", "127.0.0.1", "::1", sys.argv[1])))
 print("# devbox --traffic-audit=connect: route ordinary web tools through the audited")
 print("# host CONNECT proxy. Direct TCP/UDP 80/443 is blocked by the guest nft table.")
 for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
     print(f"export {key}={quoted}")
-print("unset NO_PROXY no_proxy")
-' | limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-30-traffic-audit.sh >/dev/null'
+print(f"export NO_PROXY={no_proxy} no_proxy={no_proxy}")
+' "$proxy_host" | limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-30-traffic-audit.sh >/dev/null'
   record_traffic_proxy_endpoint "$name" "$url"
 }
 
