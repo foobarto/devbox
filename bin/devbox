@@ -472,7 +472,9 @@ enable_ssh_agent() { # $1 instance; restart only when its persisted config chang
   fi
   log "Enabling host SSH-agent forwarding"
   limactl edit "$name" --set '.ssh.forwardAgent = true' >/dev/null
-  [[ "$status" == "Running" ]] && limactl start "$name"
+  # if/fi, not `&&`: see ensure_session_mount — on a stopped box a false
+  # trailing condition would return 1 and abort devbox under `set -e`.
+  if [[ "$status" == "Running" ]]; then limactl start "$name"; fi
 }
 
 ssh_signing_public_key() {
@@ -1876,7 +1878,9 @@ PY
 guest_login_value() { # $1 Lima instance $2 shell expression
   local name="$1" expr="$2" raw
   raw="$(limactl shell "$name" -- bash -lc "printf '<devbox:%s:xobved>' \"$expr\"" 2>/dev/null || true)"
-  [[ "$raw" =~ \<devbox:(.*):xobved\> ]] && printf '%s' "${BASH_REMATCH[1]}"
+  # An unreadable guest yields an empty value, not a failure: callers assign
+  # this under `set -e`, and seeding must never abort an otherwise usable box.
+  if [[ "$raw" =~ \<devbox:(.*):xobved\> ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
 }
 
 seed_agent_trust() { # $1 Lima instance $2 mounted project dir
