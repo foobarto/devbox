@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from base64 import b64encode
 from contextlib import contextmanager
 from pathlib import Path
@@ -29,6 +30,11 @@ os.environ.pop("DEVBOX_PROXY_CONFIG", None)
 SPEC = importlib.util.spec_from_file_location("devbox_ai_proxy", MODULE)
 proxy = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(proxy)
+# Likewise for the host CLI credential stores and their refresh lock/state
+# files: no test may read, lock, or rewrite the real ~/.claude or ~/.codex.
+proxy.CLAUDE_CREDENTIALS_PATH = os.path.join(_ISOLATED_STATE.name, "claude", ".credentials.json")
+proxy.CODEX_CREDENTIALS_PATH = os.path.join(_ISOLATED_STATE.name, "codex", "auth.json")
+proxy.CODEX_REFRESH_LOCK_PATH = os.path.join(_ISOLATED_STATE.name, "codex", ".devbox-oauth-refresh.lock")
 
 
 class AutoAnthropicAuthTests(TestCase):
@@ -55,7 +61,7 @@ class AutoAnthropicAuthTests(TestCase):
                     "anthropic",
                 ),
             )
-            oauth.assert_called_once_with(False)
+            oauth.assert_called_once_with(False, "")
 
     def test_reports_missing_auth_instead_of_forwarding_an_empty_key(self):
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}, clear=False), \
@@ -862,6 +868,182 @@ class AiClientAuthTests(TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(proxy.CONFIG.get("listen"), "127.0.0.1:4141")
         self.assertEqual(proxy.AI_CLIENT_AUTH, "devbox")
+
+
+class GuestProvokedRefreshTests(TestCase):
+    """A guest can make an upstream reject a request; that must not churn host OAuth."""
+
+    def setUp(self):
+        stderr = patch.object(proxy.sys, "stderr")
+        stderr.start()
+        self.addCleanup(stderr.stop)
+
+    def _claude_credentials(self, directory, access="current-access", expires_at=None):
+        path = Path(directory) / "credentials.json"
+        path.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": access, "refreshToken": "refresh-1",
+            "expiresAt": expires_at if expires_at is not None else int((time.time() + 3600) * 1000),
+        }}))
+        return path
+
+    def test_claude_adopts_a_token_the_host_already_rotated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._claude_credentials(directory, access="host-rotated")
+            with patch.object(proxy, "CLAUDE_CREDENTIALS_PATH", str(path)), \
+                 patch.object(proxy, "refresh_token") as refresh:
+                self.assertEqual(
+                    proxy.resolve_claude_oauth(force_refresh=True, rejected_access="rejected"),
+                    ("host-rotated", "anthropic"),
+                )
+            refresh.assert_not_called()
+
+    def test_forced_refreshes_are_throttled_per_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._claude_credentials(directory)
+            rotated = iter(["new-1", "new-2", "new-3"])
+
+            def fake_refresh(*_):
+                return {"access_token": next(rotated), "refresh_token": "refresh-2", "expires_in": 3600}
+
+            with patch.object(proxy, "CLAUDE_CREDENTIALS_PATH", str(path)), \
+                 patch.object(proxy, "refresh_token", side_effect=fake_refresh) as refresh:
+                first = proxy.resolve_claude_oauth(force_refresh=True, rejected_access="current-access")
+                second = proxy.resolve_claude_oauth(force_refresh=True, rejected_access="new-1")
+                third = proxy.resolve_claude_oauth(force_refresh=True, rejected_access="new-1")
+            self.assertEqual(first, ("new-1", "anthropic"))
+            # Within the interval the rejected token is returned as is: the
+            # guest sees the upstream's 401, and the host session is untouched.
+            self.assertEqual(second, ("new-1", "anthropic"))
+            self.assertEqual(third, ("new-1", "anthropic"))
+            self.assertEqual(refresh.call_count, 1)
+            # The allowance lives in an owner-only file beside the lock, so
+            # every proxy process on the host shares it.
+            state = Path(directory) / ".devbox-oauth-refresh.state"
+            self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+            self.assertGreater(json.loads(state.read_text())["next_forced_refresh"], time.time())
+
+    def test_an_expiring_token_is_refreshed_even_when_throttled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._claude_credentials(directory, expires_at=0)
+            (Path(directory) / ".devbox-oauth-refresh.state").write_text(
+                json.dumps({"next_forced_refresh": time.time() + 3600}))
+            with patch.object(proxy, "CLAUDE_CREDENTIALS_PATH", str(path)), \
+                 patch.object(proxy, "refresh_token", return_value={
+                     "access_token": "fresh", "refresh_token": "r", "expires_in": 3600}) as refresh:
+                self.assertEqual(proxy.resolve_claude_oauth(force_refresh=True), ("fresh", "anthropic"))
+            refresh.assert_called_once()
+
+    def test_codex_forced_refresh_is_throttled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "auth.json"
+            path.write_text(json.dumps({"tokens": {"access_token": "codex-access",
+                                                   "refresh_token": "r", "account_id": "a"}}))
+            with patch.object(proxy, "CODEX_CREDENTIALS_PATH", str(path)), \
+                 patch.object(proxy, "CODEX_REFRESH_LOCK_PATH", str(Path(directory) / "lock")), \
+                 patch.object(proxy, "request_codex_managed_refresh") as refresh:
+                proxy.resolve_codex_oauth(force_refresh=True, rejected_access="codex-access")
+                self.assertEqual(
+                    proxy.resolve_codex_oauth(force_refresh=True, rejected_access="codex-access"),
+                    ("codex-access", "a", "openai"),
+                )
+            self.assertEqual(refresh.call_count, 1)
+
+    def test_claude_refresh_takes_a_cross_process_lock_beside_its_credentials(self):
+        contender = (
+            "import fcntl, os, sys; "
+            "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600); "
+            "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._claude_credentials(directory)
+            lock_path = str(Path(directory) / ".devbox-oauth-refresh.lock")
+            with patch.object(proxy, "CLAUDE_CREDENTIALS_PATH", str(path)):
+                with proxy.claude_refresh_lock():
+                    blocked = subprocess.run([sys.executable, "-c", contender, lock_path], capture_output=True)
+            self.assertNotEqual(blocked.returncode, 0)
+
+    def _upstream_status_run(self, status_code, tokens=("oauth-access",)):
+        calls = []
+        seen_tokens = []
+        statuses = list(status_code) if isinstance(status_code, (list, tuple)) else [status_code]
+
+        def resolve(force_refresh=False, rejected_access=""):
+            calls.append(force_refresh)
+            return (tokens[min(len(calls), len(tokens)) - 1], "anthropic")
+
+        class UpstreamHandler(proxy.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+                seen_tokens.append(self.headers.get("Authorization", ""))
+                self.send_response(statuses[min(len(seen_tokens), len(statuses)) - 1])
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(proxy, "STATE_DIR", directory), \
+             patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}, clear=False), \
+             patch.object(proxy, "resolve_claude_oauth", side_effect=resolve), \
+             patch.object(proxy.Handler, "log_message"):
+            capability = proxy.issue_ai_proxy_token("devbox-refresh")
+            upstream = proxy.ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+            threading.Thread(target=upstream.serve_forever, daemon=True).start()
+            route = {"match": "/v1/messages", "upstream": f"http://127.0.0.1:{upstream.server_address[1]}",
+                     "auth": {"source": "auto:anthropic"}}
+            server = proxy.ThreadingHTTPServer(("127.0.0.1", 0), proxy.Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                with patch.object(proxy, "ROUTES", [route]), \
+                     patch.object(proxy, "AUDIT_PATH", str(Path(directory) / "audit.jsonl")):
+                    connection = http.client.HTTPConnection(*server.server_address, timeout=5)
+                    connection.request("POST", "/v1/messages", body=b"{}", headers={"x-api-key": capability})
+                    status = connection.getresponse().status
+                    connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                upstream.shutdown()
+                upstream.server_close()
+        self.seen_tokens = seen_tokens
+        return status, calls
+
+    def test_an_upstream_403_never_refreshes_host_oauth(self):
+        status, calls = self._upstream_status_run(403)
+        self.assertEqual(status, 403)
+        # A re-read of the current token at most; never a forced refresh.
+        self.assertNotIn(True, calls)
+        self.assertEqual(self.seen_tokens, ["Bearer oauth-access"])
+
+    def test_an_upstream_401_refreshes_once_then_backs_off_when_it_did_not_help(self):
+        with patch.object(proxy, "note_ineffective_refresh") as backoff:
+            status, calls = self._upstream_status_run(401)
+        self.assertEqual(status, 401)
+        self.assertEqual(calls, [False, True])
+        backoff.assert_called_once_with("anthropic")
+        with patch.object(proxy, "note_ineffective_refresh") as backoff:
+            status, calls = self._upstream_status_run([401, 200], tokens=("old", "new"))
+        self.assertEqual(status, 200)
+        backoff.assert_not_called()
+
+    def test_ineffective_refresh_backs_off_for_minutes_across_processes(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(proxy, "CLAUDE_CREDENTIALS_PATH", str(Path(directory) / "credentials.json")):
+            proxy.note_ineffective_refresh("anthropic")
+            state = json.loads((Path(directory) / ".devbox-oauth-refresh.state").read_text())
+            self.assertGreater(state["next_forced_refresh"],
+                               time.time() + proxy.INEFFECTIVE_REFRESH_BACKOFF_SECONDS - 60)
+            self.assertFalse(proxy._forced_refresh_allowed("anthropic"))
+
+    def test_a_403_retries_once_with_a_token_the_host_already_replaced(self):
+        status, calls = self._upstream_status_run([403, 200], tokens=("revoked", "host-rotated"))
+        self.assertEqual(status, 200)
+        self.assertEqual(calls, [False, False])
+        self.assertEqual(self.seen_tokens, ["Bearer revoked", "Bearer host-rotated"])
+        status, calls = self._upstream_status_run([403, 200], tokens=("same", "same"))
+        self.assertEqual(status, 403)
+        self.assertEqual(self.seen_tokens, ["Bearer same"])
 
 
 class RouteScopeTests(TestCase):

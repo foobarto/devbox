@@ -24,6 +24,10 @@
   `--no-auth`. Custom `proxy-env` templates get it as `__PROXY_TOKEN__`.
 - Limit the proxy's ChatGPT route to Codex's API (`/backend-api/codex/`) and
   refuse request paths with dot segments or encoded separators.
+- Refresh host OAuth only after a 401, at most once a minute per provider
+  across all proxies and not for 15 minutes after a refresh failed to help, and
+  serialize Claude refreshes, limiting how often a guest can rotate the host
+  login. A 403 retries once only if the host already replaced the token.
 
 ## v1.4.0 - 2026-08-28
 
