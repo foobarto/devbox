@@ -99,6 +99,13 @@ class InspectionDocumentTests(TestCase):
         long_query = "/?" + "a" * 9000 + "&leak=SECRET"
         self.assertIn("leak=SECRET", self.document([], target=long_query)["url"])
 
+    def test_described_credentials_cannot_repeat_or_exceed_a_per_request_total(self):
+        with self.assertRaises(proxy.InspectionBlocked):
+            self.document([("X-Api-Key", "a"), ("X-Api-Key", "b")])
+        with self.assertRaises(proxy.InspectionBlocked):
+            self.document([("Authorization", "x" * 3000), ("X-Api-Key", "y" * 2000)])
+        self.document([("Authorization", "Bearer token"), ("Cookie", "a=b")])
+
     def test_scoped_ipv6_literals_never_reach_openssl(self):
         self.assertIsNone(proxy.traffic_connect_target("[fe80::1%25${ENV::HOME}]:443"))
         self.assertIsNone(proxy.traffic_connect_target("[fe80::1%eth0]:443"))
@@ -478,6 +485,28 @@ class InspectedTunnelTests(TestCase):
         raw, status = github_connect("github.com")
         raw.close()
         self.assertIn(b" 403 ", status)
+        # A tunnel opened before inspection was required closes once it is.
+        proxy.revoke_traffic_inspection("devbox-test")
+        real_connect = socket.create_connection
+
+        def route(address, *args, **kwargs):
+            if address[1] == 443:
+                return real_connect(self.upstream.server_address, timeout=10)
+            return real_connect(address, *args, **kwargs)
+
+        with patch.object(proxy.socket, "create_connection", side_effect=route):
+            raw, status = github_connect("github.com")
+            self.assertIn(b" 200 ", status)
+            proxy.register_traffic_inspection("devbox-test")
+            raw.settimeout(5)
+            started = time.monotonic()
+            try:
+                data = raw.recv(1)
+            except OSError:
+                data = b""
+            raw.close()
+        self.assertEqual(data, b"")
+        self.assertLess(time.monotonic() - started, 4)
         with patch.object(proxy, "resolve_github_token", return_value="host-token"), \
              patch.object(proxy, "_call_classifier", return_value='{"verdict":"block","reason":"gist"}') as call:
             raw, status = github_connect("api.github.com")
@@ -489,6 +518,17 @@ class InspectedTunnelTests(TestCase):
             client.close()
         self.assertEqual(response.status, 403)
         call.assert_called_once()
+        with patch.object(proxy, "resolve_github_token", return_value="host-token"), \
+             patch.object(proxy, "_call_classifier") as call:
+            raw, _ = github_connect("api.github.com")
+            client = ssl.create_default_context(cafile=ca_path).wrap_socket(raw, server_hostname="api.github.com")
+            client.sendall(b"GET /socket HTTP/1.1\r\nHost: api.github.com\r\nConnection: Upgrade\r\n"
+                           b"Upgrade: websocket\r\n\r\n")
+            response = http.client.HTTPResponse(client, method="GET")
+            response.begin()
+            client.close()
+        self.assertEqual(response.status, 403)
+        call.assert_not_called()
 
     def test_unavailable_inspection_refuses_the_tunnel(self):
         with patch.dict(proxy._STATIC_CREDENTIALS, {"ANTHROPIC_API_KEY": ""}), \
@@ -504,6 +544,16 @@ class InspectedTunnelTests(TestCase):
             raw.close()
         self.assertIn(b" 502 ", status)
         call.assert_not_called()
+
+    def test_destinations_are_rechecked_for_each_request(self):
+        with patch.object(proxy, "_call_classifier", return_value='{"verdict":"allow","reason":"ok"}') as call:
+            raw, _ = self.connect()
+            client = self.tls(raw)
+            self.assertEqual(self.request(client)[0], 201)
+            self.public.return_value = False
+            self.assertEqual(self.request(client)[0], 502)
+            client.close()
+        self.assertEqual(call.call_count, 1)
 
     def test_certificate_failures_do_not_echo_host_detail(self):
         with patch.object(proxy, "inspect_leaf_context", side_effect=RuntimeError("HOST-SECRET-DETAIL")):

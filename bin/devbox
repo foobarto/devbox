@@ -4173,7 +4173,7 @@ PY
       # it keeps a box's (or the manifest's) inspection. Only =connect lowers it.
       if [[ "$managed_traffic_audit" == connect && $traffic_audit_bare -eq 1 ]] \
          && { traffic_inspection_registered "$name" \
-              || [[ -n "$manifest" && "$(manifest_value "$grants" traffic_audit)" == inspect ]]; }; then
+              || [[ -n "${grants:-}" && "$(manifest_value "$grants" traffic_audit)" == inspect ]]; }; then
         managed_traffic_audit=inspect
       fi
       if [[ "$managed_traffic_audit" == inspect ]]; then

@@ -17,9 +17,9 @@ A request leaves only if every existing check passes *and* the model answers
 
 1. **The model can only restrict.** Inspection runs after the deterministic
    checks: capability, generation, port, per-box budgets, and a check that the
-   destination resolves to a public address (so the content of requests the
-   proxy would refuse anyway never reaches the model). The address is checked
-   again when the proxy connects. The verdict can block a request those checks
+   destination resolves to a public address, repeated for every request (so the
+   content of requests the proxy would refuse anyway never reaches the model).
+   The address is checked once more when the proxy connects. The verdict can block a request those checks
    allowed, but never allow one they refused. A prompt injection that fools the
    classifier therefore gains at most what `audit` mode already permits.
 2. **Fail closed.** Each of these blocks the request with `403` and records the
@@ -182,7 +182,8 @@ data and delimited so the request cannot close its own delimiter:
     `Private-Token`, `X-Amz-Security-Token`, `X-Vault-Token` and
     `X-Registry-Auth` are replaced by their scheme and length.
   - `Cookie` is reduced to its cookie names and value lengths.
-  - A credential value over 4,096 characters blocks the request instead.
+  - A repeated credential header, or credential values over 4,096 characters
+    in total, blocks the request instead.
 - **Body**: the whole body as text. A gzip or deflate body is decoded first. A
   binary body is described by its length and a 512-byte hex prefix. A body
   larger than `max_body_bytes` blocks the request without a call.

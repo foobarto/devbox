@@ -1243,6 +1243,15 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
   [[ "$output" == *"inspect devbox-"* && "$output" != *"clear-inspect"* ]]
   STORED_TRAFFIC=1 STORED_INSPECT=1 run_auth_grants --traffic-audit=connect
   [[ "$output" == *"clear-inspect"* ]]
+
+  # Nor does it downgrade an inspecting machine default when there is no manifest.
+  AUTH_CONFIG_DIR="$BATS_TEST_TMPDIR/cfg"; mkdir -p "$AUTH_CONFIG_DIR/policies"; export AUTH_CONFIG_DIR
+  AUTH_PROJECT="$BATS_TEST_TMPDIR/bare"; mkdir -p "$AUTH_PROJECT"; export AUTH_PROJECT
+  printf 'policy = "inspected"\n' > "$AUTH_CONFIG_DIR/config.toml"
+  printf '[grants]\negress = "inspect"\n' > "$AUTH_CONFIG_DIR/policies/inspected.toml"
+  run_auth_grants -T
+  [[ "$output" == *"inspect devbox-"* && "$output" != *"clear-inspect"* ]]
+  unset AUTH_CONFIG_DIR AUTH_PROJECT
   STORED_TRAFFIC=1 STORED_INSPECT=0 run_auth_grants
   [[ "$output" == *"clear-inspect"* && "$output" != *"inspect devbox-"* ]]
 }

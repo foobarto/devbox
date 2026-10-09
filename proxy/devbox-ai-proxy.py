@@ -2597,6 +2597,8 @@ def inspection_document(*, method: str, scheme: str, host: str, port: int, targe
     # Nothing is truncated: a field too long to show in full blocks instead.
     if len(target) > _INSPECT_MAX_FIELD_CHARS:
         raise InspectionBlocked(f"request target exceeds {_INSPECT_MAX_FIELD_CHARS} characters")
+    seen_credentials: set[str] = set()
+    credential_chars = 0
     for name, value in headers.items():
         lowered = name.lower()
         if lowered in ("proxy-authorization", "proxy-connection"):
@@ -2605,8 +2607,14 @@ def inspection_document(*, method: str, scheme: str, host: str, port: int, targe
             host_header = value
             continue
         if lowered in _CREDENTIAL_HEADERS:
-            if len(value) > _INSPECT_MAX_CREDENTIAL_CHARS:
-                raise InspectionBlocked(f"{name} header exceeds {_INSPECT_MAX_CREDENTIAL_CHARS} characters")
+            # Described values are unseen by the classifier, so their total is
+            # bounded per request and none may repeat.
+            if lowered in seen_credentials:
+                raise InspectionBlocked(f"repeated {name} header")
+            seen_credentials.add(lowered)
+            credential_chars += len(value)
+            if credential_chars > _INSPECT_MAX_CREDENTIAL_CHARS:
+                raise InspectionBlocked(f"credential headers exceed {_INSPECT_MAX_CREDENTIAL_CHARS} characters in total")
             if lowered == "cookie":
                 cookies = [part.strip().partition("=") for part in value.split(";") if part.strip()]
                 value = "[cookies: " + ", ".join(f"{key} ({len(val)} characters)" for key, _, val in cookies) + "]"
@@ -3380,7 +3388,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self.send_response(200, "Connection Established")
                 self.end_headers()
-                self._relay_socket(upstream, authorize=lambda: github_proxy_authorized(self._github_capability_headers))
+                self._relay_socket(upstream, authorize=lambda: github_proxy_authorized(self._github_capability_headers)
+                                   and not traffic_inspection_required(github_box))
             finally:
                 upstream.close()
             return
@@ -3501,8 +3510,14 @@ class Handler(BaseHTTPRequestHandler):
         # must not be an unexamined way out.
         inspection = None
         if github_host and traffic_inspection_required(box):
-            inspection = inspect_request(method=self.command, scheme="https", host=github_host, port=443,
-                                         target=self.path, headers=self.headers, body=body)
+            tokens = {token.strip().lower() for token in self.headers.get("Connection", "").split(",")}
+            if self.headers.get("Upgrade") or "upgrade" in tokens:
+                inspection = {"provider": INSPECT_PROVIDER, "model": INSPECT_MODEL, "cached": False,
+                              "skipped": False, "latency_ms": 0, "error": None, "verdict": "block",
+                              "reason": "protocol upgrades (WebSocket) cannot be inspected"}
+            else:
+                inspection = inspect_request(method=self.command, scheme="https", host=github_host, port=443,
+                                             target=self.path, headers=self.headers, body=body)
 
         def inspected(event: dict) -> dict:
             if inspection is not None:
@@ -3930,6 +3945,11 @@ class Handler(BaseHTTPRequestHandler):
         authority_host = f"[{hostname}]" if ":" in hostname else hostname
         authority = authority_host if port in (80, 443) else f"{authority_host}:{port}"
         upstream_url = urlsplit(f"{scheme}://{authority_host}:{port}")
+        if not traffic_destination_is_public(hostname, port):
+            # Rechecked per request: a long session's name can be re-pointed.
+            self.send_error(502, "traffic destination has no public IP address")
+            self.close_connection = True
+            return
         if upgrade:
             # Frames after an Upgrade would pass uninspected.
             inspection = {"provider": INSPECT_PROVIDER, "model": INSPECT_MODEL, "cached": False,
