@@ -1,5 +1,33 @@
 # Changelog
 
+## v2.0.2 - 2026-10-09
+
+- Record a verified identity for each golden and refuse goldens without one.
+- Bind kept boxes to their project directory; `devbox adopt NAME DIR` claims a
+  box created by an earlier version.
+- Issue GitHub and traffic-audit capabilities per box and generation, and
+  revoke them when a box loses the grant.
+- Enforce audited egress with an nftables policy installed at boot.
+- Refuse writable mounts that contain the home directory, or contain or lie
+  inside Devbox state.
+- Refuse mounts and grant sources beneath another Lima instance's writable
+  mount, including instances not created by Devbox.
+- Snapshot host grant sources through file descriptors, resolved once.
+- Cap proxy connections, per-box requests and per-box tunnels.
+- Write AI-proxy audit records to their own log, store request bodies once,
+  and move an oversized legacy log aside instead of truncating it.
+- Refuse proxy capability keys that are symlinks, short, or readable by others.
+- Stop restarting a running kept box on re-entry unless SSH-agent forwarding
+  must be removed.
+- Stop copying stado configuration with `--with-agent-config`.
+- Include `--keep` and a custom box name in the `--keep` re-enter hint.
+- Pin the Homebrew bootstrap and the site-version workflow to reviewed revisions.
+- Upgrade: rebuild goldens (`devbox build --force`; `devbox destroy --goldens`
+  removes old ones), run `devbox adopt` for kept boxes, re-enter running boxes
+  to receive new capabilities, `chmod 600` the api-keys file (plain
+  `KEY=value` lines only), recreate stopped audited boxes, and rerun
+  `make hooks` in a clone.
+
 ## v2.0.1 - 2026-10-08
 
 - Show account-specific Codex models, including Daybreak Blue, when using the

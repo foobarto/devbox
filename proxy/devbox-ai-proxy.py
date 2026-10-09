@@ -31,13 +31,16 @@ import os
 import re
 import select
 import secrets
+import shutil
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -88,6 +91,16 @@ AUDIT_PATH = os.path.abspath(os.path.expanduser(os.environ.get(
     "DEVBOX_PROXY_AUDIT_PATH",
     _AUDIT_CONFIG.get("path", os.path.join(STATE_DIR, "proxy-audit.jsonl")),
 )))
+# AI-route events (prompts, often hundreds of KB each) rotate in their own file,
+# so routine model traffic cannot push GitHub, traffic and mutation records out
+# of retention.
+def audit_ai_path() -> str:
+    base, ext = os.path.splitext(AUDIT_PATH)
+    return f"{base}-ai{ext or '.jsonl'}"
+
+
+def audit_streams() -> tuple[str, str]:
+    return AUDIT_PATH, audit_ai_path()
 try:
     AUDIT_MAX_BODY_BYTES = max(
         0,
@@ -97,6 +110,214 @@ except (TypeError, ValueError):
     AUDIT_MAX_BODY_BYTES = 1048576
 AUDIT_SCHEMA = "devbox.proxy.audit/v1"
 _AUDIT_LOCK = threading.Lock()
+
+
+def _config_integer(section: dict, key: str, default: int, minimum: int = 1) -> int:
+    value = section.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise SystemExit(f'proxy config "{key}" must be an integer >= {minimum}')
+    return value
+
+
+_LIMITS = CONFIG.get("limits", {})
+if not isinstance(_LIMITS, dict):
+    raise SystemExit('proxy config "limits" must be an object')
+MAX_WORKERS = _config_integer(_LIMITS, "max_workers", 256)
+# Lima delivers every guest's connections from 127.0.0.1, so a per-source cap
+# below the global one would be a second global cap that any guest can fill.
+# Per-box fairness is enforced after authentication instead.
+MAX_WORKERS_PER_SOURCE = _config_integer(_LIMITS, "max_workers_per_source", MAX_WORKERS)
+MAX_REQUESTS_PER_BOX = _config_integer(_LIMITS, "max_requests_per_box", 32)
+# CONNECT tunnels (audited egress, gh) live for the whole transfer; package
+# managers open dozens in parallel, so they get their own, larger budget.
+MAX_TUNNELS_PER_BOX = _config_integer(_LIMITS, "max_tunnels_per_box", 64)
+MAX_REQUEST_BODY_BYTES = _config_integer(_LIMITS, "max_request_body_bytes", 256 * 1024 * 1024)
+MAX_BUFFERED_BODY_BYTES = _config_integer(_LIMITS, "max_buffered_body_bytes", 768 * 1024 * 1024, 2)
+MAX_BUFFERED_BODY_BYTES_PER_BOX = _config_integer(
+    _LIMITS,
+    "max_buffered_body_bytes_per_box",
+    min(MAX_REQUEST_BODY_BYTES, MAX_BUFFERED_BODY_BYTES - 1),
+)
+if MAX_BUFFERED_BODY_BYTES_PER_BOX >= MAX_BUFFERED_BODY_BYTES:
+    raise SystemExit(
+        'proxy config "max_buffered_body_bytes_per_box" must be less than '
+        '"max_buffered_body_bytes"'
+    )
+HEADER_TIMEOUT_SECONDS = _config_integer(_LIMITS, "header_timeout_seconds", 15)
+BODY_TIMEOUT_SECONDS = _config_integer(_LIMITS, "body_timeout_seconds", 300)
+STREAM_IDLE_TIMEOUT_SECONDS = _config_integer(_LIMITS, "stream_idle_timeout_seconds", 600)
+MAX_CONNECTION_SECONDS = _config_integer(_LIMITS, "max_connection_seconds", 8 * 60 * 60)
+AUDIT_MAX_FILE_BYTES = _config_integer(_AUDIT_CONFIG, "max_file_bytes", 16 * 1024 * 1024)
+AUDIT_BACKUP_COUNT = _config_integer(_AUDIT_CONFIG, "backup_count", 3, 0)
+AUDIT_MIN_FREE_BYTES = _config_integer(_AUDIT_CONFIG, "min_free_bytes", 64 * 1024 * 1024, 0)
+AUDIT_FAILURE_INTERVAL_SECONDS = _config_integer(_AUDIT_CONFIG, "failure_interval_seconds", 10)
+_DIAGNOSTICS_CONFIG = CONFIG.get("diagnostics", {})
+if not isinstance(_DIAGNOSTICS_CONFIG, dict):
+    raise SystemExit('proxy config "diagnostics" must be an object')
+DIAGNOSTICS_MAX_FILE_BYTES = _config_integer(_DIAGNOSTICS_CONFIG, "max_file_bytes", 8 * 1024 * 1024)
+_AUDIT_LAST_FAILURE: dict[str, float] = {}
+_AUDIT_LAST_GLOBAL_FAILURE = 0.0
+_AUDIT_DROPPED_FAILURES = 0
+_RESOURCE_LOCK = threading.Lock()
+_BUFFERED_BODY_BYTES = 0
+_BOX_BUFFERED_BODY_BYTES: dict[str | None, int] = {}
+_BOX_REQUESTS: dict[str, int] = {}
+_BOX_TUNNELS: dict[str, int] = {}
+_STATIC_CREDENTIALS: dict[str, str] = {}
+
+
+class UnsafeApiKeyFile(ValueError):
+    """The configured static-credential file is unsafe or malformed."""
+
+
+_API_KEY_ASSIGNMENT = re.compile(
+    r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=(.*)$"
+)
+_UNQUOTED_SHELL_SYNTAX = frozenset("\\$`;&|<>()'\"")
+_MAX_API_KEY_FILE_BYTES = 1024 * 1024
+
+
+def _api_key_error(path: str, line_number: int, message: str) -> UnsafeApiKeyFile:
+    return UnsafeApiKeyFile(f"unsafe API-key file {path}, line {line_number}: {message}")
+
+
+def _parse_api_key_value(value: str, path: str, line_number: int) -> str:
+    """Parse one static dotenv value without evaluating shell syntax."""
+    leading_whitespace = len(value) - len(value.lstrip(" \t"))
+    value = value.lstrip(" \t")
+    if not value or (leading_whitespace and value.startswith("#")):
+        return ""
+
+    def unquoted_literal(source: str) -> str:
+        comment = re.search(r"[ \t]+#", source)
+        if comment:
+            source = source[:comment.start()]
+        result = source.rstrip(" \t")
+        if any(character.isspace() for character in result):
+            raise _api_key_error(path, line_number, "unquoted values cannot contain whitespace")
+        if any(character in _UNQUOTED_SHELL_SYNTAX for character in result):
+            raise _api_key_error(path, line_number, "shell syntax is not allowed")
+        return result
+
+    def quoted_trailer(source: str) -> str:
+        if not source:
+            return ""
+        if source[0] in " \t":
+            remainder = source.lstrip(" \t")
+            if not remainder or remainder.startswith("#"):
+                return ""
+            raise _api_key_error(path, line_number, "unexpected text after quoted value")
+        return unquoted_literal(source)
+
+    if value[0] == "'":
+        end = value.find("'", 1)
+        if end < 0:
+            raise _api_key_error(path, line_number, "unterminated single-quoted value")
+        parsed = value[1:end] + quoted_trailer(value[end + 1:])
+    elif value[0] == '"':
+        parsed_parts = []
+        index = 1
+        while index < len(value):
+            character = value[index]
+            if character == '"':
+                parsed = "".join(parsed_parts) + quoted_trailer(value[index + 1:])
+                break
+            if character == "\\":
+                index += 1
+                if index >= len(value):
+                    raise _api_key_error(path, line_number, "unterminated escape in quoted value")
+                escaped = value[index]
+                if escaped in '\\"$`':
+                    parsed_parts.append(escaped)
+                else:
+                    parsed_parts.extend(("\\", escaped))
+            elif character in "$`":
+                raise _api_key_error(path, line_number, "shell expansion is not allowed")
+            else:
+                parsed_parts.append(character)
+            index += 1
+        else:
+            raise _api_key_error(path, line_number, "unterminated double-quoted value")
+    else:
+        parsed = unquoted_literal(value)
+        if not parsed:
+            return ""
+
+    if any(ord(character) < 32 or ord(character) == 127 for character in parsed):
+        raise _api_key_error(path, line_number, "control characters are not allowed")
+    return parsed
+
+
+def parse_api_key_assignments(contents: str, path: str = "api-keys.env") -> dict[str, str]:
+    """Parse a bounded, assignment-only credential file as data."""
+    credentials = {}
+    for line_number, line in enumerate(contents.splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        assignment = _API_KEY_ASSIGNMENT.fullmatch(line)
+        if not assignment:
+            raise _api_key_error(path, line_number, "expected NAME=value or export NAME=value")
+        name, value = assignment.groups()
+        credentials[name] = _parse_api_key_value(value, path, line_number)
+    return credentials
+
+
+def api_key_file_path() -> str:
+    config_dir = os.environ.get("DEVBOX_CONFIG_DIR") or os.path.join("~", ".config", "devbox")
+    configured = os.environ.get("DEVBOX_PROXY_ENV") or os.path.join(config_dir, "api-keys.env")
+    return os.path.abspath(os.path.expanduser(configured))
+
+
+def load_api_key_file(path: str | None = None) -> dict[str, str]:
+    """Open, validate, and parse the static credential file through one descriptor."""
+    path = os.path.abspath(os.path.expanduser(path or api_key_file_path()))
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise UnsafeApiKeyFile("this platform cannot safely open the API-key file without following links")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        raise UnsafeApiKeyFile(f"cannot safely open API-key file {path}: {error.strerror}") from error
+
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise UnsafeApiKeyFile(f"API-key file must be a regular file: {path}")
+        if before.st_uid != os.getuid():
+            raise UnsafeApiKeyFile(f"API-key file must be owned by the current user: {path}")
+        if before.st_mode & 0o077:
+            raise UnsafeApiKeyFile(
+                f"API-key file must not be accessible by group or other users: {path} "
+                f"(run: chmod 600 {path})"
+            )
+        if before.st_size > _MAX_API_KEY_FILE_BYTES:
+            raise UnsafeApiKeyFile(f"API-key file exceeds 1 MiB: {path}")
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            contents = stream.read(_MAX_API_KEY_FILE_BYTES + 1)
+        if len(contents) > _MAX_API_KEY_FILE_BYTES:
+            raise UnsafeApiKeyFile(f"API-key file exceeds 1 MiB: {path}")
+        after = os.fstat(descriptor)
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ):
+            raise UnsafeApiKeyFile(f"API-key file changed while being read: {path}")
+    finally:
+        os.close(descriptor)
+
+    try:
+        decoded = contents.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise UnsafeApiKeyFile(f"API-key file is not valid UTF-8: {path}") from error
+    return parse_api_key_assignments(decoded, path)
+
+
+def credential_value(name: str) -> str:
+    """Prefer the static credential map without exposing it as process control."""
+    if name in _STATIC_CREDENTIALS:
+        return _STATIC_CREDENTIALS[name]
+    return os.environ.get(name, "")
 
 # OAuth credentials stay on the host. Access tokens are reread for every
 # request, refreshed before expiry, and retried once after an auth failure.
@@ -189,11 +410,14 @@ AUDIT_SECRET_KEYS = {
     "access_token", "api_key", "authorization", "client_secret", "cookie",
     "password", "proxy_authorization", "refresh_token", "secret", "token",
 }
+_AUDIT_CANONICAL_SECRET_KEYS = {re.sub(r"[^a-z0-9]", "", key) for key in AUDIT_SECRET_KEYS}
 
 
 def _audit_key_is_secret(key: object) -> bool:
-    normalized = str(key).lower().replace("-", "_")
-    return normalized in AUDIT_SECRET_KEYS or normalized.endswith("_token") or normalized.endswith("_secret")
+    # Separator-independent matching covers camelCase, acronyms, and mixed
+    # hyphen/snake forms without relying on a particular client convention.
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return normalized in _AUDIT_CANONICAL_SECRET_KEYS or normalized.endswith("token") or normalized.endswith("secret")
 
 
 def _redact_audit_value(value):
@@ -225,6 +449,9 @@ def audit_body(body: bytes | None, content_type: str = "") -> dict | None:
         record["encoding"] = "binary"
         return record
     media_type = content_type.partition(";")[0].strip().lower()
+    if record["truncated"] and (media_type.endswith("/json") or media_type.endswith("+json")):
+        # A cut JSON object cannot be parsed/redacted safely.
+        return record
     if not record["truncated"] and (media_type.endswith("/json") or media_type.endswith("+json")):
         try:
             record["json"] = _redact_audit_value(json.loads(text))
@@ -239,12 +466,14 @@ def audit_action(method: str, path: str, body: bytes | None) -> tuple[str, bool]
     """Classify the externally observable operation without guessing its result."""
     method = method.upper()
     if path.rstrip("/") == "/graphql" and method == "POST":
+        if len(body or b"") > AUDIT_MAX_BODY_BYTES:
+            return "graphql-operation", True
         try:
             payload = json.loads((body or b"").decode("utf-8"))
             query = payload.get("query", "") if isinstance(payload, dict) else ""
         except (UnicodeDecodeError, json.JSONDecodeError):
             query = ""
-        operation = query.lstrip().lower()
+        operation = query.lstrip().lower() if isinstance(query, str) else ""
         if operation.startswith("mutation"):
             return "graphql-mutation", True
         if operation.startswith(("query", "subscription", "{")):
@@ -304,38 +533,138 @@ def build_audit_event(
     }
 
 
+def _audit_enforce_file_quota(path: str) -> None:
+    """Move an oversized log from before quotas aside, intact, once."""
+    try:
+        # Non-blocking: a FIFO planted at the path must not hang audited traffic.
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise OSError("audit path is not an owner-controlled regular file")
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+    if info.st_size <= AUDIT_MAX_FILE_BYTES:
+        return
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    legacy = f"{path}.legacy-{stamp}"
+    os.replace(path, legacy)
+    sys.stderr.write(f"[devbox-ai-proxy] moved oversized audit log aside: {legacy}\n")
+
+
+def _audit_stream_path(event: dict) -> str:
+    return audit_ai_path() if event.get("source") == "auth-proxy" else AUDIT_PATH
+
+
 def write_audit_event(event: dict) -> None:
-    """Append a host-only JSONL record without ever exposing it to the guest."""
+    """Durably append within bounded retention, preserving a disk reserve."""
     if not AUDIT_ENABLED:
         return
-    directory = os.path.dirname(AUDIT_PATH)
+    audit_path = _audit_stream_path(event)
+    directory = os.path.dirname(audit_path)
     os.makedirs(directory, mode=0o700, exist_ok=True)
     encoded = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(encoded) > AUDIT_MAX_FILE_BYTES:
+        raise OSError("audit event exceeds the file quota")
     with _AUDIT_LOCK:
-        descriptor = os.open(AUDIT_PATH, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        # A process-shared lock also covers CLI readers and another daemon
+        # during handover, so rotations cannot interleave with an append.
+        lock_descriptor = os.open(AUDIT_PATH + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "wb") as audit_file:
-                audit_file.write(encoded)
-            descriptor = -1
-        finally:
-            if descriptor >= 0:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            for path in [audit_path] + [f"{audit_path}.{index}" for index in range(1, AUDIT_BACKUP_COUNT + 1)]:
+                _audit_enforce_file_quota(path)
+            if shutil.disk_usage(directory).free - len(encoded) < AUDIT_MIN_FREE_BYTES:
+                raise OSError("audit filesystem free-space reserve reached")
+            try:
+                info = os.lstat(audit_path)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                    raise OSError("audit path is not an owner-controlled regular file")
+                size = info.st_size
+            except FileNotFoundError:
+                size = 0
+            if size + len(encoded) > AUDIT_MAX_FILE_BYTES:
+                if AUDIT_BACKUP_COUNT:
+                    for index in range(AUDIT_BACKUP_COUNT, 1, -1):
+                        previous = f"{audit_path}.{index - 1}"
+                        if os.path.lexists(previous):
+                            os.replace(previous, f"{audit_path}.{index}")
+                    os.replace(audit_path, audit_path + ".1")
+                else:
+                    os.unlink(audit_path)
+            descriptor = os.open(audit_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "wb", closefd=False) as audit_file:
+                    audit_file.write(encoded)
+                    audit_file.flush()
+                    os.fsync(descriptor)
+            finally:
                 os.close(descriptor)
+            # Persist rotation/file creation as well as contents.
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            os.close(lock_descriptor)
+
+
+def write_audit_failure(event: dict) -> None:
+    """Bound repetitive unauthenticated diagnostics globally and per source."""
+    global _AUDIT_LAST_GLOBAL_FAILURE, _AUDIT_DROPPED_FAILURES
+    client = str(event.get("client", ""))
+    now = time.monotonic()
+    with _AUDIT_LOCK:
+        if (now - _AUDIT_LAST_GLOBAL_FAILURE < 1 or
+                now - _AUDIT_LAST_FAILURE.get(client, -AUDIT_FAILURE_INTERVAL_SECONDS) < AUDIT_FAILURE_INTERVAL_SECONDS):
+            _AUDIT_DROPPED_FAILURES += 1
+            return
+        # The global limiter bounds growth even if source addresses vary.
+        for source, timestamp in list(_AUDIT_LAST_FAILURE.items()):
+            if now - timestamp >= AUDIT_FAILURE_INTERVAL_SECONDS:
+                del _AUDIT_LAST_FAILURE[source]
+        if len(_AUDIT_LAST_FAILURE) >= 64:
+            del _AUDIT_LAST_FAILURE[next(iter(_AUDIT_LAST_FAILURE))]
+        _AUDIT_LAST_FAILURE[client] = now
+        _AUDIT_LAST_GLOBAL_FAILURE = now
+        event["suppressed_failures"] = _AUDIT_DROPPED_FAILURES
+        _AUDIT_DROPPED_FAILURES = 0
+    write_audit_event(event)
 
 
 def read_audit_events() -> list[dict]:
     """Read valid JSONL entries, skipping a partial final line after a crash."""
     try:
         events = []
-        with open(AUDIT_PATH, encoding="utf-8") as audit_file:
-            for line in audit_file:
-                if not line.strip():
-                    continue
-                try:
-                    events.append(json.loads(line))
-                except json.JSONDecodeError:
-                    # An abrupt host shutdown can leave a final partial line.
-                    continue
+        if not os.path.isdir(os.path.dirname(AUDIT_PATH)):
+            return []
+        with _AUDIT_LOCK:
+            descriptor = os.open(AUDIT_PATH + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH)
+                paths = [f"{stream}.{index}" for stream in audit_streams() for index in range(AUDIT_BACKUP_COUNT, 0, -1)]
+                paths += list(audit_streams())
+                for path in paths:
+                    try:
+                        with open(path, encoding="utf-8") as audit_file:
+                            for line in audit_file:
+                                if not line.strip():
+                                    continue
+                                try:
+                                    events.append(json.loads(line))
+                                except json.JSONDecodeError:
+                                    # An abrupt host shutdown can leave a partial line.
+                                    continue
+                    except FileNotFoundError:
+                        continue
+            finally:
+                os.close(descriptor)
+        events.sort(key=lambda event: str(event.get("timestamp", "")))
         return events
     except FileNotFoundError:
         return []
@@ -344,20 +673,45 @@ def read_audit_events() -> list[dict]:
 
 
 def audit_status() -> dict:
-    try:
-        size = os.stat(AUDIT_PATH).st_size
-    except FileNotFoundError:
-        size = 0
+    def sizes(stream: str) -> tuple[int, int]:
+        try:
+            size = os.stat(stream).st_size
+        except FileNotFoundError:
+            size = 0
+        retained = size
+        for index in range(1, AUDIT_BACKUP_COUNT + 1):
+            try:
+                retained += os.stat(f"{stream}.{index}").st_size
+            except FileNotFoundError:
+                pass
+        return size, retained
+
+    size, retained_size = sizes(AUDIT_PATH)
+    ai_size, ai_retained = sizes(audit_ai_path())
     return {
         "enabled": AUDIT_ENABLED,
         "path": AUDIT_PATH,
+        "ai_path": audit_ai_path(),
         "max_body_bytes": AUDIT_MAX_BODY_BYTES,
+        "max_file_bytes": AUDIT_MAX_FILE_BYTES,
+        "backup_count": AUDIT_BACKUP_COUNT,
+        "min_free_bytes": AUDIT_MIN_FREE_BYTES,
+        "suppressed_failures": _AUDIT_DROPPED_FAILURES,
         "bytes": size,
+        "retained_bytes": retained_size,
+        "ai_bytes": ai_size,
+        "ai_retained_bytes": ai_retained,
     }
 
 
 def audit_html(events: list[dict]) -> str:
     """Render a self-contained, escaped report. Its contents are sensitive."""
+    # Show the latest outcome once, retaining an opening record when a daemon
+    # crash or audit failure left no completion record for that request.
+    latest = {}
+    for index, event in enumerate(events):
+        latest[event.get("request_id") or f"legacy-{index}"] = event
+    events = list(latest.values())
     mutations = sum(bool(event.get("request", {}).get("mutating")) for event in events)
     rows = []
     for event in reversed(events):
@@ -405,7 +759,7 @@ def write_audit_html(path: str) -> str:
 
 def resolve_source(source: str) -> str:
     if source.startswith("env:"):
-        return os.environ.get(source[4:], "")
+        return credential_value(source[4:])
     if source.startswith("token-file:"):
         path, _, dotted = source[len("token-file:"):].partition("#")
         try:
@@ -822,7 +1176,7 @@ def resolve_codex_oauth(
 def resolve_github_token() -> str:
     """Read the host GitHub CLI token without ever sending it to the guest."""
     for name in ("GH_TOKEN", "GITHUB_TOKEN"):
-        token = os.environ.get(name, "")
+        token = credential_value(name)
         if token:
             return token
 
@@ -855,7 +1209,7 @@ def resolve_auth(auth: dict, force_refresh: bool = False, rejected_access: str =
     """
     source = auth.get("source", "")
     if source == "auto:anthropic":
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        api_key = credential_value("ANTHROPIC_API_KEY")
         if api_key:
             return "x-api-key", "", api_key, {}, ("authorization",), ""
         oauth_token, provider = resolve_claude_oauth(force_refresh, rejected_access)
@@ -870,7 +1224,7 @@ def resolve_auth(auth: dict, force_refresh: bool = False, rejected_access: str =
             )
         return "", "", "", {}, (), ""
     if source in ("auto:openai", "auto:codex"):
-        api_key = os.environ.get("OPENAI_API_KEY", "")
+        api_key = credential_value("OPENAI_API_KEY")
         if api_key and source == "auto:openai":
             return "authorization", "Bearer ", api_key, {}, (), ""
         oauth_token, account_id, provider = resolve_codex_oauth(
@@ -1117,6 +1471,56 @@ def _create_github_certificates(ca_path: str, cert_path: str, key_path: str) -> 
             os.replace(source, destination)
 
 
+def _load_or_create_capability_key(path: str, prefix: str) -> bytes:
+    """Read the host-only signing key, creating it only if it does not exist.
+
+    Any other failure (permissions, I/O, a truncated or foreign file) fails
+    closed: regenerating would silently invalidate every issued capability.
+    """
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        descriptor = None
+    if descriptor is not None:
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise OSError(f"capability key {path} must be an owner-only regular file")
+            key = os.read(descriptor, 4096)
+        finally:
+            os.close(descriptor)
+        if len(key) < 32:
+            raise OSError(f"capability key {path} is truncated; remove it to issue new capabilities")
+        return key
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    key = secrets.token_bytes(32)
+    descriptor, temporary = tempfile.mkstemp(prefix=prefix, dir=STATE_DIR)
+    try:
+        os.fchmod(descriptor, 0o600)
+        os.write(descriptor, key)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        try:
+            # link() never replaces: a concurrent creator's key wins and is reread.
+            os.link(temporary, path)
+        except FileExistsError:
+            return _load_or_create_capability_key(path, prefix)
+        directory = os.open(STATE_DIR, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        return key
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+
 def github_proxy_key_path() -> str:
     return os.path.join(STATE_DIR, "gh-proxy-capability-key")
 
@@ -1124,30 +1528,7 @@ def github_proxy_key_path() -> str:
 def github_proxy_key() -> bytes:
     """Load or create the host-only key that signs short-lived guest grants."""
     with _GITHUB_CAPABILITY_LOCK:
-        path = github_proxy_key_path()
-        try:
-            with open(path, "rb") as key_file:
-                key = key_file.read()
-            if len(key) >= 32:
-                return key
-        except OSError:
-            pass
-
-        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-        key = secrets.token_bytes(32)
-        descriptor, temporary = tempfile.mkstemp(prefix=".devbox-gh-capability-", dir=STATE_DIR)
-        try:
-            with os.fdopen(descriptor, "wb") as key_file:
-                key_file.write(key)
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, path)
-        except Exception:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-            raise
-        return key
+        return _load_or_create_capability_key(github_proxy_key_path(), ".devbox-gh-capability-")
 
 
 def _base64url(data: bytes) -> str:
@@ -1158,31 +1539,186 @@ def _base64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
-def issue_github_proxy_token() -> str:
-    """Issue a VM-only, time-limited proxy capability; never a GitHub token."""
-    payload = json.dumps(
-        {"aud": "devbox-gh", "exp": int(time.time()) + GITHUB_PROXY_TOKEN_TTL_SECONDS},
-        separators=(",", ":"),
-    ).encode("utf-8")
-    encoded = _base64url(payload)
-    signature = hmac.new(github_proxy_key(), encoded.encode("ascii"), "sha256").digest()
-    return f"{encoded}.{_base64url(signature)}"
+def issue_github_proxy_token(name: str, *, expected_generation: str | None = None) -> str:
+    """Issue only for a live explicit grant; renewal never creates a grant."""
+    return _issue_registered_proxy_token("github", name, expected_generation)
 
 
 def valid_github_proxy_token(token: str) -> bool:
-    try:
-        encoded, signature = token.split(".", 1)
-        expected = hmac.new(github_proxy_key(), encoded.encode("ascii"), "sha256").digest()
-        if not hmac.compare_digest(_base64url_decode(signature), expected):
-            return False
-        payload = json.loads(_base64url_decode(encoded))
-        return payload.get("aud") == "devbox-gh" and int(payload.get("exp", 0)) >= int(time.time())
-    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, OSError):
-        return False
+    return _valid_registered_proxy_token("github", token)
 
 
 def github_proxy_registration_dir() -> str:
     return os.path.join(STATE_DIR, "gh-proxy-boxes")
+
+
+def proxy_registration_path(kind: str, name: str) -> str:
+    if kind not in ("github", "traffic") or not _LIMA_INSTANCE_NAME.fullmatch(name):
+        raise ValueError("invalid proxy registration")
+    directory = "gh-proxy-boxes" if kind == "github" else "traffic-proxy-boxes"
+    return os.path.join(STATE_DIR, directory, f"{name}.url")
+
+
+def _valid_proxy_registration_endpoint(endpoint: str) -> bool:
+    # Keep the launcher's whole-string ASCII grammar; parsing alone discards
+    # some control characters and could introduce extra registration lines.
+    match = re.fullmatch(r"http://[A-Za-z0-9.-]+(?::([0-9]{1,5}))?", endpoint)
+    return bool(match) and 1 <= int(match[1] or "4141") <= 65535
+
+
+@contextmanager
+def proxy_registration_lock():
+    """Serialize grants, upgrade migration and revocation across processes."""
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+    descriptor = os.open(os.path.join(STATE_DIR, ".proxy-registration.lock"),
+                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        if os.fstat(descriptor).st_uid != os.getuid():
+            raise OSError("proxy registration lock is owned by another user")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _proxy_registration(
+    kind: str, name: str, *, legacy: bool = False, for_listener: bool = False,
+) -> tuple[str, str] | None:
+    path = proxy_registration_path(kind, name)
+    try:
+        directory_info = os.stat(os.path.dirname(path), follow_symlinks=False)
+        if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != os.getuid()
+                or (not legacy and directory_info.st_mode & 0o077)):
+            return None
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, encoding="utf-8") as registration:
+            info = os.fstat(registration.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or (not legacy and info.st_mode & 0o077)):
+                return None
+            lines = registration.read(4096).splitlines()
+        endpoint = lines[0].strip()
+        if not _valid_proxy_registration_endpoint(endpoint):
+            return None
+        if for_listener and (urlsplit(endpoint).port or 4141) != BIND_PORT:
+            return None
+        generation_line = 1
+        if kind == "github":
+            if len(lines) < 2 or lines[1] != GITHUB_GRANT_MARKER:
+                return None
+            generation_line = 2
+        generation = lines[generation_line].removeprefix("generation=") if len(lines) > generation_line else ""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", generation):
+            if not legacy:
+                return None
+            generation = ""
+        return endpoint, generation
+    except (OSError, ValueError, IndexError, UnicodeError):
+        return None
+
+
+def _write_proxy_registration(kind: str, name: str, endpoint: str, generation: str) -> None:
+    path = proxy_registration_path(kind, name)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as registration:
+            registration.write(endpoint + "\n")
+            if kind == "github":
+                registration.write(GITHUB_GRANT_MARKER + "\n")
+            registration.write("generation=" + generation + "\n")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def register_proxy_box(kind: str, name: str, endpoint: str) -> None:
+    """Host launcher grants authority; repeated entry preserves live tokens."""
+    proxy_registration_path(kind, name)
+    if not _valid_proxy_registration_endpoint(endpoint):
+        raise ValueError("proxy endpoint must be a bare http URL with a valid port")
+    with proxy_registration_lock():
+        previous = _proxy_registration(kind, name)
+        generation = previous[1] if previous and previous[0] == endpoint else _base64url(secrets.token_bytes(32))
+        _write_proxy_registration(kind, name, endpoint, generation)
+
+
+def revoke_proxy_box(kind: str, name: str) -> None:
+    """Delete live authority before the launcher starts guest cleanup."""
+    path = proxy_registration_path(kind, name)
+    with proxy_registration_lock():
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def _registered_proxy_boxes(kind: str) -> dict[str, tuple[str, str]]:
+    """Upgrade existing explicit grants under the revocation lock, once."""
+    directory = os.path.dirname(proxy_registration_path(kind, "placeholder"))
+    registrations = {}
+    with proxy_registration_lock():
+        try:
+            entries = list(os.scandir(directory))
+        except FileNotFoundError:
+            return registrations
+        for entry in entries:
+            if not entry.name.endswith(".url") or not entry.is_file(follow_symlinks=False):
+                continue
+            name = entry.name[:-4]
+            if not _LIMA_INSTANCE_NAME.fullmatch(name):
+                continue
+            current = _proxy_registration(kind, name, legacy=True, for_listener=True)
+            if not current:
+                continue
+            endpoint, generation = current
+            if not generation or _proxy_registration(kind, name) is None:
+                generation = generation or _base64url(secrets.token_bytes(32))
+                _write_proxy_registration(kind, name, endpoint, generation)
+            registrations[name] = endpoint, generation
+    return registrations
+
+
+def _issue_registered_proxy_token(kind: str, name: str, expected_generation: str | None) -> str:
+    with proxy_registration_lock():
+        registration = _proxy_registration(kind, name)
+        if not registration or (expected_generation is not None and registration[1] != expected_generation):
+            raise ValueError("proxy grant missing, revoked or replaced")
+        key = github_proxy_key() if kind == "github" else traffic_proxy_key()
+        ttl = GITHUB_PROXY_TOKEN_TTL_SECONDS if kind == "github" else TRAFFIC_PROXY_TOKEN_TTL_SECONDS
+        audience = "devbox-gh" if kind == "github" else "devbox-traffic"
+        payload = json.dumps({"aud": audience, "box": name, "generation": registration[1],
+                              "exp": int(time.time()) + ttl}, separators=(",", ":")).encode("utf-8")
+        encoded = _base64url(payload)
+        signature = hmac.new(key, encoded.encode("ascii"), "sha256").digest()
+        return f"{encoded}.{_base64url(signature)}"
+
+
+def _valid_registered_proxy_token(kind: str, token: str) -> bool:
+    try:
+        if not isinstance(token, str) or len(token) > 4096:
+            return False
+        encoded, signature = token.split(".", 1)
+        payload = json.loads(_base64url_decode(encoded))
+        audience = "devbox-gh" if kind == "github" else "devbox-traffic"
+        if (not isinstance(payload, dict) or payload.get("aud") != audience
+                or not isinstance(payload.get("box"), str)
+                or not isinstance(payload.get("generation"), str)
+                or type(payload.get("exp")) is not int or payload["exp"] <= int(time.time())):
+            return False
+        registration = _proxy_registration(kind, payload["box"], for_listener=True)
+        if not registration or not hmac.compare_digest(registration[1], payload["generation"]):
+            return False
+        key = github_proxy_key() if kind == "github" else traffic_proxy_key()
+        expected = hmac.new(key, encoded.encode("ascii"), "sha256").digest()
+        return hmac.compare_digest(_base64url_decode(signature), expected)
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, OSError):
+        return False
 
 
 AI_PROXY_TOKEN_PREFIX = "dbx-ai."
@@ -1290,47 +1826,7 @@ def ai_request_box(headers) -> tuple[str, set[str]] | None:
 
 def registered_github_proxy_boxes() -> dict[str, str]:
     """Return host-approved Lima box names and their bare proxy endpoints."""
-    directory = github_proxy_registration_dir()
-    registrations = {}
-    try:
-        entries = list(os.scandir(directory))
-    except FileNotFoundError:
-        return registrations
-    except OSError as exc:
-        raise RuntimeError(f"could not read GitHub proxy registrations: {exc}") from exc
-
-    for entry in entries:
-        if not entry.name.endswith(".url") or not entry.is_file(follow_symlinks=False):
-            continue
-        name = entry.name[:-4]
-        if not _LIMA_INSTANCE_NAME.fullmatch(name):
-            continue
-        try:
-            with open(entry.path, encoding="utf-8") as endpoint_file:
-                lines = endpoint_file.read(4096).splitlines()
-            # Only explicit --gh-proxy grants carry the marker. Registrations
-            # from before the AI/GitHub split came from a plain --proxy and are
-            # left to expire instead of being renewed.
-            if len(lines) < 2 or lines[1].strip() != GITHUB_GRANT_MARKER:
-                continue
-            endpoint = lines[0].strip()
-            parsed = urlsplit(endpoint)
-            endpoint_port = parsed.port or 4141
-        except (OSError, ValueError):
-            continue
-        if (
-            parsed.scheme != "http"
-            or not parsed.netloc
-            or parsed.username
-            or parsed.password
-            or parsed.path
-            or parsed.query
-            or parsed.fragment
-            or endpoint_port != BIND_PORT
-        ):
-            continue
-        registrations[name] = endpoint
-    return registrations
+    return {name: endpoint for name, (endpoint, _) in _registered_proxy_boxes("github").items()}
 
 
 def running_lima_instances() -> set[str]:
@@ -1381,9 +1877,13 @@ def github_proxy_url(endpoint: str, capability: str) -> str:
     ))
 
 
-def deliver_github_proxy_capability(name: str, endpoint: str) -> None:
+def deliver_github_proxy_capability(name: str, endpoint: str, *, expected_generation: str | None = None) -> None:
     """Atomically update a running guest; capability bytes travel over stdin."""
-    capability_url = github_proxy_url(endpoint, issue_github_proxy_token())
+    try:
+        capability = issue_github_proxy_token(name, expected_generation=expected_generation)
+    except (ValueError, OSError) as exc:
+        raise RuntimeError(str(exc)) from exc
+    capability_url = github_proxy_url(endpoint, capability)
     # The capability is what keeps a guest working; never withhold it because
     # the CA could not be checked. An empty CA leaves the guest's copy alone.
     ca_certificate = ""
@@ -1421,7 +1921,7 @@ def retract_github_proxy_capability(name: str) -> None:
 
 
 def refresh_registered_github_proxy_boxes(
-    renewed_at: dict[str, tuple[str, float, int]] | None = None,
+    renewed_at: dict[str, tuple[str, float, int, str]] | None = None,
     *,
     force: bool = False,
     now: float | None = None,
@@ -1429,7 +1929,7 @@ def refresh_registered_github_proxy_boxes(
     """Renew due capabilities by recorded box name, independent of manifests."""
     if GITHUB_PROXY_RENEW_SECONDS <= 0:
         raise RuntimeError("DEVBOX_GH_PROXY_CAPABILITY_RENEW_SECONDS must be positive")
-    registrations = registered_github_proxy_boxes()
+    registrations = _registered_proxy_boxes("github")
     running = running_lima_instances() if registrations else set()
     # A replaced CA (expiry, or a set predating key identifiers) must reach
     # running guests now, not at their next scheduled renewal.
@@ -1454,7 +1954,7 @@ def refresh_registered_github_proxy_boxes(
         "renewed": 0,
         "failed": 0,
     }
-    for name, endpoint in sorted(registrations.items()):
+    for name, (endpoint, generation) in sorted(registrations.items()):
         if name not in running:
             continue
         summary["running"] += 1
@@ -1463,17 +1963,16 @@ def refresh_registered_github_proxy_boxes(
             not force
             and previous is not None
             and previous[0] == endpoint
-            and previous[2:] == (ca_generation,)
+            and previous[2:] == (ca_generation, generation)
             and timestamp - previous[1] < GITHUB_PROXY_RENEW_SECONDS
         ):
             continue
         # Re-check: `--gh-proxy=off` may have removed the grant while this
         # pass was running, and a late delivery would re-create guest state.
-        registration = os.path.join(github_proxy_registration_dir(), f"{name}.url")
-        if not os.path.isfile(registration):
+        if _proxy_registration("github", name) != (endpoint, generation):
             continue
         try:
-            deliver_github_proxy_capability(name, endpoint)
+            deliver_github_proxy_capability(name, endpoint, expected_generation=generation)
         except RuntimeError as exc:
             summary["failed"] += 1
             sys.stderr.write(f"[devbox-ai-proxy] GitHub capability renewal failed: {exc}\n")
@@ -1481,10 +1980,10 @@ def refresh_registered_github_proxy_boxes(
         # The grant can still disappear between that check and the delivery.
         # Removal deletes the registration before touching the guest, so a
         # registration missing now means the delivery raced it: take it back.
-        if not os.path.isfile(registration):
+        if _proxy_registration("github", name) != (endpoint, generation):
             retract_github_proxy_capability(name)
             continue
-        history[name] = (endpoint, timestamp, ca_generation)
+        history[name] = (endpoint, timestamp, ca_generation, generation)
         summary["renewed"] += 1
     return summary
 
@@ -1497,7 +1996,7 @@ def maintain_github_proxy_capabilities() -> None:
             "DEVBOX_GH_PROXY_CAPABILITY_POLL_SECONDS must be positive\n"
         )
         return
-    renewed_at: dict[str, tuple[str, float, int]] = {}
+    renewed_at: dict[str, tuple[str, float, int, str]] = {}
     while True:
         try:
             summary = refresh_registered_github_proxy_boxes(renewed_at)
@@ -1531,52 +2030,38 @@ def traffic_proxy_key_path() -> str:
 def traffic_proxy_key() -> bytes:
     """Load or create the host-only key for generic traffic-audit grants."""
     with _TRAFFIC_CAPABILITY_LOCK:
-        path = traffic_proxy_key_path()
-        try:
-            with open(path, "rb") as key_file:
-                key = key_file.read()
-            if len(key) >= 32:
-                return key
-        except OSError:
-            pass
-        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-        key = secrets.token_bytes(32)
-        descriptor, temporary = tempfile.mkstemp(prefix=".devbox-traffic-capability-", dir=STATE_DIR)
-        try:
-            with os.fdopen(descriptor, "wb") as key_file:
-                key_file.write(key)
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, path)
-        except Exception:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-            raise
-        return key
+        return _load_or_create_capability_key(traffic_proxy_key_path(), ".devbox-traffic-capability-")
 
 
-def issue_traffic_proxy_token() -> str:
+def issue_traffic_proxy_token(name: str, *, expected_generation: str | None = None) -> str:
     """Issue a VM-only generic HTTP(S) CONNECT capability, never a host token."""
-    payload = json.dumps(
-        {"aud": "devbox-traffic", "exp": int(time.time()) + TRAFFIC_PROXY_TOKEN_TTL_SECONDS},
-        separators=(",", ":"),
-    ).encode("utf-8")
-    encoded = _base64url(payload)
-    signature = hmac.new(traffic_proxy_key(), encoded.encode("ascii"), "sha256").digest()
-    return f"{encoded}.{_base64url(signature)}"
+    return _issue_registered_proxy_token("traffic", name, expected_generation)
 
 
 def valid_traffic_proxy_token(token: str) -> bool:
+    return _valid_registered_proxy_token("traffic", token)
+
+
+def _proxy_request_box(kind: str, headers) -> str | None:
+    authorization = headers.get("Proxy-Authorization", "")
+    if not authorization.startswith("Basic "):
+        return None
     try:
-        encoded, signature = token.split(".", 1)
-        expected = hmac.new(traffic_proxy_key(), encoded.encode("ascii"), "sha256").digest()
-        if not hmac.compare_digest(_base64url_decode(signature), expected):
-            return False
-        payload = json.loads(_base64url_decode(encoded))
-        return payload.get("aud") == "devbox-traffic" and int(payload.get("exp", 0)) >= int(time.time())
-    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, OSError):
-        return False
+        decoded = base64.b64decode(authorization[6:], validate=True).decode("utf-8")
+        token, separator, password = decoded.partition(":")
+        if not separator or password or not _valid_registered_proxy_token(kind, token):
+            return None
+        return json.loads(_base64url_decode(token.split(".", 1)[0]))["box"]
+    except (ValueError, TypeError, UnicodeError, KeyError):
+        return None
+
+
+def github_request_box(headers) -> str | None:
+    return _proxy_request_box("github", headers)
+
+
+def traffic_request_box(headers) -> str | None:
+    return _proxy_request_box("traffic", headers)
 
 
 def traffic_proxy_authorized(headers) -> bool:
@@ -1666,12 +2151,14 @@ def open_traffic_connection(host: str, port: int) -> socket.socket:
 def build_connect_audit_event(
     *, client: str, host: str, port: int, status: int, duration_ms: int,
     request_bytes: int = 0, response_bytes: int = 0, error: str = "",
+    box: str = "",
 ) -> dict:
     return {
         "schema": AUDIT_SCHEMA,
         "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "source": "traffic-connect",
         "client": client,
+        "box": box or None,
         "upstream": {"scheme": "https" if port == 443 else "http", "host": host, "port": port},
         "provider": None,
         "request": {
@@ -1694,9 +2181,185 @@ def build_connect_audit_event(
     }
 
 
-# Request bodies are buffered (for audit and for replay after an OAuth
-# refresh), so cap them. Large enough for GitHub release-asset uploads.
-MAX_REQUEST_BODY_BYTES = 256 * 1024 * 1024
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """Admit connections before spawning a thread and enforce deadlines."""
+    daemon_threads = True
+    request_queue_size = 32
+
+    def __init__(self, *args, **kwargs):
+        self._admission_lock = threading.Lock()
+        self._connections: dict[object, tuple[str, float, float]] = {}
+        self._deadline_sockets: dict[object, socket.socket] = {}
+        self._sources: dict[str, int] = {}
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        source = client_address[0]
+        now = time.monotonic()
+        with self._admission_lock:
+            allowed = len(self._connections) < MAX_WORKERS and self._sources.get(source, 0) < MAX_WORKERS_PER_SOURCE
+            if allowed:
+                self._sources[source] = self._sources.get(source, 0) + 1
+                self._connections[request] = (source, now + HEADER_TIMEOUT_SECONDS, now + MAX_CONNECTION_SECONDS)
+                self._deadline_sockets[request] = request
+        if not allowed:
+            # Close directly: sending an error to a non-reading client would
+            # itself consume an unbounded accept-loop operation.
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._release_connection(request)
+            raise
+
+    def _release_connection(self, request):
+        with self._admission_lock:
+            entry = self._connections.pop(request, None)
+            self._deadline_sockets.pop(request, None)
+            if entry:
+                source = entry[0]
+                self._sources[source] -= 1
+                if not self._sources[source]:
+                    del self._sources[source]
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._release_connection(request)
+
+    def set_deadline(self, request, seconds, connection=None):
+        with self._admission_lock:
+            entry = self._connections.get(request)
+            if entry:
+                self._connections[request] = (entry[0], time.monotonic() + seconds, entry[2])
+                if connection is not None:
+                    self._deadline_sockets[request] = connection
+
+    def service_actions(self):
+        now = time.monotonic()
+        with self._admission_lock:
+            expired = [self._deadline_sockets[request] for request, (_, deadline, lifetime) in self._connections.items()
+                       if now >= min(deadline, lifetime)]
+        for request in expired:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+_BODY_READ_CHUNK_BYTES = 64 * 1024
+
+
+class BodyReservation:
+    """Track retained body bytes and short-lived decoder copies atomically."""
+
+    def __init__(self, box: str = ""):
+        # Unauthenticated compatibility mode has no box identity. Treat all of
+        # its requests as one client so it cannot consume authenticated boxes'
+        # entire global allowance.
+        self.key: str | None = box or None
+        self.buffered_bytes = 0
+        self.total_bytes = 0
+
+    def resize(self, buffered_bytes: int, temporary_bytes: int = 0) -> None:
+        """Set retained and temporary charges before allocating more memory."""
+        global _BUFFERED_BODY_BYTES
+        if buffered_bytes < 0 or temporary_bytes < 0:
+            raise ValueError("body reservations cannot be negative")
+        total_bytes = buffered_bytes + temporary_bytes
+        with _RESOURCE_LOCK:
+            global_delta = total_bytes - self.total_bytes
+            box_delta = buffered_bytes - self.buffered_bytes
+            if global_delta > 0 and _BUFFERED_BODY_BYTES + global_delta > MAX_BUFFERED_BODY_BYTES:
+                raise RequestBodyError(503, "proxy request buffer budget exhausted")
+            box_total = _BOX_BUFFERED_BODY_BYTES.get(self.key, 0)
+            if box_delta > 0 and box_total + box_delta > MAX_BUFFERED_BODY_BYTES_PER_BOX:
+                raise RequestBodyError(503, "proxy per-box request buffer budget exhausted")
+            _BUFFERED_BODY_BYTES += global_delta
+            if box_delta:
+                box_total += box_delta
+                if box_total:
+                    _BOX_BUFFERED_BODY_BYTES[self.key] = box_total
+                else:
+                    _BOX_BUFFERED_BODY_BYTES.pop(self.key, None)
+            self.buffered_bytes = buffered_bytes
+            self.total_bytes = total_bytes
+
+    def release(self) -> None:
+        self.resize(0)
+
+
+def reserve_body_bytes(box: str = "") -> BodyReservation:
+    """Install request-owned accounting before the first body allocation."""
+    return BodyReservation(box)
+
+
+def release_body_bytes(reservation: BodyReservation | None) -> None:
+    if reservation is not None:
+        reservation.release()
+
+
+def terminal_safe_diagnostic(value: str) -> str:
+    """Escape characters that can alter terminal-rendered diagnostics."""
+    rendered = []
+    for character in value:
+        if unicodedata.category(character) in {"Cc", "Cf"}:
+            width = 4 if ord(character) <= 0xffff else 8
+            rendered.append(f"\\u{ord(character):0{width}x}")
+        else:
+            rendered.append(character)
+    return "".join(rendered)
+
+
+class BoundedDiagnosticStream:
+    """Cap an already-redirected regular stderr file without opening paths.
+
+    The launcher redirects stderr to its diagnostic log. Retention for that
+    file must be enforced too; pipe and terminal output keeps normal behavior.
+    """
+    def __init__(self, stream, maximum_bytes):
+        self.stream = stream
+        self.maximum_bytes = maximum_bytes
+        self.lock = threading.Lock()
+        self.truncations = 0
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+    def write(self, text):
+        original_length = len(text)
+        with self.lock:
+            try:
+                descriptor = self.stream.fileno()
+                regular = stat.S_ISREG(os.fstat(descriptor).st_mode)
+            except (AttributeError, OSError, ValueError):
+                regular = False
+            if not regular:
+                return self.stream.write(text)
+            encoding = self.stream.encoding or "utf-8"
+            errors = self.stream.errors or "replace"
+            # Bound transient encoding work even for an oversized diagnostic.
+            text = text[-self.maximum_bytes:]
+            for offset in range(0, len(text), 4096):
+                chunk = text[offset:offset + 4096]
+                encoded = chunk.encode(encoding, errors=errors)
+                if len(encoded) > self.maximum_bytes:
+                    chunk = encoded[-self.maximum_bytes:].decode(encoding, errors="ignore")
+                    encoded = chunk.encode(encoding, errors=errors)
+                self.stream.flush()
+                if os.fstat(descriptor).st_size + len(encoded) > self.maximum_bytes:
+                    os.ftruncate(descriptor, 0)
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    self.truncations += 1
+                self.stream.write(chunk)
+                self.stream.flush()
+        return original_length
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
 
 
 class RequestBodyError(Exception):
@@ -1705,7 +2368,9 @@ class RequestBodyError(Exception):
         self.status = status
 
 
-def read_request_body(headers, stream) -> bytes | None:
+def read_request_body(
+    headers, stream, reservation: BodyReservation | None = None,
+) -> bytes | None:
     """Read a request body framed by Content-Length or chunked encoding.
 
     Transfer-Encoding was dropped while only Content-Length was read, so a
@@ -1722,7 +2387,7 @@ def read_request_body(headers, stream) -> bytes | None:
         codings = [c.strip().lower() for value in transfer_encodings for c in value.split(",") if c.strip()]
         if codings != ["chunked"]:
             raise RequestBodyError(501, "unsupported Transfer-Encoding")
-        return _read_chunked_body(stream)
+        return _read_chunked_body(stream, reservation)
     if not lengths:
         return None
     if len(set(value.strip() for value in lengths)) != 1:
@@ -1734,19 +2399,23 @@ def read_request_body(headers, stream) -> bytes | None:
     # than 4300 characters, which would surface as an unhandled ValueError.
     if len(value.lstrip("0")) > len(str(MAX_REQUEST_BODY_BYTES)):
         raise RequestBodyError(413, "request body too large")
-    length = int(value)
+    length = int(value.lstrip("0") or "0")
     if length > MAX_REQUEST_BODY_BYTES:
         raise RequestBodyError(413, "request body too large")
     if length == 0:
         return None
+    if reservation is not None:
+        reservation.resize(length)
     body = stream.read(length)
     if len(body) != length:
         raise RequestBodyError(400, "request body ended early")
     return body
 
 
-def _read_chunked_body(stream) -> bytes:
-    body = bytearray()
+def _read_chunked_body(stream, reservation: BodyReservation | None = None) -> bytes:
+    chunks = []
+    pending = bytearray()
+    body_size = 0
     while True:
         line = stream.readline(1026)
         if not line.endswith(b"\n"):
@@ -1759,17 +2428,48 @@ def _read_chunked_body(stream) -> bytes:
         size = int(size_text, 16)
         if size == 0:
             break
-        if len(body) + size > MAX_REQUEST_BODY_BYTES:
+        if body_size + size > MAX_REQUEST_BODY_BYTES:
             raise RequestBodyError(413, "request body too large")
-        chunk = stream.read(size)
-        if len(chunk) != size or stream.read(2) != b"\r\n":
+        remaining = size
+        while remaining:
+            read_size = min(remaining, _BODY_READ_CHUNK_BYTES - len(pending))
+            target_size = body_size + read_size
+            if reservation is not None:
+                # A blocking read may hold only the retained body plus this
+                # bounded result. Reserve copy headroom only after it returns.
+                reservation.resize(target_size)
+            chunk = stream.read(read_size)
+            if len(chunk) != read_size:
+                raise RequestBodyError(400, "invalid chunk data")
+            if reservation is not None:
+                reservation.resize(target_size, _BODY_READ_CHUNK_BYTES)
+            pending.extend(chunk)
+            del chunk
+            body_size = target_size
+            remaining -= read_size
+            if len(pending) == _BODY_READ_CHUNK_BYTES:
+                chunks.append(bytes(pending))
+                pending = bytearray()
+            if reservation is not None:
+                reservation.resize(body_size)
+        if stream.read(2) != b"\r\n":
             raise RequestBodyError(400, "invalid chunk data")
-        body.extend(chunk)
     # Trailer fields are not forwarded; consume them up to the blank line.
     for _ in range(100):
         line = stream.readline(8192)
         if line in (b"\r\n", b"\n"):
-            return bytes(body)
+            if pending:
+                if reservation is not None:
+                    reservation.resize(body_size, _BODY_READ_CHUNK_BYTES)
+                chunks.append(bytes(pending))
+            del pending
+            if reservation is not None:
+                reservation.resize(body_size, body_size)
+            result = b"".join(chunks)
+            del chunks
+            if reservation is not None:
+                reservation.resize(body_size)
+            return result
         if not line:
             break
     raise RequestBodyError(400, "invalid chunked trailer")
@@ -1781,7 +2481,84 @@ class Handler(BaseHTTPRequestHandler):
     # Bound every blocking read/write on a client connection, so a client that
     # stalls mid-request cannot hold a thread forever. Streaming relays use
     # select() and are unaffected while idle.
-    timeout = 300
+    timeout = HEADER_TIMEOUT_SECONDS
+
+    def _deadline(self, seconds):
+        self.connection.settimeout(seconds)
+        if hasattr(self.server, "set_deadline"):
+            self.server.set_deadline(self.request, seconds, self.connection)
+
+    def handle_one_request(self):
+        self._body_reservation = None
+        self._admitted_box = ""
+        self._admitted_tunnel = False
+        self._deadline(HEADER_TIMEOUT_SECONDS)
+        try:
+            super().handle_one_request()
+        finally:
+            # Hold the reservation for retries and audit until the body object
+            # has left the request stack, including all exceptional exits.
+            release_body_bytes(self._body_reservation)
+            self._body_reservation = None
+            if self._admitted_box:
+                counts = _BOX_TUNNELS if self._admitted_tunnel else _BOX_REQUESTS
+                with _RESOURCE_LOCK:
+                    counts[self._admitted_box] -= 1
+                    if not counts[self._admitted_box]:
+                        del counts[self._admitted_box]
+
+    def _admit_box(self, box, tunnel=False):
+        if not box:
+            return True
+        counts, limit = (_BOX_TUNNELS, MAX_TUNNELS_PER_BOX) if tunnel else (_BOX_REQUESTS, MAX_REQUESTS_PER_BOX)
+        with _RESOURCE_LOCK:
+            allowed = counts.get(box, 0) < limit
+            if allowed:
+                counts[box] = counts.get(box, 0) + 1
+        if not allowed:
+            kind = "tunnel" if tunnel else "request"
+            self.send_error(503, f"proxy per-box {kind} budget exhausted")
+            self.close_connection = True
+            return False
+        self._admitted_box = box
+        self._admitted_tunnel = tunnel
+        return True
+
+    def _read_body(self):
+        self._deadline(BODY_TIMEOUT_SECONDS)
+        self._body_reservation = reserve_body_bytes(self._admitted_box)
+        body = read_request_body(self.headers, self.rfile, self._body_reservation)
+        self._deadline(MAX_CONNECTION_SECONDS)
+        self.connection.settimeout(STREAM_IDLE_TIMEOUT_SECONDS)
+        return body
+
+    def _audit_before_forwarding(self, event, required=False):
+        if not AUDIT_ENABLED and not required:
+            return True
+        try:
+            if not AUDIT_ENABLED:
+                raise OSError("audited traffic requires audit logging")
+            if callable(event):
+                event = event()
+            event["phase"] = "request-open"
+            event["request_id"] = self._audit_request_id = secrets.token_hex(16)
+            write_audit_event(event)
+            return True
+        except Exception as exc:
+            sys.stderr.write(f"[devbox-ai-proxy] audit admission failed: {exc}\n")
+            self.send_error(503, "proxy audit storage unavailable")
+            self.close_connection = True
+            return False
+
+    def _audit_completed(self, event):
+        # The opening event already holds the captured body; keep only its
+        # length and hash here so each body is stored once.
+        body = (event.get("request") or {}).get("body")
+        if isinstance(body, dict):
+            event["request"]["body"] = {key: body[key] for key in ("bytes", "sha256", "truncated") if key in body}
+        event["phase"] = "completed"
+        event["request_id"] = getattr(self, "_audit_request_id", None)
+        write_audit_event(event)
 
     def _reject_body(self, error: "RequestBodyError") -> None:
         self.send_error(error.status, str(error))
@@ -1808,7 +2585,9 @@ class Handler(BaseHTTPRequestHandler):
                     pass
 
     def log_message(self, fmt, *args):  # to stderr, quiet-ish
-        sys.stderr.write("[devbox-ai-proxy] %s %s\n" % (self.command, self.path))
+        method = terminal_safe_diagnostic(self.command)
+        target = terminal_safe_diagnostic(self.path.partition("?")[0])
+        sys.stderr.write("[devbox-ai-proxy] %s %s\n" % (method, target))
 
     def _open_websocket(self, upstream, headers):
         """Open a WebSocket upstream, returning its socket and raw response.
@@ -1846,24 +2625,80 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
             raise
 
-    def _relay_socket(self, upstream):
+    def _relay_socket(self, upstream, authorize=None, initial_response=b""):
         sockets = (self.connection, upstream)
         request_bytes = response_bytes = 0
+        # Each direction has at most 64 KiB waiting for a receiver. Never block
+        # in sendall: authorization/lifetime checks must also run under pressure.
+        pending = {self.connection: bytearray(initial_response), upstream: bytearray()}
+        read_closed = set()
+        write_wait = {}
+        read_wait_write = set()
+        started = last_activity = time.monotonic()
+        self._deadline(MAX_CONNECTION_SECONDS)
+        self.connection.setblocking(False)
+        upstream.setblocking(False)
         try:
             while True:
-                readable, _, _ = select.select(sockets, (), (), 600)
-                if not readable:
-                    continue
-                for source in readable:
-                    data = source.recv(65536)
-                    if not data:
+                now = time.monotonic()
+                if (now - started >= MAX_CONNECTION_SECONDS or
+                        now - last_activity >= STREAM_IDLE_TIMEOUT_SECONDS or
+                        (authorize is not None and not authorize())):
+                    break
+                remaining = min(MAX_CONNECTION_SECONDS - (now - started),
+                                STREAM_IDLE_TIMEOUT_SECONDS - (now - last_activity))
+                readers = [source for source in sockets if source not in read_closed
+                           and (upstream if source is self.connection else self.connection) not in write_wait
+                           and len(pending[upstream if source is self.connection else self.connection]) < 65536]
+                wait_readers = list(set(readers) | {destination for destination, wanted in write_wait.items() if wanted == "read"})
+                writers = list({destination for destination in sockets
+                                if pending[destination] and write_wait.get(destination) != "read"} | read_wait_write)
+                if not wait_readers and not writers:
+                    break
+                readable, writable, _ = select.select(wait_readers, writers, (), min(1, remaining))
+                for source in readers:
+                    if isinstance(source, ssl.SSLSocket) and source.pending() and source not in readable:
+                        readable.append(source)
+                write_ready = set(writable) | {destination for destination in readable if write_wait.get(destination) == "read"}
+                for destination in write_ready:
+                    if not pending[destination]:
+                        continue
+                    try:
+                        sent = destination.send(pending[destination])
+                    except ssl.SSLWantReadError:
+                        write_wait[destination] = "read"
+                        continue
+                    except (BlockingIOError, ssl.SSLWantWriteError):
+                        write_wait[destination] = "write"
+                        continue
+                    if not sent:
                         return request_bytes, response_bytes
+                    del pending[destination][:sent]
+                    write_wait.pop(destination, None)
+                    last_activity = time.monotonic()
+                read_ready = set(readable) | (set(writable) & read_wait_write)
+                for source in read_ready & set(readers):
+                    destination = upstream if source is self.connection else self.connection
+                    try:
+                        data = source.recv(65536 - len(pending[destination]))
+                    except ssl.SSLWantWriteError:
+                        read_wait_write.add(source)
+                        continue
+                    except (BlockingIOError, ssl.SSLWantReadError):
+                        read_wait_write.discard(source)
+                        continue
+                    read_wait_write.discard(source)
+                    if not data:
+                        # Deliver the final buffered bytes before closure.
+                        read_closed.update(sockets)
+                        read_wait_write.clear()
+                        continue
+                    last_activity = time.monotonic()
+                    pending[destination].extend(data)
                     if source is self.connection:
                         request_bytes += len(data)
-                        upstream.sendall(data)
                     else:
                         response_bytes += len(data)
-                        self.connection.sendall(data)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
@@ -1874,17 +2709,29 @@ class Handler(BaseHTTPRequestHandler):
     def _connect(self):
         """Handle capability-scoped generic web tunnels and GitHub `gh` tunnels."""
         traffic_target = traffic_connect_target(self.path)
-        if traffic_target and traffic_proxy_authorized(self.headers):
+        traffic_box = traffic_request_box(self.headers) if traffic_target else None
+        if traffic_target and traffic_box:
             hostname, port = traffic_target
+            if not self._admit_box(traffic_box, tunnel=True):
+                return
             started = time.monotonic()
+            event = build_connect_audit_event(
+                client=self.client_address[0] if self.client_address else "",
+                host=hostname, port=port, status=0, duration_ms=0,
+                box=traffic_box,
+            )
+            if not self._audit_before_forwarding(event, required=True):
+                return
+            self._deadline(MAX_CONNECTION_SECONDS)
             try:
                 upstream = open_traffic_connection(hostname, port)
             except OSError as exc:
                 self.send_error(502, "traffic CONNECT error: %s" % exc)
                 try:
-                    write_audit_event(build_connect_audit_event(
+                    self._audit_completed(build_connect_audit_event(
                         client=self.client_address[0] if self.client_address else "",
                         host=hostname,
+                        box=traffic_box,
                         port=port,
                         status=502,
                         duration_ms=round((time.monotonic() - started) * 1000),
@@ -1893,13 +2740,20 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as audit_exc:
                     sys.stderr.write(f"[devbox-ai-proxy] audit write failed: {audit_exc}\n")
                 return
-            self.send_response(200, "Connection Established")
-            self.end_headers()
-            request_bytes, response_bytes = self._relay_socket(upstream)
             try:
-                write_audit_event(build_connect_audit_event(
+                self.send_response(200, "Connection Established")
+                self.end_headers()
+                request_bytes, response_bytes = self._relay_socket(
+                    upstream, authorize=lambda: traffic_proxy_authorized(self.headers)
+                )
+            finally:
+                # The client may disappear before the relay assumes ownership.
+                upstream.close()
+            try:
+                self._audit_completed(build_connect_audit_event(
                     client=self.client_address[0] if self.client_address else "",
                     host=hostname,
+                    box=traffic_box,
                     port=port,
                     status=200,
                     duration_ms=round((time.monotonic() - started) * 1000),
@@ -1913,13 +2767,19 @@ class Handler(BaseHTTPRequestHandler):
         if target is None:
             self.send_error(403, "CONNECT is limited to GitHub HTTPS hosts")
             return
-        if not github_proxy_authorized(self.headers):
+        github_box = github_request_box(self.headers)
+        if not github_box:
             self.send_response(407, "Devbox GitHub proxy authentication required")
             self.send_header("Proxy-Authenticate", 'Basic realm="devbox-gh"')
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
             return
+        if not self._admit_box(github_box, tunnel=True):
+            return
+        self._github_capability_headers = self.headers
+        self._deadline(MAX_CONNECTION_SECONDS)
+        self.connection.settimeout(HEADER_TIMEOUT_SECONDS)
         mode, hostname = target
 
         if mode == "tunnel":
@@ -1928,9 +2788,12 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as exc:
                 self.send_error(502, "GitHub tunnel error: %s" % exc)
                 return
-            self.send_response(200, "Connection Established")
-            self.end_headers()
-            self._relay_socket(upstream)
+            try:
+                self.send_response(200, "Connection Established")
+                self.end_headers()
+                self._relay_socket(upstream, authorize=lambda: github_proxy_authorized(self._github_capability_headers))
+            finally:
+                upstream.close()
             return
 
         try:
@@ -1958,7 +2821,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/_devbox"):
             # Feature markers let bin/devbox restart an older daemon after an
             # upgrade (see PROXY_REQUIRED_FEATURE there). Only ever append.
-            body = b"devbox-ai-proxy ok gh-self-renewal gh-ca-renewal ai-client-auth gh-explicit-grant\n"
+            body = b"devbox-ai-proxy ok gh-self-renewal gh-ca-renewal ai-client-auth gh-explicit-grant live-proxy-grants bounded-proxy-audit fair-body-budget safe-request-diagnostics\n"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
@@ -1975,6 +2838,11 @@ class Handler(BaseHTTPRequestHandler):
             self._traffic_http_proxy(*traffic_target)
             return
         github_host = getattr(self, "_github_connect_host", "")
+        github_box = github_request_box(self._github_capability_headers) if github_host else None
+        if github_host and not github_box:
+            self.send_error(407, "Devbox GitHub proxy capability revoked")
+            self.close_connection = True
+            return
         route = (
             {"upstream": f"https://{github_host}", "auth": {"source": "auto:github"}}
             if github_host
@@ -2008,7 +2876,7 @@ class Handler(BaseHTTPRequestHandler):
                     pass
                 self.close_connection = True
                 try:
-                    write_audit_event(build_audit_event(
+                    write_audit_failure(build_audit_event(
                         method=self.command, target=self.path, upstream=up, body=None,
                         content_type="", source="auth-proxy", provider="",
                         client=self.client_address[0] if self.client_address else "",
@@ -2017,11 +2885,22 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     sys.stderr.write(f"[devbox-ai-proxy] audit write failed: {exc}\n")
                 return
-
+        if github_host:
+            box = github_box
+        if not self._admit_box(box):
+            return
         try:
-            body = read_request_body(self.headers, self.rfile)
+            body = self._read_body()
         except RequestBodyError as error:
             self._reject_body(error)
+            return
+        if github_host and github_request_box(self._github_capability_headers) != box:
+            self.send_error(407, "Devbox GitHub proxy capability revoked")
+            self.close_connection = True
+            return
+        if not github_host and AI_CLIENT_AUTH == "devbox" and ai_request_box(self.headers) is None:
+            self.send_error(401, "Devbox AI proxy capability revoked")
+            self.close_connection = True
             return
         audit_started = time.monotonic()
         audit_source = "github-connect" if github_host else "auth-proxy"
@@ -2032,7 +2911,7 @@ class Handler(BaseHTTPRequestHandler):
             attempts: int = 1, websocket: bool = False,
         ) -> None:
             try:
-                write_audit_event(build_audit_event(
+                self._audit_completed(build_audit_event(
                     method=self.command,
                     target=self.path,
                     upstream=up,
@@ -2052,6 +2931,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 sys.stderr.write(f"[devbox-ai-proxy] audit write failed: {exc}\n")
 
+        if not self._audit_before_forwarding(lambda: build_audit_event(
+            method=self.command, target=self.path, upstream=up, body=body,
+            content_type=self.headers.get("Content-Type", ""), source=audit_source,
+            provider="", client=client, status=0, duration_ms=0, box=box,
+        )):
+            return
+
         # The box capability authenticates only this proxy; it never travels on,
         # even through a custom route that injects no host credential.
         strip = {h.lower() for h in (route.get("strip_headers") or [])} | capability_headers
@@ -2059,8 +2945,13 @@ class Handler(BaseHTTPRequestHandler):
             k: v for k, v in self.headers.items()
             if k.lower() not in DROP and k.lower() not in strip
         }
+        # A websocket handshake needs Connection and Upgrade; every other
+        # hop-by-hop or routing header (Host, Proxy-*, framing) stays behind so
+        # the guest cannot steer the request that carries the host credential.
+        websocket_drop = DROP - {"connection", "upgrade"}
         websocket_headers = {
-            k: v for k, v in self.headers.items() if k.lower() not in strip
+            k: v for k, v in self.headers.items()
+            if k.lower() not in websocket_drop and k.lower() not in strip
         }
         auth = route.get("auth")
         conn_cls = http.client.HTTPSConnection if up.scheme == "https" else http.client.HTTPConnection
@@ -2122,16 +3013,20 @@ class Handler(BaseHTTPRequestHandler):
                 audit_outcome(502, error="websocket-upstream-error", attempts=attempts, websocket=True)
                 return
             try:
-                self.connection.sendall(response)
                 if status == 101:
                     audit_outcome(status, provider, response_bytes=len(response), attempts=attempts, websocket=True)
-                    self._relay_socket(conn)
+                    authorize = (
+                        (lambda: github_proxy_authorized(self._github_capability_headers)) if github_host
+                        else (lambda: ai_request_box(self.headers) is not None) if AI_CLIENT_AUTH == "devbox"
+                        else None
+                    )
+                    self._relay_socket(conn, authorize=authorize, initial_response=response)
                     return
+                self.connection.sendall(response)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
             finally:
-                if status != 101:
-                    conn.close()
+                conn.close()
             audit_outcome(status, provider, response_bytes=len(response), attempts=attempts, websocket=True)
             self.close_connection = True
             return
@@ -2144,7 +3039,7 @@ class Handler(BaseHTTPRequestHandler):
 
         def upstream_request(request_headers):
             conn = conn_cls(
-                up.hostname, up.port or (443 if up.scheme == "https" else 80), timeout=600
+                up.hostname, up.port or (443 if up.scheme == "https" else 80), timeout=STREAM_IDLE_TIMEOUT_SECONDS
             )
             try:
                 conn.request(self.command, self.path, body=body, headers=request_headers)
@@ -2159,7 +3054,8 @@ class Handler(BaseHTTPRequestHandler):
             # OAuth access tokens can be revoked between the preflight and this
             # request. Refresh once and replay only the failed request.
             if resp.status == 401 and provider:
-                resp.read()
+                # This connection is discarded, so draining an arbitrary error
+                # body would add an unnecessary unbounded response allocation.
                 conn.close()
                 rejected_access = headers.get("authorization", "").removeprefix("Bearer ")
                 headers, _ = request_headers(
@@ -2181,7 +3077,6 @@ class Handler(BaseHTTPRequestHandler):
                 current, _ = request_headers()
                 current_access = (current or {}).get("authorization", "").removeprefix("Bearer ")
                 if current_access and current_access != rejected_access:
-                    resp.read()
                     conn.close()
                     headers = current
                     conn, resp = upstream_request(headers)
@@ -2202,13 +3097,13 @@ class Handler(BaseHTTPRequestHandler):
         response_bytes = 0
         try:
             while True:
-                chunk = resp.read(65536)
+                chunk = resp.read1(65536)
                 if not chunk:
                     break
                 response_bytes += len(chunk)
                 self.wfile.write(chunk)
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
             pass
         finally:
             conn.close()
@@ -2217,25 +3112,34 @@ class Handler(BaseHTTPRequestHandler):
 
     def _traffic_http_proxy(self, hostname: str, port: int, path: str) -> None:
         """Forward plain HTTP through the generic capability-scoped proxy."""
-        if not traffic_proxy_authorized(self.headers):
+        traffic_box = traffic_request_box(self.headers)
+        if not traffic_box:
             self.send_response(407, "Devbox traffic proxy authentication required")
             self.send_header("Proxy-Authenticate", 'Basic realm="devbox-traffic"')
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
             return
+        if not self._admit_box(traffic_box):
+            return
         try:
-            body = read_request_body(self.headers, self.rfile)
+            body = self._read_body()
         except RequestBodyError as error:
             self._reject_body(error)
             return
+        if traffic_request_box(self.headers) != traffic_box:
+            self.send_error(407, "Devbox traffic proxy capability revoked")
+            self.close_connection = True
+            return
         started = time.monotonic()
         client = self.client_address[0] if self.client_address else ""
-        upstream_url = urlsplit(f"http://{hostname}:{port}")
+        # URL authorities require brackets around IPv6 literals.
+        authority_host = f"[{hostname}]" if ":" in hostname else hostname
+        upstream_url = urlsplit(f"http://{authority_host}:{port}")
 
         def audit_outcome(status: int, error: str = "", response_bytes: int = 0) -> None:
             try:
-                write_audit_event(build_audit_event(
+                self._audit_completed(build_audit_event(
                     method=self.command,
                     target=self.path,
                     upstream=upstream_url,
@@ -2248,24 +3152,38 @@ class Handler(BaseHTTPRequestHandler):
                     duration_ms=round((time.monotonic() - started) * 1000),
                     response_bytes=response_bytes,
                     error=error,
+                    box=traffic_box,
                 ))
             except Exception as audit_exc:
                 sys.stderr.write(f"[devbox-ai-proxy] audit write failed: {audit_exc}\n")
 
+        if not self._audit_before_forwarding(lambda: build_audit_event(
+            method=self.command, target=self.path, upstream=upstream_url,
+            body=body, content_type=self.headers.get("Content-Type", ""),
+            source="traffic-http", provider="", client=client,
+            status=0, duration_ms=0, box=traffic_box,
+        ), required=True):
+            return
+
         try:
             upstream_socket = open_traffic_connection(hostname, port)
-            connection = http.client.HTTPConnection(hostname, port, timeout=600)
+            upstream_socket.settimeout(STREAM_IDLE_TIMEOUT_SECONDS)
+            connection = http.client.HTTPConnection(hostname, port, timeout=STREAM_IDLE_TIMEOUT_SECONDS)
             connection.sock = upstream_socket
             connection.putrequest(self.command, path, skip_host=True, skip_accept_encoding=True)
             for header, value in self.headers.items():
                 if header.lower() not in DROP and header.lower() != "proxy-connection":
                     connection.putheader(header, value)
-            connection.putheader("Host", hostname)
+            connection.putheader("Host", authority_host)
             if body is not None:
                 connection.putheader("Content-Length", str(len(body)))
             connection.endheaders(body)
             response = connection.getresponse()
         except Exception as exc:
+            if "connection" in locals():
+                connection.close()
+            elif "upstream_socket" in locals():
+                upstream_socket.close()
             self.send_error(502, "traffic HTTP error: %s" % exc)
             audit_outcome(502, "upstream-error")
             return
@@ -2279,13 +3197,13 @@ class Handler(BaseHTTPRequestHandler):
         response_bytes = 0
         try:
             while True:
-                chunk = response.read(65536)
+                chunk = response.read1(65536)
                 if not chunk:
                     break
                 response_bytes += len(chunk)
                 self.wfile.write(chunk)
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
             pass
         finally:
             connection.close()
@@ -2297,17 +3215,37 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    global _STATIC_CREDENTIALS
     args = sys.argv[1:]
     if args == ["--init-gh-ca"]:
         ca_path, _, _ = ensure_github_certificates()
         print(ca_path)
         return
-    if args == ["--new-gh-proxy-token"]:
-        print(issue_github_proxy_token())
+    if len(args) == 3 and args[0] in ("--register-gh-proxy-box", "--register-traffic-proxy-box"):
+        try:
+            register_proxy_box("github" if args[0] == "--register-gh-proxy-box" else "traffic", args[1], args[2])
+        except (ValueError, OSError) as exc:
+            raise SystemExit(str(exc)) from exc
         return
-    if args == ["--new-traffic-proxy-token"]:
-        print(issue_traffic_proxy_token())
+    if len(args) == 2 and args[0] in (
+        "--new-gh-proxy-token", "--new-traffic-proxy-token",
+        "--revoke-gh-proxy-token", "--revoke-traffic-proxy-token",
+    ):
+        kind = "github" if "-gh-" in args[0] else "traffic"
+        try:
+            if args[0].startswith("--new-"):
+                print(_issue_registered_proxy_token(kind, args[1], None))
+            else:
+                revoke_proxy_box(kind, args[1])
+        except (ValueError, OSError) as exc:
+            raise SystemExit(str(exc)) from exc
         return
+    if args[:1] and args[0] in (
+        "--new-gh-proxy-token", "--new-traffic-proxy-token",
+        "--revoke-gh-proxy-token", "--revoke-traffic-proxy-token",
+        "--register-gh-proxy-box", "--register-traffic-proxy-box",
+    ):
+        raise SystemExit("usage: " + args[0] + " NAME" + (" ENDPOINT" if args[0].startswith("--register-") else ""))
     if len(args) == 2 and args[0] in ("--ai-proxy-token", "--revoke-ai-proxy-token"):
         try:
             if args[0] == "--ai-proxy-token":
@@ -2343,14 +3281,19 @@ def main():
         if limit < 0:
             raise SystemExit("audit LIMIT must be a non-negative integer")
         for event in read_audit_events()[-limit:]:
-            print(json.dumps(event, ensure_ascii=False, sort_keys=True))
+            print(json.dumps(event, ensure_ascii=True, sort_keys=True))
         return
     if args[:1] == ["--audit-export"]:
         if len(args) > 2:
             raise SystemExit("usage: devbox-ai-proxy --audit-export [FILE]")
         print(write_audit_html(args[1] if len(args) == 2 else ""))
         return
-    srv = ThreadingHTTPServer((BIND_HOST, BIND_PORT), Handler)
+    try:
+        _STATIC_CREDENTIALS = load_api_key_file()
+    except UnsafeApiKeyFile as error:
+        raise SystemExit(str(error)) from error
+    sys.stderr = BoundedDiagnosticStream(sys.stderr, DIAGNOSTICS_MAX_FILE_BYTES)
+    srv = BoundedHTTPServer((BIND_HOST, BIND_PORT), Handler)
     sys.stderr.write(
         "[devbox-ai-proxy] listening on %s:%d  (config: %s, %d route(s))\n"
         % (_HOST, BIND_PORT, CONFIG_PATH, len(ROUTES))

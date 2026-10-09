@@ -24,8 +24,28 @@
     "_comment": "Host-only detailed request audit. It records AI prompts/queries and GitHub API payloads, with known credential fields redacted. Keep the 0600 JSONL file private; set enabled false to disable.",
     "enabled": true,
     "path": "~/.config/devbox/proxy-audit.jsonl",
-    "max_body_bytes": 1048576
+    "max_body_bytes": 1048576,
+    "max_file_bytes": 16777216,
+    "backup_count": 3,
+    "min_free_bytes": 67108864,
+    "failure_interval_seconds": 10
   },
+
+  "limits": {
+    "max_workers": 256,
+    "max_workers_per_source": 256,
+    "max_requests_per_box": 32,
+    "max_tunnels_per_box": 64,
+    "max_request_body_bytes": 268435456,
+    "max_buffered_body_bytes": 805306368,
+    "max_buffered_body_bytes_per_box": 268435456,
+    "header_timeout_seconds": 15,
+    "body_timeout_seconds": 300,
+    "stream_idle_timeout_seconds": 600,
+    "max_connection_seconds": 28800
+  },
+
+  "diagnostics": { "max_file_bytes": 8388608 },
 
   "routes": [
     {

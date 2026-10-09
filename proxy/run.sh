@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
 # Launch the host-side credential proxy so disposable devboxes never hold credentials.
-# Reads API keys from ~/.config/devbox/api-keys.env (if present) and a route
-# config from ~/.config/devbox/proxy.config.json (falls back to the bundled
-# example). Bind address/port come from the config's "listen" field.
+# The proxy reads static API-key assignments from
+# ~/.config/devbox/api-keys.env (if present) and a route config from
+# ~/.config/devbox/proxy.config.json (falls back to the bundled example).
+# Bind address/port come from the config's "listen" field.
 #
 # Requires: python3 (standard library only). `gh` proxy support also uses
 # OpenSSL to make a local, per-host CA for GitHub API TLS interception.
@@ -17,17 +18,10 @@ if [[ "${1:-}" == "-V" || "${1:-}" == "--version" || "${1:-}" == "version" ]]; t
   exit 0
 fi
 
-envfile="${DEVBOX_PROXY_ENV:-$HOME/.config/devbox/api-keys.env}"
-if [[ -f "$envfile" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "$envfile"
-  set +a
-fi
-
-cfg="${DEVBOX_PROXY_CONFIG:-$HOME/.config/devbox/proxy.config.json}"
+config_dir="${DEVBOX_CONFIG_DIR:-$HOME/.config/devbox}"
+cfg="${DEVBOX_PROXY_CONFIG:-$config_dir/proxy.config.json}"
 [[ -f "$cfg" ]] || cfg="$here/proxy.config.example.json"
 export DEVBOX_PROXY_CONFIG="$cfg"
-export DEVBOX_PROXY_STATE_DIR="${DEVBOX_PROXY_STATE_DIR:-${DEVBOX_CONFIG_DIR:-$HOME/.config/devbox}}"
+export DEVBOX_PROXY_STATE_DIR="${DEVBOX_PROXY_STATE_DIR:-$config_dir}"
 
 exec python3 "$here/devbox-ai-proxy.py" "$@"

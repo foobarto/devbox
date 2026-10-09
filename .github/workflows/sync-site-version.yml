@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: main
 
@@ -56,22 +56,32 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          branch="automation/sync-site-version-${VERSION}"
-          existing_pr="$(gh pr list --base main --head "$branch" --state open --json number --jq '.[0].number')"
-          if [[ -n "$existing_pr" ]]; then
-            printf 'merged=false\n' >> "$GITHUB_OUTPUT"
-            printf 'An open version-sync PR already exists: #%s\n' "$existing_pr"
-            exit 0
-          fi
+          set -euo pipefail
+          nonce="$(python3 -c 'import secrets; print(secrets.token_hex(8))')"
+          branch="automation/sync-site-version-${VERSION}-${GITHUB_RUN_ID}-${nonce}"
 
           git switch -c "$branch"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/index.html
           git commit -m "docs(site): sync version to ${VERSION}"
+          expected_head="$(git rev-parse HEAD)"
           git push --set-upstream origin "$branch"
           pr_url="$(gh pr create --base main --head "$branch" --title "docs(site): sync version to ${VERSION}" --body "Automated website version update from \`VERSION\`.")"
-          gh pr merge "$pr_url" --squash --delete-branch
+          pr_number="${pr_url##*/}"
+          abandon() {
+            printf '::error::%s\n' "$1"
+            gh pr close "$pr_url" --delete-branch --comment "Closed by automation: $1" || true
+            exit 1
+          }
+          pr_state="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq '[.head.repo.full_name, .head.ref, .head.sha, .base.ref] | @tsv')"
+          [[ "$pr_state" == "${GITHUB_REPOSITORY}"$'\t'"${branch}"$'\t'"${expected_head}"$'\t'main ]] \
+            || abandon "PR head or base does not match the pushed commit (got: ${pr_state//$'\t'/ })"
+          changed="$(gh pr diff "$pr_url" --name-only)"
+          [[ "$changed" == docs/index.html ]] \
+            || abandon "PR changes more than docs/index.html: ${changed//$'\n'/ }"
+          gh pr merge "$pr_url" --squash --delete-branch --match-head-commit "$expected_head" \
+            || abandon "could not merge the version-sync PR (branch protection or a moved head)"
           printf 'merged=true\n' >> "$GITHUB_OUTPUT"
 
       - name: Request a GitHub Pages build

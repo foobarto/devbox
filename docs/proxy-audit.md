@@ -7,7 +7,10 @@ connection.
 
 ## What is recorded
 
-One JSONL event is appended after each final request result. Records include:
+A `request-open` event is committed before forwarding, followed by a
+`completed` event with the same request ID after the final result. An unmatched
+opening event indicates an interrupted request. If enabled audit storage cannot
+accept the opening event, the proxy refuses to forward. Records include:
 
 - UTC timestamp, provider, proxy source, guest address, and upstream host;
 - request method and path, plus query parameter **names** but not values;
@@ -26,14 +29,21 @@ alone is insufficient.
 Request headers and response bodies are never recorded. Known JSON credential
 keys—such as `authorization`, `access_token`, `refresh_token`, `api_key`, and
 `password`—are replaced with `[redacted]`. The raw body SHA-256 is retained for
-correlation. This is targeted redaction, not a guarantee that user-supplied
+correlation. Key matching also recognizes camelCase and separator variants,
+including `accessToken`, `refreshToken`, `apiKey`, and `clientSecret`.
+This is targeted redaction, not a guarantee that user-supplied
 prompt or source content contains no secrets.
 
 ## Storage and export
 
 The default log is `~/.config/devbox/proxy-audit.jsonl`; Devbox creates it with
-mode `0600`. The default request-body capture limit is 1 MiB. Large and binary
-bodies retain length and SHA-256, but do not retain their full contents.
+mode `0600`. AI-route events (prompts) go to a sibling
+`~/.config/devbox/proxy-audit-ai.jsonl` with its own retention, so routine model
+traffic cannot rotate GitHub, traffic, and mutation records out of the main log.
+The default request-body capture limit is 1 MiB. Large and binary bodies retain
+length and SHA-256, but do not retain their full contents. Each request's body is
+captured once, in its `request-open` event; the `completed` event repeats only
+the body's length and SHA-256.
 
 ```sh
 devbox proxy audit status
@@ -48,10 +58,21 @@ contain prompts, source snippets, issue text, pull-request descriptions, and
 other request payloads.
 
 Keep both files outside repositories and back them up only into encrypted,
-access-controlled storage. The log is append-only while the proxy is running;
-retention and removal stay an explicit host-operator decision. Set
+access-controlled storage. Audit storage rotates at 16 MiB, retaining three
+backups (64 MiB per log); show/export merge both logs and their retained
+backups. A log larger than the quota from before quotas existed is moved aside
+intact, as `proxy-audit.jsonl.legacy-<timestamp>`, on the first write; it is not
+rotated or deleted, so archive or remove it yourself. The proxy refuses forwarding
+when less than 64 MiB of disk space remains or enabled audit storage fails.
+Repeated rejected-client events are limited globally and per source, with
+suppression counts. Host configuration can change these defaults through
+`audit.max_file_bytes`, `backup_count`, `min_free_bytes`, and
+`failure_interval_seconds`. Redirected proxy diagnostic logs reset at 8 MiB
+(`diagnostics.max_file_bytes`); terminal and pipe output are unaffected. Set
 `DEVBOX_PROXY_AUDIT=0`, or `"audit": { "enabled": false }` in the host-local
 proxy configuration, before starting the proxy to disable future collection.
+Audited generic traffic requires enabled, working audit storage and fails
+closed when collection is disabled.
 
 ## Opt-in web egress audit
 
@@ -65,9 +86,19 @@ host — and an nftables output rule rejects direct TCP and UDP connections to
 ports 80 and 443. A policy without it, or `--traffic-audit=off`, removes both
 from a kept box.
 
+The rule is replaced in a checked atomic transaction. Devbox persists a
+root-owned boot policy and requires it before supported systemd network
+services start, preserving the guard across guest restarts. Audited egress
+refuses guests without systemd or a recognized network service. Running legacy
+audited boxes receive the boot policy in place on re-entry; stopped legacy boxes without a
+verified boot policy must be recreated.
+
 The traffic capability is distinct from the AI/GitHub credential capability,
 expires after eight hours, and is refreshed when a kept audited box is
-re-entered. It authorizes only public HTTP(S) destinations; the host proxy
+re-entered. Every request checks its box's current host registration generation;
+removing the grant or destroying the box invalidates copied capabilities.
+Open tunnels recheck the grant at least once per second and close on revocation.
+It authorizes only public HTTP(S) destinations; the host proxy
 refuses loopback, private, link-local, and other non-global addresses to avoid
 becoming a path into host or LAN web services.
 
