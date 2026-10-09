@@ -3,8 +3,9 @@
 `egress = "audit"` (`--traffic-audit=connect`) records where a box connected,
 but HTTPS stays encrypted end to end, so the proxy never sees what was sent.
 `egress = "inspect"` (`--traffic-audit=inspect`) goes further:
-- the host proxy terminates the box's HTTPS with a Devbox CA that only that
-  guest trusts;
+- the host proxy terminates the box's HTTPS with a Devbox CA. The CA is
+  created on the host and trusted only by inspected guests, and its key never
+  leaves the host;
 - it records every decrypted request;
 - it asks a small, configurable model whether the request may leave the
   machine.
@@ -14,11 +15,13 @@ A request leaves only if every existing check passes *and* the model answers
 
 ## Principles
 
-1. **The model can only restrict.** Inspection runs after every deterministic
-   check: capability, generation, port, public address and per-box budgets. Its
-   verdict can block a request those checks allowed, but never allow one they
-   refused. A prompt injection that fools the classifier therefore gains at most
-   what `audit` mode already permits.
+1. **The model can only restrict.** Inspection runs after the deterministic
+   checks: capability, generation, port, per-box budgets, and a check that the
+   destination resolves to a public address (so the content of requests the
+   proxy would refuse anyway never reaches the model). The address is checked
+   again when the proxy connects. The verdict can block a request those checks
+   allowed, but never allow one they refused. A prompt injection that fools the
+   classifier therefore gains at most what `audit` mode already permits.
 2. **Fail closed.** Each of these blocks the request with `403` and records the
    reason in the audit log:
    - no CA;
@@ -69,9 +72,11 @@ In addition:
 - **The CA private key stays on the host.** Leaving inspect mode removes the CA
   from the trust store and deletes the profile.
 
-The registration is written before the guest trusts the CA, and revoked only
-after the CA has been removed again. A mode change therefore never leaves a
-window in which traffic is uninspected.
+The registration is written before the guest trusts the CA, and before its
+profile receives a fresh traffic capability. It is revoked only after the CA has
+been removed again. A mode change therefore never leaves a window in which
+traffic is uninspected. A bare `--traffic-audit` (`-T`) keeps an inspected box
+inspected; only an explicit `--traffic-audit=connect` or `=off` lowers it.
 
 ## Proxy flow
 
@@ -157,21 +162,37 @@ proxy (`devbox proxy stop`; it restarts on the next run):
 
 `devbox` checks readiness before enabling inspection, and refuses with the
 reason if the classifier is not ready. The check is
-`devbox-ai-proxy --inspect-status`.
+`devbox-ai-proxy --inspect-status`, and it runs with the launching shell's
+environment. The running proxy daemon reads the key from its own environment,
+taken when it started, or from `api-keys.env`. If the daemon lacks the key, every
+inspected CONNECT fails with `503`, and the host proxy log says why.
+
+A blocked request gets `403` with an `audit_request_id`, but not the
+classifier's reason: the reason stays in the host audit log, so a manipulated
+agent cannot use it to rephrase until something passes.
 
 ### What the classifier sees
 
 The classifier receives one JSON document per request, labelled as untrusted
 data and delimited so the request cannot close its own delimiter:
 - **Request line**: the method, and the URL with the full query string.
-- **Headers**: names and values, with credential-bearing headers
-  (`Authorization`, `Cookie`, `*-Api-Key`, `*token*`, `*secret*`, `*session*`,
-  and similar) replaced by their scheme and length.
+- **Headers**: names and full values, except a fixed list of credential
+  headers.
+  - `Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `X-Auth-Token`,
+    `Private-Token`, `X-Amz-Security-Token`, `X-Vault-Token` and
+    `X-Registry-Auth` are replaced by their scheme and length.
+  - `Cookie` is reduced to its cookie names and value lengths.
+  - A credential value over 4,096 characters blocks the request instead.
 - **Body**: the whole body as text. A gzip or deflate body is decoded first. A
   binary body is described by its length and a 512-byte hex prefix. A body
   larger than `max_body_bytes` blocks the request without a call.
 - **`Host` header**: included only when it differs from the CONNECT
   destination.
+
+Nothing is truncated. A URL or header value over 16,384 characters blocks the
+request without a call. So does a body with:
+- more than one content encoding;
+- data outside its single gzip or deflate stream.
 
 The classifier must answer with a JSON object,
 `{"verdict": "allow"|"block", "reason": "..."}`. Any other answer blocks the
@@ -203,6 +224,10 @@ classifier call; classifier errors are not cached.
   cache, skip and error state ([proxy audit](proxy-audit.md)).
 - **Latency and cost.** Every request that is neither skipped nor cached waits
   for a model call.
+- **GitHub grant.** On an inspected box, `github` (`--gh-proxy`) API calls are
+  classified like other traffic. The opaque tunnels that the gh grant otherwise
+  opens to `github.com` and `*.githubusercontent.com` are refused, so `gh`
+  commands that need them fail. Git over HTTPS uses the inspected web path.
 - **AI agents in the box.** Pair inspection with the `ai_proxy` grant
   (`--proxy`). Agent traffic then goes to the credential proxy, which is exempt
   from `HTTP(S)_PROXY`. Without it, the agent's own model traffic is inspected

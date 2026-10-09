@@ -54,7 +54,7 @@ class InspectionDocumentTests(TestCase):
         ])
         listed = dict(document["headers"])
         self.assertEqual(listed["Authorization"], "[credential Bearer, 19 characters]")
-        self.assertEqual(listed["Cookie"], "[credential, 11 characters]")
+        self.assertEqual(listed["Cookie"], "[cookies: session (3 characters)]")
         self.assertEqual(listed["X-Api-Key"], "[credential, 1 characters]")
         self.assertEqual(listed["User-Agent"], "curl/8")
         self.assertNotIn("Proxy-Authorization", listed)
@@ -68,10 +68,43 @@ class InspectionDocumentTests(TestCase):
 
     def test_bodies_are_text_decoded_gzip_expanded_and_binary_summarised(self):
         self.assertEqual(self.document([], b"hello")["body"], {"bytes": 5, "text": "hello"})
-        self.assertEqual(self.document([("Content-Encoding", "gzip")], gzip.compress(b"zipped"))["body"],
-                         {"bytes": 6, "text": "zipped"})
+        compressed = gzip.compress(b"zipped")
+        self.assertEqual(self.document([("Content-Encoding", "gzip")], compressed)["body"],
+                         {"bytes": len(compressed), "decoded_bytes": 6, "text": "zipped"})
         binary = self.document([], b"\xff\xfe\x00")["body"]
         self.assertEqual(binary, {"bytes": 3, "binary_prefix_hex": "fffe00"})
+
+    def test_data_outside_one_compressed_stream_is_blocked(self):
+        # Trailing bytes and further gzip members would be forwarded unseen.
+        for body in (gzip.compress(b'{"q":"hello"}') + b"AWS_SECRET_ACCESS_KEY=hunter2",
+                     gzip.compress(b"a") + gzip.compress(b"SECRET"),
+                     gzip.compress(b"truncated")[:-4]):
+            with self.subTest(body=body), self.assertRaises(proxy.InspectionBlocked):
+                self.document([("Content-Encoding", "gzip")], body)
+        for headers in ([("Content-Encoding", "identity"), ("Content-Encoding", "gzip")],
+                        [("Content-Encoding", "gzip, identity")]):
+            with self.subTest(headers=headers), self.assertRaises(proxy.InspectionBlocked):
+                self.document(headers, gzip.compress(b"x"))
+
+    def test_only_known_credential_headers_are_described_and_nothing_is_truncated(self):
+        notes = "n" * 4000
+        listed = dict(self.document([("X-Session-Notes", notes), ("X-Upload-Token", "visible")])["headers"])
+        self.assertEqual(listed["X-Session-Notes"], notes)
+        self.assertEqual(listed["X-Upload-Token"], "visible")
+        for headers, target in (([("Authorization", "Bearer " + "x" * 5000)], "/"),
+                                ([("X-Data", "y" * 20000)], "/"),
+                                ([], "/?" + "q=" + "z" * 20000)):
+            with self.subTest(target=target[:10]), self.assertRaises(proxy.InspectionBlocked):
+                self.document(headers, target=target)
+        long_query = "/?" + "a" * 9000 + "&leak=SECRET"
+        self.assertIn("leak=SECRET", self.document([], target=long_query)["url"])
+
+    def test_scoped_ipv6_literals_never_reach_openssl(self):
+        self.assertIsNone(proxy.traffic_connect_target("[fe80::1%25${ENV::HOME}]:443"))
+        self.assertIsNone(proxy.traffic_connect_target("[fe80::1%eth0]:443"))
+        for host in ("fe80::1%eth0", "fe80::1%${ENV::HOME}", "a,IP:1.2.3.4", "${ENV::HOME}"):
+            with self.subTest(host=host), self.assertRaises(ValueError):
+                proxy.inspect_leaf_context(host)
 
     def test_oversized_undecodable_or_unknown_encodings_are_blocked(self):
         with patch.object(proxy, "INSPECT_MAX_BODY_BYTES", 8):
@@ -303,6 +336,9 @@ class InspectedTunnelTests(TestCase):
             def do_POST(self):
                 body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 outer.received.append((self.command, self.path, self.headers.get("Host"), body))
+                if getattr(outer, "upstream_override", None):
+                    outer.upstream_override(self)
+                    return
                 self.send_response(201)
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
@@ -327,6 +363,7 @@ class InspectedTunnelTests(TestCase):
         stack.enter_context(patch.object(proxy, "AUDIT_ENABLED", True))
         stack.enter_context(patch.object(proxy.Handler, "log_message"))
         stack.enter_context(patch.object(proxy, "inspect_upstream_context", return_value=upstream_trust))
+        self.public = stack.enter_context(patch.object(proxy, "traffic_destination_is_public", return_value=True))
         stack.enter_context(patch.object(
             proxy, "open_traffic_connection",
             side_effect=lambda *_: socket.create_connection(self.upstream.server_address)))
@@ -394,7 +431,9 @@ class InspectedTunnelTests(TestCase):
             status, body = self.request(client, body=b"AWS_SECRET=x")
             client.close()
         self.assertEqual(status, 403)
-        self.assertEqual(json.loads(body)["reason"], "exfiltration")
+        # The guest learns that it was blocked, not why.
+        self.assertNotIn("exfiltration", body.decode())
+        self.assertIn("audit_request_id", json.loads(body))
         self.assertEqual(self.received, [])
         completed = [e for e in self.events(1) if e.get("phase") == "completed"]
         self.assertEqual(completed[0]["response"]["error"], "inspection-blocked")
@@ -419,12 +458,93 @@ class InspectedTunnelTests(TestCase):
         call.assert_not_called()
         self.assertEqual(self.received, [])
 
+    def test_inspected_boxes_get_no_opaque_github_tunnel_and_classified_github_api_calls(self):
+        proxy.register_proxy_box("github", "devbox-test", "http://host.lima.internal:4141")
+        github = b64encode(f"{proxy.issue_github_proxy_token('devbox-test')}:".encode()).decode()
+        ca_path, _, _ = proxy.ensure_github_certificates()
+
+        def github_connect(host):
+            raw = socket.create_connection(self.proxy_server.server_address, timeout=10)
+            raw.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n"
+                        f"Proxy-Authorization: Basic {github}\r\n\r\n".encode())
+            response = bytearray()
+            while b"\r\n\r\n" not in response:
+                chunk = raw.recv(4096)
+                if not chunk:
+                    break
+                response.extend(chunk)
+            return raw, bytes(response).split(b"\r\n", 1)[0]
+
+        raw, status = github_connect("github.com")
+        raw.close()
+        self.assertIn(b" 403 ", status)
+        with patch.object(proxy, "resolve_github_token", return_value="host-token"), \
+             patch.object(proxy, "_call_classifier", return_value='{"verdict":"block","reason":"gist"}') as call:
+            raw, status = github_connect("api.github.com")
+            self.assertIn(b" 200 ", status)
+            client = ssl.create_default_context(cafile=ca_path).wrap_socket(raw, server_hostname="api.github.com")
+            client.sendall(b"POST /gists HTTP/1.1\r\nHost: api.github.com\r\nContent-Length: 2\r\n\r\n{}")
+            response = http.client.HTTPResponse(client, method="POST")
+            response.begin()
+            client.close()
+        self.assertEqual(response.status, 403)
+        call.assert_called_once()
+
     def test_unavailable_inspection_refuses_the_tunnel(self):
         with patch.dict(proxy._STATIC_CREDENTIALS, {"ANTHROPIC_API_KEY": ""}), \
              patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
             raw, status = self.connect()
             raw.close()
         self.assertIn(b" 503 ", status)
+
+    def test_private_destinations_are_refused_before_classification(self):
+        self.public.return_value = False
+        with patch.object(proxy, "_call_classifier") as call:
+            raw, status = self.connect(host="internal.test")
+            raw.close()
+        self.assertIn(b" 502 ", status)
+        call.assert_not_called()
+
+    def test_certificate_failures_do_not_echo_host_detail(self):
+        with patch.object(proxy, "inspect_leaf_context", side_effect=RuntimeError("HOST-SECRET-DETAIL")):
+            raw, status = self.connect()
+            rest = raw.recv(65536)
+            raw.close()
+        self.assertIn(b" 502 ", status)
+        self.assertNotIn(b"HOST-SECRET-DETAIL", status + rest)
+
+    def test_inspected_sessions_hold_their_tunnel_slot(self):
+        with patch.object(proxy, "MAX_TUNNELS_PER_BOX", 2):
+            first, _ = self.connect()
+            first = self.tls(first)
+            second, _ = self.connect()
+            second = self.tls(second)
+            third, status = self.connect()
+            third.close()
+            self.assertIn(b" 503 ", status)
+            first.close()
+            deadline = time.monotonic() + 5
+            while proxy._BOX_TUNNELS.get("devbox-test", 0) > 1 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            fourth, status = self.connect()
+            self.assertIn(b" 200 ", status)
+            fourth.close()
+            second.close()
+
+    def test_interim_upstream_responses_fail_instead_of_replacing_the_response(self):
+        def early_hints(handler):
+            handler.wfile.write(b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\n")
+            handler.send_response(200)
+            handler.send_header("Content-Length", "2")
+            handler.end_headers()
+            handler.wfile.write(b"ok")
+        with patch.object(proxy, "_call_classifier", return_value='{"verdict":"allow","reason":"ok"}'):
+            self.upstream_override = early_hints
+            raw, _ = self.connect()
+            client = self.tls(raw)
+            status, _ = self.request(client)
+            client.close()
+        self.assertEqual(status, 502)
 
     def test_nested_connect_inside_an_inspected_session_is_refused(self):
         raw, _ = self.connect()

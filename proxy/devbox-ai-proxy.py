@@ -2090,7 +2090,9 @@ def traffic_connect_target(authority: str) -> tuple[str, int] | None:
         host, port = parsed.hostname, parsed.port
     except ValueError:
         return None
-    if not host or parsed.username or parsed.password or port not in (80, 443):
+    # "%" would be an IPv6 zone ID: never a public destination, and not text
+    # that may reach an openssl configuration file.
+    if not host or "%" in host or parsed.username or parsed.password or port not in (80, 443):
         return None
     return host, port
 
@@ -2262,7 +2264,14 @@ _INSPECT_LEAF_SECONDS = 24 * 60 * 60
 _INSPECT_HOSTNAME = re.compile(
     r"(?=.{1,253}$)[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9])?(?:\.[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9])?)*"
 )
-_CREDENTIAL_HEADER = re.compile(r"authorization|cookie|api[-_]?key|token|secret|session|password|signature", re.I)
+# Headers whose values the classifier sees only described. A fixed list: a
+# name pattern would let a guest hide data in any header it names "*-session".
+_CREDENTIAL_HEADERS = frozenset({
+    "authorization", "cookie", "x-api-key", "api-key", "x-goog-api-key", "x-auth-token",
+    "private-token", "x-amz-security-token", "x-vault-token", "x-registry-auth",
+})
+_INSPECT_MAX_CREDENTIAL_CHARS = 4096
+_INSPECT_MAX_FIELD_CHARS = 16384
 
 INSPECT_SYSTEM_PROMPT = """\
 You are a security filter for outgoing HTTP requests from a sandboxed \
@@ -2326,7 +2335,11 @@ def _private_regular_file(path: str) -> bool:
     return stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077
 
 
+_INSPECT_CA_CHECK: list = []
+
+
 def inspect_ca_problem() -> str | None:
+    """Validate the CA files; the openssl expiry check is cached per file identity."""
     ca_path, ca_key, leaf_key = inspect_certificate_paths()
     for path in (ca_key, leaf_key):
         if not _private_regular_file(path):
@@ -2337,11 +2350,19 @@ def inspect_ca_problem() -> str | None:
         return "inspection CA certificate is missing"
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
         return "inspection CA certificate is not an owner-controlled regular file"
+    identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    now = time.monotonic()
+    with _INSPECT_LOCK:
+        if _INSPECT_CA_CHECK and _INSPECT_CA_CHECK[0] == identity and _INSPECT_CA_CHECK[1] > now:
+            return _INSPECT_CA_CHECK[2]
     try:
         valid = _openssl("x509", "-in", ca_path, "-noout", "-checkend", str(30 * 24 * 60 * 60)).returncode == 0
     except (OSError, RuntimeError):
         valid = False
-    return None if valid else "inspection CA certificate is unreadable or expires within 30 days"
+    problem = None if valid else "inspection CA certificate is unreadable or expires within 30 days"
+    with _INSPECT_LOCK:
+        _INSPECT_CA_CHECK[:] = [identity, now + 300, problem]
+    return problem
 
 
 def _openssl_checked(*arguments: str) -> None:
@@ -2399,12 +2420,17 @@ def _inspect_ca_fingerprint() -> str:
 
 def inspect_leaf_context(hostname: str) -> ssl.SSLContext:
     """A server context presenting a certificate for `hostname`, signed by the CA."""
+    # Only a validated DNS name or a compressed, unscoped IP literal reaches the
+    # openssl configuration below, which would expand ${ENV::NAME} and commas.
     try:
         address = ipaddress.ip_address(hostname)
     except ValueError:
         address = None
         if not _INSPECT_HOSTNAME.fullmatch(hostname):
             raise ValueError("host name cannot be inspected")
+    else:
+        if "%" in hostname or getattr(address, "scope_id", None):
+            raise ValueError("scoped addresses cannot be inspected")
     with inspect_certificate_lock(shared=True):
         if (problem := inspect_ca_problem()) is not None:
             raise RuntimeError(problem)
@@ -2415,7 +2441,7 @@ def inspect_leaf_context(hostname: str) -> ssl.SSLContext:
             if cached and cached[0] > now:
                 return cached[1]
         ca_cert, ca_key, leaf_key = inspect_certificate_paths()
-        subject = f"IP:{address}" if address else f"DNS:{hostname}"
+        subject = f"IP:{address.compressed}" if address else f"DNS:{hostname}"
         with tempfile.TemporaryDirectory(prefix=".devbox-inspect-leaf-", dir=STATE_DIR) as directory:
             config, request, certificate = (os.path.join(directory, name) for name in ("leaf.cnf", "leaf.csr", "leaf.pem"))
             with open(config, "w", encoding="utf-8") as stream:
@@ -2489,6 +2515,25 @@ def traffic_inspection_required(name: str) -> bool:
     return True
 
 
+def traffic_destination_is_public(host: str, port: int) -> bool:
+    """Whether `host` resolves to a public address, checked before classification.
+
+    open_traffic_connection repeats the check when it connects; this one keeps
+    the content of requests that would be refused anyway away from the model.
+    """
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return False
+    for *_, sockaddr in addresses:
+        try:
+            if ipaddress.ip_address(sockaddr[0]).is_global:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def inspect_problem() -> str | None:
     """Why inspected traffic cannot currently be classified, if it cannot."""
     if not INSPECT_MODEL:
@@ -2514,7 +2559,12 @@ def _inspection_body(body: bytes | None, headers) -> dict | None:
         return None
     if len(body) > INSPECT_MAX_BODY_BYTES:
         raise InspectionBlocked(f"request body exceeds the {INSPECT_MAX_BODY_BYTES}-byte inspection limit")
-    encoding = (headers.get("Content-Encoding") or "identity").strip().lower()
+    values = headers.get_all("Content-Encoding") if hasattr(headers, "get_all") else [headers.get("Content-Encoding")]
+    encodings = [item.strip().lower() for value in values or [] if value for item in value.split(",") if item.strip()]
+    if len(encodings) > 1:
+        raise InspectionBlocked("stacked or repeated content encodings cannot be inspected")
+    encoding = encodings[0] if encodings else "identity"
+    wire_bytes = len(body)
     if encoding in ("gzip", "x-gzip", "deflate"):
         decoder = zlib.decompressobj(31 if "gzip" in encoding else 15)
         try:
@@ -2523,12 +2573,19 @@ def _inspection_body(body: bytes | None, headers) -> dict | None:
             raise InspectionBlocked("request body does not match its content encoding") from exc
         if len(body) > INSPECT_MAX_BODY_BYTES or decoder.unconsumed_tail:
             raise InspectionBlocked(f"decoded request body exceeds the {INSPECT_MAX_BODY_BYTES}-byte inspection limit")
+        # Everything forwarded must have been decoded: no truncated stream, no
+        # second member, no trailing bytes after the compressed data.
+        if not decoder.eof or decoder.unused_data:
+            raise InspectionBlocked("request body has data outside its single compressed stream")
     elif encoding != "identity":
         raise InspectionBlocked(f"request content encoding {encoding!r} cannot be inspected")
+    summary = {"bytes": wire_bytes}
+    if len(body) != wire_bytes:
+        summary["decoded_bytes"] = len(body)
     try:
-        return {"bytes": len(body), "text": body.decode("utf-8")}
+        return {**summary, "text": body.decode("utf-8")}
     except UnicodeDecodeError:
-        return {"bytes": len(body), "binary_prefix_hex": body[:512].hex()}
+        return {**summary, "binary_prefix_hex": body[:512].hex()}
 
 
 def inspection_document(*, method: str, scheme: str, host: str, port: int, target: str,
@@ -2537,6 +2594,9 @@ def inspection_document(*, method: str, scheme: str, host: str, port: int, targe
     listed = []
     authority = host if port in (80, 443) else f"{host}:{port}"
     host_header = ""
+    # Nothing is truncated: a field too long to show in full blocks instead.
+    if len(target) > _INSPECT_MAX_FIELD_CHARS:
+        raise InspectionBlocked(f"request target exceeds {_INSPECT_MAX_FIELD_CHARS} characters")
     for name, value in headers.items():
         lowered = name.lower()
         if lowered in ("proxy-authorization", "proxy-connection"):
@@ -2544,15 +2604,21 @@ def inspection_document(*, method: str, scheme: str, host: str, port: int, targe
         if lowered == "host":
             host_header = value
             continue
-        if _CREDENTIAL_HEADER.search(lowered):
-            scheme_word = value.split(" ", 1)[0] if lowered.endswith("authorization") and " " in value else ""
-            value = f"[credential{' ' + scheme_word if scheme_word else ''}, {len(value)} characters]"
-        elif len(value) > 2048:
-            value = f"{value[:2048]}... [{len(value)} characters]"
+        if lowered in _CREDENTIAL_HEADERS:
+            if len(value) > _INSPECT_MAX_CREDENTIAL_CHARS:
+                raise InspectionBlocked(f"{name} header exceeds {_INSPECT_MAX_CREDENTIAL_CHARS} characters")
+            if lowered == "cookie":
+                cookies = [part.strip().partition("=") for part in value.split(";") if part.strip()]
+                value = "[cookies: " + ", ".join(f"{key} ({len(val)} characters)" for key, _, val in cookies) + "]"
+            else:
+                scheme_word = value.split(" ", 1)[0] if lowered == "authorization" and " " in value else ""
+                value = f"[credential{' ' + scheme_word if scheme_word else ''}, {len(value)} characters]"
+        elif len(value) > _INSPECT_MAX_FIELD_CHARS:
+            raise InspectionBlocked(f"{name} header exceeds {_INSPECT_MAX_FIELD_CHARS} characters")
         listed.append([name, value])
     document = {
         "method": method,
-        "url": f"{scheme}://{authority}{target if len(target) <= 8192 else target[:8192] + '...'}",
+        "url": f"{scheme}://{authority}{target}",
         "headers": listed,
         "body": _inspection_body(body, headers),
     }
@@ -3058,6 +3124,13 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def finish(self):
+        box = getattr(self, "_inspect_tunnel_box", "")
+        if box:
+            self._inspect_tunnel_box = ""
+            with _RESOURCE_LOCK:
+                _BOX_TUNNELS[box] -= 1
+                if not _BOX_TUNNELS[box]:
+                    del _BOX_TUNNELS[box]
         try:
             super().finish()
         finally:
@@ -3211,11 +3284,17 @@ class Handler(BaseHTTPRequestHandler):
             )
             if inspect:
                 event["request"]["action"] = "inspected-connect"
-                problem = inspect_problem()
+                # Nothing reaches the classifier for a destination the proxy
+                # would refuse to connect to anyway.
+                problem = None if traffic_destination_is_public(hostname, port) else "no-public-address"
+                problem = problem or ("inspection-unavailable" if inspect_problem() else None)
                 if problem:
-                    self.send_error(503, "Devbox traffic inspection unavailable: %s" % problem)
+                    if problem == "no-public-address":
+                        self.send_error(502, "traffic destination has no public IP address")
+                    else:
+                        self.send_error(503, "Devbox traffic inspection is unavailable; see the host proxy log")
                     self.close_connection = True
-                    event["response"].update(status=503, error="inspection-unavailable")
+                    event["response"].update(status=502 if problem == "no-public-address" else 503, error=problem)
                     try:
                         write_audit_failure(event)
                     except Exception as audit_exc:
@@ -3282,6 +3361,10 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         if not self._admit_box(github_box, tunnel=True):
+            return
+        if target[0] == "tunnel" and traffic_inspection_required(github_box):
+            self.send_error(403, "opaque GitHub tunnels are disabled while this box's traffic is inspected")
+            self.close_connection = True
             return
         self._github_capability_headers = self.headers
         self._deadline(MAX_CONNECTION_SECONDS)
@@ -3414,13 +3497,24 @@ class Handler(BaseHTTPRequestHandler):
         audit_started = time.monotonic()
         audit_source = "github-connect" if github_host else "auth-proxy"
         client = self.client_address[0] if self.client_address else ""
+        # An inspected box's GitHub API traffic is classified too: the gh grant
+        # must not be an unexamined way out.
+        inspection = None
+        if github_host and traffic_inspection_required(box):
+            inspection = inspect_request(method=self.command, scheme="https", host=github_host, port=443,
+                                         target=self.path, headers=self.headers, body=body)
+
+        def inspected(event: dict) -> dict:
+            if inspection is not None:
+                event["inspection"] = inspection
+            return event
 
         def audit_outcome(
             status: int, provider: str = "", error: str = "", response_bytes: int = 0,
             attempts: int = 1, websocket: bool = False,
         ) -> None:
             try:
-                self._audit_completed(build_audit_event(
+                self._audit_completed(inspected(build_audit_event(
                     method=self.command,
                     target=self.path,
                     upstream=up,
@@ -3436,15 +3530,19 @@ class Handler(BaseHTTPRequestHandler):
                     error=error,
                     websocket=websocket,
                     box=box,
-                ))
+                )))
             except Exception as exc:
                 sys.stderr.write(f"[devbox-ai-proxy] audit write failed: {exc}\n")
 
-        if not self._audit_before_forwarding(lambda: build_audit_event(
+        if not self._audit_before_forwarding(lambda: inspected(build_audit_event(
             method=self.command, target=self.path, upstream=up, body=body,
             content_type=self.headers.get("Content-Type", ""), source=audit_source,
             provider="", client=client, status=0, duration_ms=0, box=box,
-        )):
+        )), required=inspection is not None):
+            return
+        if inspection is not None and inspection["verdict"] != "allow":
+            self._send_inspection_block(inspection)
+            audit_outcome(403, error="inspection-blocked")
             return
 
         # The box capability authenticates only this proxy; it never travels on,
@@ -3647,6 +3745,10 @@ class Handler(BaseHTTPRequestHandler):
         upstream_url = urlsplit(f"http://{authority_host}:{port}")
         inspection = None
         if traffic_inspection_required(traffic_box):
+            if not traffic_destination_is_public(hostname, port):
+                self.send_error(502, "traffic destination has no public IP address")
+                self.close_connection = True
+                return
             inspection = inspect_request(method=self.command, scheme="http", host=hostname, port=port,
                                          target=path, headers=self.headers, body=body)
 
@@ -3755,7 +3857,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 context = inspect_leaf_context(hostname)
             except Exception as exc:
-                self.send_error(502, "Devbox traffic inspection could not certify %s: %s" % (hostname, exc))
+                # The detail stays on the host: openssl output must never reach the guest.
+                sys.stderr.write("[devbox-ai-proxy] inspection certificate for %s failed: %s\n"
+                                 % (terminal_safe_diagnostic(hostname), terminal_safe_diagnostic(str(exc))))
+                self.send_error(502, "Devbox traffic inspection could not certify this host")
                 self.close_connection = True
                 completed(502, "inspection-certificate")
                 return
@@ -3776,12 +3881,17 @@ class Handler(BaseHTTPRequestHandler):
         self._inspect_target = (hostname, port, box)
         self._inspect_capability_headers = self.headers
         self.close_connection = False
+        # The decrypted session holds this CONNECT's tunnel slot until the
+        # connection closes (finish), not just for the CONNECT request.
+        self._inspect_tunnel_box, self._admitted_box = self._admitted_box, ""
         completed(200)
 
     def _send_inspection_block(self, inspection: dict) -> None:
+        # The reason stays in the host audit log: returning it would give a
+        # manipulated agent an oracle to iterate against.
         body = json.dumps({
             "error": "blocked by Devbox traffic inspection",
-            "reason": inspection.get("reason") or "",
+            "audit_request_id": getattr(self, "_audit_request_id", None),
         }).encode("utf-8") + b"\n"
         self.send_response(403, "Blocked by Devbox traffic inspection")
         self.send_header("Content-Type", "application/json")
@@ -3872,6 +3982,9 @@ class Handler(BaseHTTPRequestHandler):
                 upstream.putheader("Content-Length", str(len(body)))
             upstream.endheaders(body)
             response = upstream.getresponse()
+            if 100 <= response.status < 200:
+                # http.client cannot read past an interim response such as 103.
+                raise http.client.HTTPException(f"unsupported interim response {response.status}")
         except Exception as exc:
             if "upstream" in locals():
                 upstream.close()
@@ -3884,8 +3997,7 @@ class Handler(BaseHTTPRequestHandler):
 
         response_bytes = 0
         try:
-            no_body = (self.command == "HEAD" or response.status in (204, 304)
-                       or 100 <= response.status < 200)
+            no_body = self.command == "HEAD" or response.status in (204, 304)
             length = response.getheader("Content-Length")
             chunked = not no_body and (response.chunked or length is None)
             if chunked and self.request_version == "HTTP/1.0":

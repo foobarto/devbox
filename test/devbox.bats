@@ -1025,6 +1025,7 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
     apply_connect_traffic_audit() { echo "traffic $2"; }
     require_traffic_inspection_ready() { echo "inspect-ready"; }
     apply_traffic_inspection() { echo "inspect $1"; }
+    register_traffic_inspection() { echo "register-inspect $1"; }
     clear_traffic_inspection() { echo "clear-inspect"; }
     traffic_inspection_registered() { [[ "${STORED_INSPECT:-0}" == 1 ]]; }
     stored_traffic_proxy_endpoint() { [[ "${STORED_TRAFFIC:-0}" == 1 ]] && echo http://host.lima.internal:4141; }
@@ -1235,6 +1236,13 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
 @test "a kept box remembers inspection when re-entered without a flag" {
   STORED_TRAFFIC=1 STORED_INSPECT=1 run_auth_grants
   [[ "$output" == *"inspect devbox-"* ]]
+  # Inspection is registered before the guest receives a fresh capability.
+  [[ "$output" == *"register-inspect devbox-"*"traffic http"*"inspect devbox-"* ]]
+  # A bare -T keeps inspection; only an explicit =connect lowers it.
+  STORED_TRAFFIC=1 STORED_INSPECT=1 run_auth_grants -T
+  [[ "$output" == *"inspect devbox-"* && "$output" != *"clear-inspect"* ]]
+  STORED_TRAFFIC=1 STORED_INSPECT=1 run_auth_grants --traffic-audit=connect
+  [[ "$output" == *"clear-inspect"* ]]
   STORED_TRAFFIC=1 STORED_INSPECT=0 run_auth_grants
   [[ "$output" == *"clear-inspect"* && "$output" != *"inspect devbox-"* ]]
 }

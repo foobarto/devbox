@@ -1815,13 +1815,20 @@ require_traffic_inspection_ready() {
     || die "traffic inspection is not ready: $status (configure \"inspect\" in proxy.config.json; see docs/inspect-proxy.md)"
 }
 
-apply_traffic_inspection() { # $1 Lima instance with connect-mode audit applied
+register_traffic_inspection() { # $1 Lima instance $2 traffic proxy endpoint
+  local launcher
+  record_traffic_proxy_endpoint "$1" "$2" || die "could not register traffic proxy grant"
+  launcher="$(proxy_launcher)" || die "proxy launcher not found"
+  DEVBOX_PROXY_STATE_DIR="$(proxy_state_dir)" "$launcher" --register-traffic-inspect-box "$1" \
+    || die "could not register traffic inspection for $1"
+}
+
+apply_traffic_inspection() { # $1 Lima instance, registered and with connect-mode audit applied
   local name="$1" launcher ca_path
   launcher="$(proxy_launcher)" || die "proxy launcher not found"
   ca_path="$(DEVBOX_PROXY_STATE_DIR="$(proxy_state_dir)" "$launcher" --init-inspect-ca)" \
     || die "could not create the traffic inspection CA"
-  DEVBOX_PROXY_STATE_DIR="$(proxy_state_dir)" "$launcher" --register-traffic-inspect-box "$name" \
-    || die "could not register traffic inspection for $name"
+  traffic_inspection_registered "$name" || die "traffic inspection for $name is not registered"
   log "Enabling TLS inspection of web traffic in $name"
   limactl shell "$name" -- mkdir -p .devbox </dev/null || die "could not prepare $name for the inspection CA"
   limactl copy "$ca_path" "$name:.devbox/inspect-ca.pem" || die "could not copy the inspection CA into $name"
@@ -3710,7 +3717,7 @@ run_cleanup() {
 }
 
 cmd_run() {
-  local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 with_agent_config=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name="" gui=0 traffic_audit="" ephemeral_sessions=0
+  local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 with_agent_config=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name="" gui=0 traffic_audit="" traffic_audit_bare=0 ephemeral_sessions=0
   local gh_proxy="" no_gh_proxy=0 cli_policy="" legacy_flags=()
   local extra_mounts=() extra_copies=() manifest_requests=() gui_command=()
   local cli_cpus="" cli_memory="" cli_disk=""
@@ -3744,7 +3751,7 @@ cmd_run() {
       --gh-proxy=off|-H=off) no_gh_proxy=1; gh_proxy=""; legacy_flags+=(--gh-proxy);;
       --gh-proxy=|-H=) die "--gh-proxy= needs a proxy URL or off";;
       --gh-proxy=*|-H=*) gh_proxy="${1#*=}"; legacy_flags+=(--gh-proxy);;
-      --traffic-audit|-T) traffic_audit=connect; legacy_flags+=(--traffic-audit);;
+      --traffic-audit|-T) traffic_audit=connect; traffic_audit_bare=1; legacy_flags+=(--traffic-audit);;
       --traffic-audit=*|-T=*) traffic_audit="${1#*=}"; legacy_flags+=(--traffic-audit);;
       --mount|-m) shift; extra_mounts+=("${1:?--mount needs PATH[:ro|:rw]}");;
       --mount=*|-m=*) extra_mounts+=("${1#*=}");;
@@ -4162,7 +4169,20 @@ PY
       [[ -n "$traffic_proxy_endpoint" ]] || \
         traffic_proxy_endpoint="$(proxy_endpoint "${proxy:-${gh_proxy:-$PROXY_DEFAULT_URL}}")" \
         || die "proxy must be a bare http://host:port URL with a numeric port"
-      [[ "$managed_traffic_audit" != inspect ]] || require_traffic_inspection_ready
+      # A bare --traffic-audit asks for audited egress, not for a downgrade:
+      # it keeps a box's (or the manifest's) inspection. Only =connect lowers it.
+      if [[ "$managed_traffic_audit" == connect && $traffic_audit_bare -eq 1 ]] \
+         && { traffic_inspection_registered "$name" \
+              || [[ -n "$manifest" && "$(manifest_value "$grants" traffic_audit)" == inspect ]]; }; then
+        managed_traffic_audit=inspect
+      fi
+      if [[ "$managed_traffic_audit" == inspect ]]; then
+        require_traffic_inspection_ready
+        proxy_ensure "$traffic_proxy_endpoint" || die "could not start traffic proxy"
+        # Registered before the guest's profile receives a fresh capability, so
+        # running processes cannot open an opaque tunnel in between.
+        register_traffic_inspection "$name" "$traffic_proxy_endpoint"
+      fi
       proxy_ensure "$traffic_proxy_endpoint" || die "could not start traffic proxy"
       apply_connect_traffic_audit "$name" "$traffic_proxy_endpoint"
       if [[ "$managed_traffic_audit" == inspect ]]; then
