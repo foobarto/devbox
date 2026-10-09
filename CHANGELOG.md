@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Add `egress = "inspect"` (`--traffic-audit=inspect`): the host proxy decrypts
+  a box's web traffic with a Devbox CA the guest trusts and forwards each
+  request only if a configurable model (Claude Haiku by default, or any
+  OpenAI-compatible endpoint) allows it; failures block.
+- Use an explicit empty password in the audited-egress proxy URL so git does
+  not prompt for one, and set `NODE_USE_ENV_PROXY=1` so Node's `fetch` uses
+  the proxy.
+
 ## v2.0.2 - 2026-10-09
 
 - Record a verified identity for each golden and refuse goldens without one.

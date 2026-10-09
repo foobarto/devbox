@@ -945,8 +945,9 @@ print("" if d is None else d)' "$1"
   ensure_guest_nftables() { :; }; apply_connect_traffic_firewall() { :; }
   limactl() { if [[ "$*" == *zz-devbox-30-traffic-audit.sh* ]]; then cat > "$profile"; fi; return 0; }
   apply_connect_traffic_audit box http://host.lima.internal:4141
-  grep -Fxq "export HTTPS_PROXY=http://part.one@host.lima.internal:4141" "$profile"
+  grep -Fxq "export HTTPS_PROXY=http://part.one:@host.lima.internal:4141" "$profile"
   grep -Fxq "export NO_PROXY=localhost,127.0.0.1,::1,host.lima.internal no_proxy=localhost,127.0.0.1,::1,host.lima.internal" "$profile"
+  grep -Fxq "export NODE_USE_ENV_PROXY=1" "$profile"
   ! grep -q 'unset NO_PROXY' "$profile"
 }
 
@@ -959,7 +960,8 @@ print("" if d is None else d)' "$1"
 @test "traffic proxy URL uses the same capability-safe bare endpoint format" {
   run bash -c 'printf %s "$2" | { source "$1"; traffic_proxy_url "$3"; }' _ "$DEVBOX" "part.one" "http://host.lima.internal:4141"
   [ "$status" -eq 0 ]
-  [ "$output" = "http://part.one@host.lima.internal:4141" ]
+  # The explicit empty password keeps git from prompting for one.
+  [ "$output" = "http://part.one:@host.lima.internal:4141" ]
 }
 
 @test "GitHub proxy URL rejects a proxy URL with existing credentials or a path" {
@@ -1021,6 +1023,10 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
     clear_auth() { echo "clear-all"; }
     clear_connect_traffic_audit() { echo "clear-traffic"; }
     apply_connect_traffic_audit() { echo "traffic $2"; }
+    require_traffic_inspection_ready() { echo "inspect-ready"; }
+    apply_traffic_inspection() { echo "inspect $1"; }
+    clear_traffic_inspection() { echo "clear-inspect"; }
+    traffic_inspection_registered() { [[ "${STORED_INSPECT:-0}" == 1 ]]; }
     stored_traffic_proxy_endpoint() { [[ "${STORED_TRAFFIC:-0}" == 1 ]] && echo http://host.lima.internal:4141; }
     confirm_manifest_permissions() { :; }
     stored_gh_proxy_endpoint() {
@@ -1151,7 +1157,8 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
 
   # No policy anywhere: the legacy behaviour refreshes what the box has.
   STORED_GH=1 STORED_TRAFFIC=1 run_auth_grants
-  [[ "$output" == *"gh http"* && "$output" == *"traffic http"* && "$output" != *"clear-"* ]]
+  # Remembered connect-mode audit stays uninspected (clear-inspect is a no-op).
+  [[ "$output" == *"gh http"* && "$output" == *"traffic http"* && "${output//clear-inspect/}" != *"clear-"* ]]
   unset AUTH_CONFIG_DIR AUTH_PROJECT
 }
 
@@ -1190,6 +1197,46 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
   run_auth_grants --policy none
   [[ "$output" != *"traffic http"* ]]
   unset AUTH_CONFIG_DIR AUTH_PROJECT
+}
+
+@test "egress = inspect and --traffic-audit=inspect select inspection, and inspect is a stronger floor" {
+  AUTH_CONFIG_DIR="$BATS_TEST_TMPDIR/cfg"; mkdir -p "$AUTH_CONFIG_DIR/policies"; export AUTH_CONFIG_DIR
+  AUTH_PROJECT="$BATS_TEST_TMPDIR/proj"; mkdir -p "$AUTH_PROJECT"; export AUTH_PROJECT
+  run_auth_grants --traffic-audit=inspect
+  [[ "$output" == *"inspect-ready"* && "$output" == *"traffic http"* && "$output" == *"inspect devbox-"* ]]
+  run_auth_grants --traffic-audit=connect
+  [[ "$output" == *"traffic http"* && "$output" == *"clear-inspect"* && "$output" != *"inspect devbox-"* ]]
+  run_auth_grants --traffic-audit=bogus
+  [[ "$output" == *"accepts connect, inspect or off"* ]]
+
+  # A manifest may tighten the machine default from audit to inspect ...
+  printf 'policy = "audited"\n' > "$AUTH_CONFIG_DIR/config.toml"
+  printf '[grants]\negress = "audit"\n' > "$AUTH_CONFIG_DIR/policies/audited.toml"
+  printf '[grants]\negress = "inspect"\n' > "$AUTH_PROJECT/.devbox.toml"
+  run_auth_grants
+  [[ "$output" == *"inspect devbox-"* ]]
+  # ... but not loosen an inspecting default to audit or open.
+  printf '[grants]\negress = "inspect"\n' > "$AUTH_CONFIG_DIR/policies/audited.toml"
+  for egress in audit open; do
+    printf '[grants]\negress = "%s"\n' "$egress" > "$AUTH_PROJECT/.devbox.toml"
+    run_auth_grants
+    [[ "$output" == *"inspect devbox-"* ]]
+  done
+  DEVBOX_CONFIG_DIR="$AUTH_CONFIG_DIR" run bash -c 'source "$1"; set +u
+    manifest_request_records "$(project_manifest "$2/.devbox.toml")" | tr "\0" "\n"' _ "$DEVBOX" "$AUTH_PROJECT"
+  [[ "$output" == *"egress|"*"egress = inspect"*"required by this machine's default policy"* ]]
+
+  printf '[grants]\negress = "sniff"\n' > "$AUTH_PROJECT/.devbox.toml"
+  run_auth_grants
+  [[ "$output" == *'egress must be "open", "audit" or "inspect"'* ]]
+  unset AUTH_CONFIG_DIR AUTH_PROJECT
+}
+
+@test "a kept box remembers inspection when re-entered without a flag" {
+  STORED_TRAFFIC=1 STORED_INSPECT=1 run_auth_grants
+  [[ "$output" == *"inspect devbox-"* ]]
+  STORED_TRAFFIC=1 STORED_INSPECT=0 run_auth_grants
+  [[ "$output" == *"clear-inspect"* && "$output" != *"inspect devbox-"* ]]
 }
 
 @test "policy convergence removes the copied API-key profile from a kept box" {
@@ -1334,7 +1381,7 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
 
 @test "traffic audit is explicit, proxy-or-fail, and removable from kept boxes" {
   source_text="$(<"$DEVBOX")"
-  [[ "$source_text" == *'--traffic-audit[=connect|off], -T'* ]]
+  [[ "$source_text" == *'--traffic-audit[=connect|inspect|off], -T'* ]]
   [[ "$source_text" == *'--traffic-audit|-T) traffic_audit=connect'* ]]
   [[ "$source_text" == *'--traffic-audit=*|-T=*) traffic_audit='* ]]
   [[ "$source_text" == *'ensure_guest_nftables'* ]]

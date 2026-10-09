@@ -47,6 +47,20 @@
 
   "diagnostics": { "max_file_bytes": 8388608 },
 
+  "inspect": {
+    "_comment": "Classifier for egress = \"inspect\" (docs/inspect-proxy.md). Every decrypted request from an inspected box is sent to this model; it can only block. provider: anthropic (Messages API) or openai (any Chat Completions endpoint, e.g. a local Ollama at http://127.0.0.1:11434/v1 with api_key_env \"\"). skip example: [{\"hosts\": [\"registry.npmjs.org\", \"*.pypi.org\"], \"methods\": [\"GET\", \"HEAD\"]}]. Restart the proxy after changing this section.",
+    "provider": "anthropic",
+    "model": "claude-haiku-4-5",
+    "api_key_env": "ANTHROPIC_API_KEY",
+    "base_url": "https://api.anthropic.com",
+    "timeout_seconds": 20,
+    "max_concurrency": 4,
+    "max_body_bytes": 65536,
+    "cache_seconds": 300,
+    "instructions": "",
+    "skip": []
+  },
+
   "routes": [
     {
       "_comment": "Anthropic / Claude — automatic mode. It prefers a host-side ANTHROPIC_API_KEY when configured, otherwise uses the host Claude Code OAuth login. The access token is read fresh on every request.",

@@ -102,6 +102,13 @@ It authorizes only public HTTP(S) destinations; the host proxy
 refuses loopback, private, link-local, and other non-global addresses to avoid
 becoming a path into host or LAN web services.
 
+With `egress = "inspect"`, each request decrypted inside an inspected tunnel is
+recorded like an AI-route request: method, path, query keys, and captured body,
+with source `traffic-inspect`. An `inspection` object adds the classifier's
+verdict, reason, provider, model, latency, and the `cached`, `skipped` and
+`error` fields. The tunnel itself is recorded as a `traffic-connect` event with
+action `inspected-connect`. See [inspecting egress proxy](inspect-proxy.md).
+
 CONNECT records have source `traffic-connect` and retain only destination
 host/port, status, timing, and request/response byte counts. HTTPS is still
 end-to-end encrypted after CONNECT, so Devbox cannot see its paths, headers,

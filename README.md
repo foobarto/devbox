@@ -370,6 +370,13 @@ pinning, or use non-web ports can fail or fall outside this coverage. The
 generic proxy accepts only public destinations, so it cannot be used to reach
 host loopback or private-network web services.
 
+`egress = "inspect"` (`--traffic-audit=inspect`) goes further. The guest
+trusts a Devbox CA, and the host proxy decrypts each web request and asks a
+configurable model (Claude Haiku by default; any OpenAI-compatible endpoint
+works) to allow or block it. It fails closed, and the model can only block. See
+[inspecting egress proxy](docs/inspect-proxy.md) for setup, cost and data
+handling.
+
 It is not part of the `agent` policy or `-a`. It is an egress
 guard for normal guest applications, not a containment boundary against a
 process that has guest root/sudo and can remove the guest firewall. See

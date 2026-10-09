@@ -141,6 +141,12 @@ detailed audit record. The generic capability cannot reach loopback, private,
 or link-local targets, preventing the proxy from becoming a route to host/LAN
 web services.
 
+`egress = "inspect"` (`--traffic-audit=inspect`) additionally installs a
+Devbox CA in the guest. The proxy then terminates the box's TLS, records each
+decrypted request, and forwards it only if the classifier configured under
+`inspect` in `proxy.config.json` answers `allow`. Any failure blocks the
+request. See [inspecting egress proxy](../docs/inspect-proxy.md).
+
 This is a guest egress guard, not a hostile-root containment system: a process
 with guest sudo/root can remove its nftables table, and non-web ports are not
 covered. Remove it from a kept box with `devbox --traffic-audit=off`. See the
