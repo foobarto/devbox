@@ -24,6 +24,9 @@
 #                               manage the shared host-side proxy
 #   devbox sessions [path|clear [--yes]] [DIR]
 #                               inspect or remove persistent AI session state
+#   devbox adopt NAME DIR
+#                               register an existing kept box (from an earlier
+#                               version) to the project directory it mounts
 #   devbox policy [list|show NAME]
 #                               list grant policies or show what one grants
 #   devbox --version|-V
@@ -79,9 +82,10 @@
 #   --with-creds, -c copy host AI-tool credential files into the box (OAuth
 #                    logins for claude/codex without a proxy). Best-effort.
 #   --with-agent-config, -g
-#                    copy selected non-secret Claude/Codex/OpenCode/Stado
-#                    configuration, prompts, rules, and custom agents. Any
-#                    file that looks like a credential is skipped.
+#                    copy selected non-secret Claude/Codex/OpenCode
+#                    settings through explicit field/value schemas. Free-form
+#                    prompts, hooks, unknown fields and config formats stay on
+#                    the host; use --copy for an explicit raw transfer.
 #   --gui, -G         open the Devbox shell through Waypipe so guest GUI apps
 #                    appear in the host Wayland session. With `-- APP`, run
 #                    just that GUI application instead of opening a shell.
@@ -123,7 +127,7 @@
 #   policy   = "agent"               optional grant-policy base (docs/policies.md)
 #   image  = "ubuntu-24.04"          shorthand, or the table form:
 #   [image]
-#   location = "/path/kali.qcow2"    template name, template://, *.yaml, *.qcow2, URL
+#   location = "/path/kali.qcow2"    template name, template://, *.qcow2, or image URL
 #   digest   = "sha512:…"            optional, for qcow2/URL images
 #   provision      = "…"             optional, root script baked into the golden
 #   provision_user = "…"             optional, user script baked into the golden
@@ -203,29 +207,14 @@ CRED_PATHS=(
   "$HOME/.config/stado"
 )
 
-# Non-secret agent configuration copied under --with-agent-config. This is
-# deliberately an allowlist: histories, sessions, caches, auth files, and
-# Stado's key directory never cross the VM boundary. Directories are expanded
-# to regular files one at a time, so a suspect file can be skipped safely.
+# Structured agent settings exported through explicit safe field/value schemas.
+# Free-form instructions, rules, hooks and plugin code need an explicit --copy
+# grant because their content cannot be classified as non-secret by its name.
 AGENT_CONFIG_PATHS=(
-  "$HOME/.claude/CLAUDE.md"
   "$HOME/.claude/settings.json"
   "$HOME/.claude/settings.local.json"
-  "$HOME/.claude/commands"
-  "$HOME/.claude/agents"
-  "$HOME/.claude/skills"
-  "$HOME/.claude/hooks"
-  "$HOME/.codex/AGENTS.md"
   "$HOME/.codex/config.toml"
-  "$HOME/.codex/rules"
-  "$HOME/.codex/hooks.json"
   "$HOME/.config/opencode/opencode.json"
-  "$HOME/.config/opencode/opencode.jsonc"
-  "$HOME/.config/opencode/commands"
-  "$HOME/.config/opencode/agents"
-  "$HOME/.config/opencode/plugins"
-  "$HOME/.config/stado/config.toml"
-  "$HOME/.config/stado/system-prompt.md"
 )
 
 # ------------------------------------------------------------------- output --
@@ -325,21 +314,100 @@ imgslug() { # stable short slug for an image spec (name or path/URL)
   esac
 }
 
+# A local image path names a file, not a string: record it absolutely so the
+# golden identity cannot match a different file run from another directory.
+normalize_image_arg() { # $1 --image value
+  case "$1" in
+    *://*|/*) printf '%s' "$1";;
+    */*|*.qcow2|*.img|*.raw|*.yaml|*.yml) abspath "$1";;
+    *) printf '%s' "$1";;
+  esac
+}
+
 # A golden is shared across every project using the same image, so anything that
-# changes what gets baked into it must change its identity. Otherwise a project
-# manifest could silently redefine — or poison — the golden another project
-# clones from. A stock image (no digest, no custom provisioning) hashes to
-# nothing and keeps its historical name, so existing goldens are not orphaned.
+# changes what gets baked into it must change its name. The name only separates
+# specifications; it never authorizes reuse — the identity record checked before
+# every clone holds the full specification. A stock image (no digest, no custom
+# provisioning) hashes to nothing and keeps its historical name.
 golden_spec_hash() { # $1 location $2 digest $3 provision $4 provision_user
   local digest="${2:-}" provision="${3:-}" provision_user="${4:-}"
   [[ -n "$digest$provision$provision_user" ]] || return 0
   printf '%s\0%s\0%s\0%s' "$1" "$digest" "$provision" "$provision_user" \
-    | sha1sum | cut -c1-6
+    | sha256sum | cut -c1-16
 }
 
 golden_name() { # $1 image [$2 spec hash]
-  local hash="${2:-}"
-  printf 'devbox-golden-%s%s' "$(imgslug "$1")" "${hash:+-$hash}"
+  local hash="${2:-}" slug
+  slug="$(imgslug "$1")"
+  # Lima places $LIMA_HOME/<name>/ssh.sock.<16 digits> in a UNIX socket path,
+  # which must stay under 104 bytes on macOS: keep customized names near 40.
+  [[ -z "$hash" ]] || slug="${slug:0:8}"
+  printf 'devbox-golden-%s%s' "$slug" "${hash:+-$hash}"
+}
+
+golden_identity() { # full normalized specification, independent of its short name
+  python3 - "$@" <<'PY'
+import json, sys
+location, digest, provision, provision_user = sys.argv[1:]
+print(json.dumps({"schema": 2, "bootstrap": "integrity-checked-v1", "location": location,
+                  "digest": digest, "provision": provision, "provision_user": provision_user},
+                 sort_keys=True))
+PY
+}
+
+identity_state() { # kind operation name [JSON]
+  local helper
+  helper="$(proxy_asset devbox-identities.py)" || die "identity helper not installed"
+  python3 "$helper" "$CONFIG_DIR" "$@"
+}
+
+require_golden_identity() { # $1 golden $2 identity [$3 image]
+  identity_state golden check "$1" "$2" || \
+    die "golden $1 has no verified identity from this version of Devbox, or its specification changed; rebuild it with: devbox build${3:+ --image $3} --force (remove goldens left by earlier versions with: devbox destroy --goldens)"
+}
+
+project_identity() {
+  python3 - "$1" <<'PY'
+import json, sys
+print(json.dumps({"schema": 1, "project": sys.argv[1]}))
+PY
+}
+
+require_instance_owner() {
+  identity_state project check "$1" "$(project_identity "$2")" || \
+    die "instance $1 is not registered to this project (created by an earlier Devbox?); if it is yours, run: devbox adopt $1 $2"
+  require_project_writable "$1" "$2"
+}
+
+record_instance_owner() { identity_state project write "$1" "$(project_identity "$2")"; }
+
+traffic_firewall_identity() {
+  python3 - "$1" <<'PY'
+import json, sys
+print(json.dumps({"schema": 1, "endpoint": sys.argv[1], "boot_policy": "systemd-v1"}))
+PY
+}
+
+record_traffic_firewall() { identity_state traffic write "$1" "$(traffic_firewall_identity "$2")"; }
+
+forget_instance_identity() {
+  case "$1" in
+    devbox-golden-*) identity_state golden remove "$1";;
+    *) identity_state project remove "$1"; identity_state traffic remove "$1";;
+  esac
+}
+
+cmd_adopt() { # explicit operator action; performs no VM/grant mutation
+  [[ $# -eq 2 ]] || die "usage: devbox adopt NAME DIR"
+  local name="$1" dir
+  [[ "$name" != devbox-golden-* ]] || die "goldens must be rebuilt, not adopted"
+  dir="$(abspath "$2")"
+  instance_exists "$name" || die "instance not found: $name"
+  [[ "$(session_mount_enabled "$name" "$dir")" == True ]] || \
+    die "$name does not mount $dir writable; pass the project directory the box was created for"
+  require_writable_mount_safe "$dir"
+  record_instance_owner "$name" "$dir"
+  log "Registered $name to $dir"
 }
 
 instance_name() { # deterministic per (image, absolute dir)
@@ -504,6 +572,11 @@ except (json.JSONDecodeError, KeyError, TypeError):
 '
 }
 
+disable_ssh_agent() { # $1 stopped instance; forwarding takes effect at its next boot
+  log "Disabling ungranted host SSH-agent forwarding"
+  limactl edit "$1" --set '.ssh.forwardAgent = false' >/dev/null
+}
+
 enable_ssh_agent() { # $1 instance; restart only when its persisted config changes
   local name="$1" status
   require_ssh_agent
@@ -625,6 +698,7 @@ containerd:
 mounts: []
 ssh:
   loadDotSSHPubKeys: false   # host pubkeys are not copied in; use --ssh-agent
+  forwardAgent: false        # repository-selected bases cannot grant the host agent
 provision:
 - mode: system
   script: |
@@ -758,14 +832,16 @@ provision:
     if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ] && ! command -v brew >/dev/null 2>&1; then
       brew_installer="$(mktemp)"
       curl --fail --silent --show-error --location --retry 3 \
-        https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh > "$brew_installer" \
+        https://raw.githubusercontent.com/Homebrew/install/8ab1549dfa1189fd4d818a2116592d8f0ee06d8c/install.sh > "$brew_installer" \
       || curl --fail --silent --show-error --location --retry 3 \
         --header 'Accept: application/vnd.github.raw' \
         --header 'X-GitHub-Api-Version: 2022-11-28' \
         --user-agent 'devbox-golden-homebrew' \
-        https://api.github.com/repos/Homebrew/install/contents/install.sh > "$brew_installer" \
-      || echo "devbox: could not fetch the Homebrew installer" >&2
-      [ -s "$brew_installer" ] && NONINTERACTIVE=1 /bin/bash "$brew_installer" || true
+        'https://api.github.com/repos/Homebrew/install/contents/install.sh?ref=8ab1549dfa1189fd4d818a2116592d8f0ee06d8c' > "$brew_installer" \
+      || { rm -f "$brew_installer"; echo "devbox: could not fetch the Homebrew installer" >&2; exit 1; }
+      printf '%s  %s\n' '5f333bbe53bc490e51e7ccb1df8779b3dd6ee73a1a7379efda216edb08ccb148' "$brew_installer" | sha256sum --check --status \
+        || { rm -f "$brew_installer"; echo "devbox: Homebrew installer checksum mismatch" >&2; exit 1; }
+      NONINTERACTIVE=1 /bin/bash "$brew_installer"
       rm -f "$brew_installer"
     fi
     BREW="$(command -v brew || echo /home/linuxbrew/.linuxbrew/bin/brew)"
@@ -780,7 +856,7 @@ provision:
     # --- AI CLIs, terminal agent multiplexer, and GitHub CLI ---
     brew install codex || true
     brew install gh || true
-    brew install sst/tap/opencode || curl -fsSL https://opencode.ai/install | bash || true
+    brew install sst/tap/opencode || true
     # Pi Coding Agent is distributed through npm.  The package does not need
     # lifecycle scripts for normal use, so keep third-party install hooks off.
     command -v npm >/dev/null 2>&1 || brew install node || true
@@ -788,15 +864,12 @@ provision:
       npm install -g --ignore-scripts @earendil-works/pi-coding-agent || true
     # Herdr is a standalone terminal agent multiplexer.
     command -v herdr >/dev/null 2>&1 || brew install herdr || true
-    # stado — Homebrew cask (installs on Linux for this binary cask). Fallback to
-    # a Go source install only if the cask ever fails (installs go on demand).
+    # Package managers verify downloaded artifact checksums. Do not substitute
+    # mutable remote shell scripts or unversioned source builds on failure.
     if ! command -v stado >/dev/null 2>&1; then
-      brew install --cask foobarto/tap/stado \
-        || { brew install go && GOBIN="$HOME/.local/bin" go install github.com/foobarto/stado/cmd/stado@latest; } \
-        || true
+      brew install --cask foobarto/tap/stado || true
     fi
-    # claude code — official native installer (-> ~/.local/bin)
-    command -v claude >/dev/null 2>&1 || { curl -fsSL https://claude.ai/install.sh | bash || true; }
+    command -v claude >/dev/null 2>&1 || brew install --cask claude-code || true
 YAML
   } > "$out"
 }
@@ -973,23 +1046,17 @@ traffic_proxy_state_path() { # $1 Lima instance name
 }
 
 record_traffic_proxy_endpoint() { # $1 Lima instance $2 bare http proxy URL
-  local name="$1" url="$2" state_dir path tmp
+  local name="$1" url="$2" launcher
   valid_gh_proxy_endpoint "$url" || die "traffic proxy URL must be a bare http://host:port URL"
-  path="$(traffic_proxy_state_path "$name")"
-  state_dir="$(dirname "$path")"
-  umask 077
-  install -d -m 700 "$state_dir"
-  tmp="$(mktemp "$state_dir/.${name}.XXXXXX")"
-  printf '%s\n' "$url" > "$tmp"
-  chmod 600 "$tmp"
-  mv -f "$tmp" "$path"
+  launcher="$(proxy_launcher)" || die "proxy launcher not found"
+  DEVBOX_PROXY_STATE_DIR="$(proxy_state_dir)" "$launcher" --register-traffic-proxy-box "$name" "$url"
 }
 
 stored_traffic_proxy_endpoint() { # $1 Lima instance; prints host-owned remembered endpoint
   local path value
   path="$(traffic_proxy_state_path "$1")"
   [[ -r "$path" ]] || return 1
-  value="$(<"$path")"
+  IFS= read -r value < "$path"
   # Normalized on read too: older versions remembered port-less endpoints.
   if ! value="$(proxy_endpoint "$value")"; then
     warn "ignoring invalid remembered traffic proxy endpoint for $1"
@@ -999,23 +1066,17 @@ stored_traffic_proxy_endpoint() { # $1 Lima instance; prints host-owned remember
 }
 
 clear_traffic_proxy_endpoint() { # $1 Lima instance
-  rm -f -- "$(traffic_proxy_state_path "$1")"
+  local launcher
+  launcher="$(proxy_launcher)" || die "proxy launcher not found"
+  DEVBOX_PROXY_STATE_DIR="$(proxy_state_dir)" "$launcher" --revoke-traffic-proxy-token "$1" || return
+  identity_state traffic remove "$1"
 }
 
 record_gh_proxy_endpoint() { # $1 Lima instance $2 bare http proxy URL
-  local name="$1" url="$2" state_dir path tmp
+  local name="$1" url="$2" launcher
   valid_gh_proxy_endpoint "$url" || die "GitHub CLI proxy URL must be a bare http://host:port URL"
-  path="$(gh_proxy_state_path "$name")"
-  state_dir="$(dirname "$path")"
-  umask 077
-  install -d -m 700 "$state_dir"
-  tmp="$(mktemp "$state_dir/.${name}.XXXXXX")"
-  # The second line marks an explicit --gh-proxy grant. Versions before the
-  # AI/GitHub split registered every --proxy box for GitHub without one; those
-  # registrations are not renewed or refreshed (see stored_gh_proxy_endpoint).
-  printf '%s\n%s\n' "$url" "$GH_PROXY_GRANT_MARKER" > "$tmp"
-  chmod 600 "$tmp"
-  mv -f "$tmp" "$path"
+  launcher="$(proxy_launcher)" || die "proxy launcher not found"
+  DEVBOX_PROXY_STATE_DIR="$(proxy_state_dir)" "$launcher" --register-gh-proxy-box "$name" "$url"
 }
 
 GH_PROXY_GRANT_MARKER="grant=gh_proxy"
@@ -1038,7 +1099,9 @@ stored_gh_proxy_endpoint() { # $1 Lima instance; prints host-owned remembered en
 }
 
 clear_gh_proxy_endpoint() { # $1 Lima instance
-  rm -f -- "$(gh_proxy_state_path "$1")"
+  local launcher
+  launcher="$(proxy_launcher)" || die "proxy launcher not found"
+  DEVBOX_PROXY_STATE_DIR="$(proxy_state_dir)" "$launcher" --revoke-gh-proxy-token "$1"
 }
 
 # The per-box AI-route capability lives only in this owner-only host file;
@@ -1074,7 +1137,7 @@ write_gh_proxy_url() { # $1 Lima instance $2 full capability-bearing proxy URL
 renew_gh_proxy_capability() { # $1 Lima instance $2 bare http proxy URL
   local name="$1" url="$2" launcher gh_proxy_token gh_proxy_url
   launcher="$(proxy_launcher)" || { warn "GitHub CLI proxy launcher not found"; return 1; }
-  gh_proxy_token="$("$launcher" --new-gh-proxy-token)" || {
+  gh_proxy_token="$("$launcher" --new-gh-proxy-token "$name")" || {
     warn "could not renew GitHub CLI proxy capability"
     return 1
   }
@@ -1098,7 +1161,7 @@ proxy_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/nul
 # long-lived daemon, so an upgrade leaves the old one serving until something
 # restarts it; bump this marker whenever an older daemon would be unsafe or
 # incompatible with this devbox (e.g. a CA it can no longer deliver).
-PROXY_REQUIRED_FEATURE="gh-explicit-grant"
+PROXY_REQUIRED_FEATURE="safe-request-diagnostics"
 proxy_current_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -qw -- "$PROXY_REQUIRED_FEATURE"; }
 # is anything at all listening on the port?
 proxy_port_open() {
@@ -1165,15 +1228,25 @@ proxy_ensure() {
     return 1
   fi
   launcher="$(proxy_launcher)" || { warn "proxy launcher not found — start it manually (devbox-ai-proxy)"; return 0; }
-  mkdir -p "$CONFIG_DIR"; logf="$CONFIG_DIR/proxy.log"
+  install -d -m 700 "$CONFIG_DIR"; logf="$CONFIG_DIR/proxy.log"
   [[ -f "$CONFIG_DIR/api-keys.env" || -f "$CONFIG_DIR/proxy.config.json" || -f "$HOME/.claude/.credentials.json" ]] \
     || warn "no Anthropic key or host Claude login found — configure ~/.config/devbox/api-keys.env or run 'claude login'"
   log "Starting credential proxy on :$port  ($launcher)"
   setsid "$launcher" >"$logf" 2>&1 </dev/null &
   echo $! > "$CONFIG_DIR/proxy.pid"
-  for i in $(seq 1 20); do proxy_health "$port" && break; sleep 0.2; done
-  if proxy_health "$port"; then log "credential proxy up (pid $(cat "$CONFIG_DIR/proxy.pid" 2>/dev/null), log: $logf)"
-  else warn "proxy did not come up — see $logf"; return 1; fi
+  for i in $(seq 1 20); do proxy_current_health "$port" && break; sleep 0.2; done
+  if proxy_current_health "$port"; then
+    log "credential proxy up (pid $(cat "$CONFIG_DIR/proxy.pid" 2>/dev/null), log: $logf)"
+  else
+    if proxy_health "$port"; then warn "started proxy is missing required feature: $PROXY_REQUIRED_FEATURE"
+    else
+      warn "proxy did not come up — see $logf"
+      # Surface the reason (for example an api-keys.env that must be chmod 600).
+      [[ ! -s "$logf" ]] || tail -n 3 -- "$logf" | sed 's/^/[devbox]   /' >&2
+    fi
+    proxy_stop_process || true
+    return 1
+  fi
 }
 
 # --proxy and --gh-proxy are separate grants with separate trust boundaries:
@@ -1356,6 +1429,7 @@ apply_gh_proxy() { # $1 Lima instance $2 bare http proxy URL
   # proxy. It receives a dummy token only; the host proxy replaces that marker
   # after TLS termination with the token from the host's `gh auth login`.
   "$launcher" --init-gh-ca >/dev/null || die "could not initialise GitHub CLI proxy certificate"
+  record_gh_proxy_endpoint "$name" "$url" || die "could not register GitHub proxy grant"
   ca_path="$(proxy_state_dir)/gh-proxy-ca.pem"
   [[ -r "$ca_path" ]] || die "GitHub CLI proxy CA was not created: $ca_path"
   gh_wrapper="$(proxy_asset gh-wrapper.py)" || die "GitHub CLI proxy wrapper not found"
@@ -1409,14 +1483,26 @@ gh() {
 export DEVBOX_GH_PROXY_URL_FILE="\$HOME/.devbox/gh-proxy/proxy-url"
 export DEVBOX_GH_PROXY_CERT_DIR="\$HOME/.devbox/gh-proxy/certs"
 EOF
-  record_gh_proxy_endpoint "$name" "$url"
 }
 
 apply_api_keys() {
-  local name="$1" file="$2"
-  [[ -f "$file" ]] || { warn "api-keys file not found: $file (skipping)"; return 0; }
-  log "Injecting API keys from $file"
-  limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-20-keys.sh >/dev/null' < "$file"
+  local name="$1" file="$2" temporary=""
+  if [[ -n "${_DB_INPUT_SNAPSHOT:-}" ]]; then
+    file="$(host_files api-path "$_DB_INPUT_SNAPSHOT")" || die "could not read approved API-key snapshot"
+    [[ -n "$file" ]] || { warn "no approved API-key snapshot (skipping)"; return 0; }
+  else
+    [[ -e "$file" || -L "$file" ]] || { warn "api-keys file not found: $file (skipping)"; return 0; }
+    temporary="$(new_host_snapshot)" || die "could not create API-key snapshot"
+    if ! host_files snapshot "$temporary" api "$file" ""; then
+      rm -rf -- "$temporary"; die "could not safely snapshot API-key input"
+    fi
+    file="$(host_files api-path "$temporary")"
+  fi
+  log "Injecting approved API-key snapshot"
+  local result=0
+  limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-20-keys.sh >/dev/null' < "$file" || result=$?
+  [[ -z "$temporary" ]] || rm -rf -- "$temporary"
+  return "$result"
 }
 
 clear_gh_proxy() { # $1 Lima instance; remove GitHub CLI proxying only
@@ -1515,19 +1601,34 @@ apply_connect_traffic_firewall() { # $1 Lima instance $2 proxy hostname $3 port
   if ! [[ "$proxy_port" =~ ^[1-9][0-9]{0,4}$ ]] || (( proxy_port > 65535 )); then
     die "invalid traffic proxy port: $proxy_port"
   fi
-  # The proxy endpoint is the only direct web exception. Resolve its IPv4
-  # address inside the guest so Lima's host DNS name works with all tools.
+  # Persist a DNS-independent base policy before changing runtime state. The
+  # boot unit gates supported network services so a reboot cannot open web
+  # egress while the host CLI is still refreshing profiles and capabilities.
   limactl shell "$name" -- bash -s -- "$proxy_host" "$proxy_port" <<'EOF'
 set -euo pipefail
 proxy_host="$1"
 proxy_port="$2"
+[ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 \
+  || { echo "persistent traffic audit requires a systemd guest" >&2; exit 1; }
+command -v nft >/dev/null 2>&1 && command -v flock >/dev/null 2>&1 \
+  || { echo "persistent traffic audit requires nftables and flock" >&2; exit 1; }
+network_units=(NetworkManager.service systemd-networkd.service networking.service wicked.service wickedd.service ifup@.service)
+recognized=0
+for unit in "${network_units[@]}"; do
+  if [ "$(systemctl show "$unit" --property=LoadState --value 2>/dev/null)" = loaded ]; then
+    recognized=1
+  fi
+done
+[ "$recognized" -eq 1 ] \
+  || { echo "persistent traffic audit requires a supported systemd network service" >&2; exit 1; }
 proxy_ip="$(getent ahostsv4 "$proxy_host" | awk 'NR == 1 { print $1}')"
 [[ "$proxy_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || {
   printf 'could not resolve an IPv4 address for Devbox traffic proxy %s\n' "$proxy_host" >&2
   exit 1
 }
-sudo nft delete table inet devbox_traffic_audit 2>/dev/null || true
-sudo nft -f - <<RULES
+stage="$(mktemp -d)"
+trap 'rm -rf -- "$stage"' EXIT
+cat > "$stage/rules" <<RULES
 table inet devbox_traffic_audit {
   chain output {
     type filter hook output priority 0; policy accept;
@@ -1539,22 +1640,115 @@ table inet devbox_traffic_audit {
   }
 }
 RULES
+cat > "$stage/apply" <<'APPLY'
+#!/bin/bash
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+exec 9>/run/devbox-traffic-audit.lock
+flock 9
+rules="$(mktemp /run/devbox-traffic-audit.XXXXXXXX)"
+trap 'rm -f -- "$rules"' EXIT
+# Only prepend a delete when the table exists. Delete and recreate occur in
+# one checked netlink transaction; neither boot nor refresh opens a gap.
+if nft list table inet devbox_traffic_audit >/dev/null 2>&1; then
+  printf '%s\n' 'delete table inet devbox_traffic_audit' > "$rules"
+fi
+cat /etc/devbox/traffic-audit.nft >> "$rules"
+nft -c -f "$rules"
+nft -f "$rules"
+APPLY
+cat > "$stage/unit" <<'UNIT'
+[Unit]
+Description=Devbox persistent direct-web deny policy
+DefaultDependencies=no
+After=local-fs.target nftables.service ufw.service firewalld.service
+Before=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/devbox-traffic-audit
+
+[Install]
+WantedBy=network-pre.target
+UNIT
+cat > "$stage/dependency" <<'DEPENDENCY'
+[Unit]
+Requires=devbox-traffic-audit.service
+After=devbox-traffic-audit.service
+DEPENDENCY
+sudo install -d -o root -g root -m 755 /etc/devbox /usr/local/libexec /etc/systemd/system
+install_atomic() {
+  local temporary
+  temporary="$(sudo mktemp "$2.XXXXXXXX")"
+  sudo install -o root -g root -m "$3" -- "$1" "$temporary"
+  sudo mv -f -- "$temporary" "$2"
+}
+# Validate first, apply live second, and only then make boot depend on the
+# guard: a ruleset this kernel rejects must never reach the boot path, where a
+# failing guard would keep the network units from starting at all.
+sudo nft -c -f "$stage/rules"
+install_atomic "$stage/rules" /etc/devbox/traffic-audit.nft 600
+install_atomic "$stage/apply" /usr/local/libexec/devbox-traffic-audit 755
+sudo /usr/local/libexec/devbox-traffic-audit
+install_atomic "$stage/unit" /etc/systemd/system/devbox-traffic-audit.service 644
+sudo systemctl daemon-reload
+sudo systemctl enable devbox-traffic-audit.service
+for unit in "${network_units[@]}"; do
+  parent="/etc/systemd/system/$unit.d"
+  sudo install -d -o root -g root -m 755 "$parent"
+  install_atomic "$stage/dependency" "$parent/10-devbox-traffic-audit.conf" 644
+done
+sudo systemctl daemon-reload
 EOF
+}
+
+persist_kept_traffic_audit() { # $1 running kept instance $2 remembered endpoint
+  local name="$1" url="$2" parts proxy_host proxy_port
+  parts="$(traffic_proxy_endpoint_parts "$url")" || die "could not parse remembered traffic proxy endpoint"
+  IFS=$'\t' read -r proxy_host proxy_port <<< "$parts"
+  log "Persisting $name's direct-web deny policy across guest restarts"
+  ensure_guest_nftables "$name" || die "could not install nftables in the audited guest"
+  apply_connect_traffic_firewall "$name" "$proxy_host" "$proxy_port" \
+    || die "could not persist direct-web deny policy in $name; re-enter to retry, or recreate the box"
+  record_traffic_firewall "$name" "$url" || die "could not record persistent traffic policy"
 }
 
 clear_connect_traffic_audit() { # $1 Lima instance
   local name="$1"
   log "Removing proxy-or-fail traffic audit from $name"
   clear_traffic_proxy_endpoint "$name"
-  limactl shell "$name" -- bash -c \
-    'sudo rm -f /etc/profile.d/zz-devbox-30-traffic-audit.sh; command -v nft >/dev/null 2>&1 && sudo nft delete table inet devbox_traffic_audit 2>/dev/null || true'
+  limactl shell "$name" -- bash -s <<'EOF'
+set -euo pipefail
+# Withdraw Requires edges before stopping the guard. Otherwise systemd can
+# propagate its stop into the network manager and disconnect this SSH session.
+for unit in NetworkManager.service systemd-networkd.service networking.service wicked.service wickedd.service ifup@.service; do
+  sudo rm -f -- "/etc/systemd/system/$unit.d/10-devbox-traffic-audit.conf"
+  sudo rmdir -- "/etc/systemd/system/$unit.d" 2>/dev/null || true
+done
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+  sudo systemctl daemon-reload
+  sudo systemctl disable --now devbox-traffic-audit.service 2>/dev/null || true
+fi
+sudo rm -f -- /etc/profile.d/zz-devbox-30-traffic-audit.sh \
+  /etc/devbox/traffic-audit.nft /usr/local/libexec/devbox-traffic-audit \
+  /etc/systemd/system/devbox-traffic-audit.service \
+  /etc/systemd/system/network-pre.target.wants/devbox-traffic-audit.service
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then sudo systemctl daemon-reload; fi
+# Disable is intentional policy removal; do not flush unrelated nft tables.
+if command -v nft >/dev/null 2>&1; then
+  sudo nft delete table inet devbox_traffic_audit 2>/dev/null || true
+fi
+EOF
 }
 
 apply_connect_traffic_audit() { # $1 Lima instance $2 bare host proxy URL
   local name="$1" url="$2" launcher traffic_proxy_token traffic_url parts proxy_host proxy_port
   valid_gh_proxy_endpoint "$url" || die "traffic proxy URL must be a bare http://host:port URL"
   launcher="$(proxy_launcher)" || die "traffic proxy launcher not found"
-  traffic_proxy_token="$("$launcher" --new-traffic-proxy-token)" || \
+  record_traffic_proxy_endpoint "$name" "$url" || die "could not register traffic proxy grant"
+  traffic_proxy_token="$("$launcher" --new-traffic-proxy-token "$name")" || \
     die "could not issue traffic proxy capability"
   [[ "$traffic_proxy_token" == *.* ]] || die "traffic proxy returned an invalid capability"
   traffic_url="$(printf '%s' "$traffic_proxy_token" | traffic_proxy_url "$url")" || \
@@ -1566,6 +1760,7 @@ apply_connect_traffic_audit() { # $1 Lima instance $2 bare host proxy URL
   ensure_guest_nftables "$name" || die "could not install nftables in $name"
   apply_connect_traffic_firewall "$name" "$proxy_host" "$proxy_port" || \
     die "could not block direct web egress in $name"
+  record_traffic_firewall "$name" "$url" || die "could not record persistent traffic policy"
   # This is a short-lived network capability, not a host credential. It must
   # be readable by guest applications through their login-shell profile;
   # applications which ignore it still hit the direct-port firewall and fail.
@@ -1588,7 +1783,6 @@ for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy
     print(f"export {key}={quoted}")
 print(f"export NO_PROXY={no_proxy} no_proxy={no_proxy}")
 ' "$proxy_host" | limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-30-traffic-audit.sh >/dev/null'
-  record_traffic_proxy_endpoint "$name" "$url"
 }
 
 # ------------------------------------------------------------ GUI / Waypipe ---
@@ -1695,6 +1889,26 @@ run_gui_shell() { # $1 Lima instance $2 guest workdir
 require_mountable_path() { # $1 resolved host path
   [[ "$1" != *[:,]* ]] || die "cannot mount a host path containing ':' or ',': $1"
 }
+
+# A guest that can write Devbox's own state could forge golden and project
+# identity records, approvals, proxy registrations and keys. Refuse a writable
+# mount that contains the home directory, or that contains or lies inside any
+# of that state.
+require_writable_mount_safe() { # $1 host path mounted writable into a guest
+  python3 - "$1" "$HOME" "$CONFIG_DIR" "$(proxy_state_dir)" "$MANIFEST_APPROVAL_DIR" "$AGENT_SESSION_BASE" <<'PY' \
+    || die "refusing to mount $1 writable: it contains the home directory, or contains or lies inside Devbox host state; mount a project directory instead"
+import os, sys
+mount = os.path.realpath(os.path.abspath(os.path.expanduser(sys.argv[1])))
+home, *state = sys.argv[2:]
+for index, protected in enumerate([home, *state]):
+    if not protected:
+        continue
+    protected = os.path.realpath(os.path.abspath(os.path.expanduser(protected)))
+    common = os.path.commonpath((mount, protected))
+    if common == mount or (index > 0 and common == protected):
+        sys.exit(1)
+PY
+}
 _mount_spec_path() { # PATH[:ro|:rw] -> resolved host path
   local spec="$1"
   case "$spec" in *:rw|*:ro) spec="${spec%:*}";; esac
@@ -1702,7 +1916,8 @@ _mount_spec_path() { # PATH[:ro|:rw] -> resolved host path
 }
 # Resolved PATH[:ro|:rw] -> a Lima --mount value (bare = read-only, :w suffix =
 # writable). Callers pass paths already resolved and checked by
-# require_mountable_path, so a symlink swapped afterwards cannot change them.
+# require_mountable_path. The caller also validates source/ancestor identity
+# before and after handing these path strings to Lima.
 _lima_mount_arg() {
   local spec="$1"
   case "$spec" in
@@ -1739,106 +1954,251 @@ case "$1" in
   *) mkdir -p -- "$parent" ;;
 esac'
 
+# All host grant reads use a descriptor-only helper. Snapshots live outside
+# guest mounts and are created before the guest boots or resumes.
+host_files() {
+  local helper
+  helper="$(proxy_asset devbox-host-files.py)" || die "host file helper is missing from this Devbox installation"
+  python3 "$helper" "$@"
+}
+new_host_snapshot() {
+  # Ignore TMPDIR: it can point inside the project's guest-writable mount.
+  # Resolve macOS's /tmp alias before no-follow descriptor traversal.
+  python3 -c 'import os,tempfile; print(os.path.realpath(tempfile.mkdtemp(prefix="devbox-inputs.", dir="/tmp")))'
+}
+verify_host_snapshot_isolation() { # $1.. actual/planned host mount paths
+  host_files snapshot-check "$_DB_INPUT_SNAPSHOT" "$@"
+}
+
+cleanup_host_inputs() {
+  [[ -z "${_DB_INPUT_SNAPSHOT:-}" ]] || rm -rf -- "$_DB_INPUT_SNAPSHOT"
+  _DB_INPUT_SNAPSHOT=""
+}
+prepare_host_inputs() {
+  # cmd_run's resolved grant variables are visible through Bash dynamic scope.
+  cleanup_host_inputs
+  _DB_INPUT_SNAPSHOT="$(new_host_snapshot)" || die "could not create host input snapshot"
+  verify_host_snapshot_isolation "$@" || { cleanup_host_inputs; die "host input snapshots overlap a guest mount"; }
+  local requests=() path relative spec api_snapshot=""
+  if [[ -n "$api_keys" ]]; then
+    if [[ -e "$api_keys" || -L "$api_keys" ]]; then
+      # Resolve operator-named links once (dotfile managers, macOS /tmp); the
+      # snapshot then walks the resolved path without following links.
+      requests+=(api "$(abspath "$api_keys")" "")
+    else
+      warn "api-keys file not found: $api_keys (skipping)"
+    fi
+  fi
+  if [[ $with_creds -eq 1 ]]; then
+    for path in "${CRED_PATHS[@]}"; do
+      [[ -e "$path" || -L "$path" ]] || continue
+      case "$path" in "$HOME/"*) relative="${path#"$HOME"/}";; *) continue;; esac
+      requests+=(credentials "$(abspath "$path")" "$relative")
+    done
+  fi
+  if [[ $with_agent_config -eq 1 ]]; then
+    for path in "${AGENT_CONFIG_PATHS[@]}"; do
+      [[ -e "$path" || -L "$path" ]] || continue
+      case "$path" in "$HOME/"*) relative="${path#"$HOME"/}";; *) continue;; esac
+      requests+=(config "$(abspath "$path")" "$relative")
+    done
+  fi
+  for spec in "${extra_copies[@]}"; do
+    path="$(_copy_src "$spec")"
+    [[ -e "$path" || -L "$path" ]] || { warn "--copy source not found: $path"; continue; }
+    requests+=(copy "$(abspath "$path")" "$(_copy_dest "$spec")")
+  done
+  # Content another guest can write is not a host grant. foreign_writable_roots
+  # (cmd_run) lists the writable mounts of every other stored Lima instance.
+  local grant_sources=() index
+  for ((index = 1; index < ${#requests[@]}; index += 3)); do grant_sources+=("${requests[index]}"); done
+  if [[ ${#grant_sources[@]} -gt 0 ]]; then
+    python3 - "$_DB_INPUT_SNAPSHOT/grant-policy.json" "${#grant_sources[@]}" \
+      "${grant_sources[@]}" ${foreign_writable_roots[@]+"${foreign_writable_roots[@]}"} <<'PY' || { cleanup_host_inputs; die "could not record host grant sources"; }
+import json, os, sys
+path, count, *paths = sys.argv[1:]
+count = int(count)
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, "w") as stream:
+    json.dump({"sources": [], "writable_roots": [], "grant_sources": paths[:count],
+               "foreign_writable_roots": paths[count:]}, stream)
+PY
+    if ! host_files mount-policy "$_DB_INPUT_SNAPSHOT/grant-policy.json"; then
+      cleanup_host_inputs
+      die "a host grant source is writable by another Lima instance; copy it elsewhere first"
+    fi
+  fi
+  if ! host_files snapshot "$_DB_INPUT_SNAPSHOT" "${requests[@]}"; then
+    cleanup_host_inputs
+    die "host grant inputs could not be safely snapshotted"
+  fi
+  api_snapshot="$(host_files api-path "$_DB_INPUT_SNAPSHOT")" || die "could not read API-key snapshot index"
+  # Even a missing input must never be revisited after the guest starts.
+  [[ -z "$api_keys" ]] || api_keys="${api_snapshot:-$_DB_INPUT_SNAPSHOT/no-api-key}"
+}
+prepare_mount_identities() { # $1 owner-only output file; $2.. canonical sources
+  host_files mount-capture "$@"
+}
+verify_mount_identities() { # $1 identity file; caller stops/removes guest on failure
+  host_files mount-check "$1"
+}
+
+guest_mount_paths() { # all stored VM mounts; reject unreadable state
+  local args=()
+  [[ -z "${1:-}" ]] || args+=("$1")
+  limactl list "${args[@]}" --json | python3 -c '
+import json, os, sys
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    item = json.loads(line)
+    for mount in item.get("config", {}).get("mounts", []):
+        path = mount["location"]
+        if not isinstance(path, str) or "\n" in path or "\0" in path:
+            raise SystemExit("invalid stored mount")
+        print(os.path.abspath(os.path.expanduser(path)))
+'
+}
+
+guest_writable_mount_paths() { # [$1 instance to leave out]
+  limactl list --json | python3 -c '
+import json, os, sys
+excluded = sys.argv[1] if len(sys.argv) > 1 else ""
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    item = json.loads(line)
+    if excluded and item.get("name") == excluded:
+        continue
+    for mount in item.get("config", {}).get("mounts", []):
+        if mount.get("writable") is not True:
+            continue
+        path = mount["location"]
+        if not isinstance(path, str) or "\n" in path or "\0" in path:
+            raise SystemExit("invalid stored writable mount")
+        print(os.path.abspath(os.path.expanduser(path)))
+' "$@"
+}
+
+require_mounts_unchanged() { # stop a guest immediately if a captured path changed
+  if ! (verify_mount_identities "$_DB_MOUNT_IDENTITY"); then
+    limactl stop -f "$1" 2>/dev/null || true
+    revoke_proxy_grants "$1" || warn "could not revoke every proxy grant; check host proxy state"
+    die "approved mount source changed; guest stopped, verify paths before retrying"
+  fi
+}
+
+revoke_proxy_grants() { # attempt every revocation even when one fails
+  local result=0
+  (revoke_ai_proxy_token "$1") || result=1
+  (clear_gh_proxy_endpoint "$1") || result=1
+  (clear_traffic_proxy_endpoint "$1") || result=1
+  return "$result"
+}
+
+cleanup_early_run() { # a failed clone/setup must not leave a destination behind
+  local rc=$?
+  trap - EXIT INT TERM
+  if [[ -n "${_DB_EARLY_CREATED:-}" ]]; then
+    limactl stop -f "$_DB_EARLY_CREATED" 2>/dev/null || true
+    revoke_proxy_grants "$_DB_EARLY_CREATED" || warn "could not revoke every proxy grant"
+    if limactl delete -f "$_DB_EARLY_CREATED" 2>/dev/null; then
+      forget_instance_identity "$_DB_EARLY_CREATED" || true
+    fi
+  fi
+  cleanup_host_inputs
+  exit "$rc"
+}
+
+transfer_host_snapshots() { # $1 instance $2 snapshot root $3 category [$4 source]
+  local name="$1" root="$2" category="$3" kind file dest entries result=0
+  entries="$(umask 077; mktemp "$root/entries.XXXXXXXX")" || return 1
+  if ! host_files entries "$root" "$category" "${@:4}" > "$entries"; then
+    rm -f -- "$entries"; return 1
+  fi
+  while IFS= read -r -d '' kind && IFS= read -r -d '' file && IFS= read -r -d '' dest; do
+    # A literal ~ is guest HOME when supplied as an argument.
+    # shellcheck disable=SC2088
+    case "$dest" in "~") dest=".";; "~/"*) dest="${dest#"~/"}";; esac
+    if ! limactl shell "$name" -- bash -c "$_COPY_PREPARE_PARENT" _ "$dest" </dev/null; then
+      result=1; break
+    fi
+    if [[ "$kind" == directory ]]; then
+      # shellcheck disable=SC2016 # Variables are expanded by the guest.
+      if ! limactl shell "$name" -- bash -c 'cd && mkdir -p -- "$1" && tar -C "$1" --no-overwrite-dir -xf -' _ "$dest" < "$file"; then
+        result=1; break
+      fi
+    else
+      if ! limactl copy "$file" "$name:$dest"; then result=1; break; fi
+      # Snapshots are owner-read-only; normal guest configs must be writable.
+      # shellcheck disable=SC2016
+      if ! limactl shell "$name" -- bash -c 'cd && chmod u+rw -- "$1"' _ "$dest" </dev/null; then
+        result=1; break
+      fi
+    fi
+  done < "$entries"
+  rm -f -- "$entries"
+  return "$result"
+}
+
 apply_copy() {
-  local name="$1" spec="$2" src dest
+  local name="$1" spec="$2" src dest temporary="" root="${_DB_INPUT_SNAPSHOT:-}"
   src="$(_copy_src "$spec")"; dest="$(_copy_dest "$spec")"
-  [[ -e "$src" ]] || { warn "--copy source not found: $src"; return 0; }
-  # The named source itself is resolved (the operator named it). Say so when
-  # it is a link: a kept box can replace a project path with one.
-  [[ ! -L "$src" ]] || warn "--copy source $src is a symlink to $(abspath "$src")"
-  src="$(abspath "$src")"
-  # A literal ~ is not expanded once DEST is an argument; it means $HOME.
-  # shellcheck disable=SC2088 # The literal ~ is matched, not expanded.
-  case "$dest" in "~") dest=".";; "~/"*) dest="${dest#"~/"}";; esac
-  log "Copying $src → $name:$dest"
-  limactl shell "$name" -- bash -c "$_COPY_PREPARE_PARENT" _ "$dest" </dev/null 2>/dev/null || true
-  if [[ ! -d "$src" ]]; then
-    limactl copy "$src" "$name:$dest" 2>/dev/null || warn "copy failed: $src → $dest"
-    return 0
+  if [[ -z "$root" ]]; then
+    [[ -e "$src" || -L "$src" ]] || { warn "--copy source not found: $src"; return 0; }
+    temporary="$(new_host_snapshot)" || die "could not create copy snapshot"
+    if ! host_files snapshot "$temporary" copy "$src" "$dest"; then
+      rm -rf -- "$temporary"; die "could not safely snapshot copy input"
+    fi
+    root="$temporary"
   fi
-  # Directories are streamed through tar rather than `limactl copy -r`: Lima
-  # falls back to scp when either side lacks rsync, and scp follows symlinks.
-  # A guest that can write into a copied directory (a project subdirectory on
-  # a kept box) could then plant a link and have the next run copy that host
-  # file or directory into the box. tar stores links as links. The contents
-  # are merged into DEST, so a repeated copy never nests DEST/SRC.
-  # macOS bsdtar would otherwise add AppleDouble `._*` files and extended
-  # attribute headers the guest's GNU tar warns about. --no-overwrite-dir keeps
-  # an existing DEST's (or $HOME's) own mode and times.
-  local tar_create=(tar)
-  if tar --version 2>/dev/null | grep -q bsdtar; then
-    tar_create=(env COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs)
-  fi
-  # shellcheck disable=SC2016 # Expanded by the guest shell.
-  if ! "${tar_create[@]}" -C "$src" -cf - . \
-      | limactl shell "$name" -- bash -c 'cd && mkdir -p -- "$1" && tar -C "$1" --no-overwrite-dir -xf -' _ "$dest"; then
-    warn "copy failed: $src → $dest"
-  fi
+  log "Copying approved snapshot → $name:$dest (raw content, including any secrets)"
+  local result=0
+  transfer_host_snapshots "$name" "$root" copy "$src" || result=$?
+  [[ -z "$temporary" ]] || rm -rf -- "$temporary"
+  [[ $result -eq 0 ]] || die "could not copy $src → $name:$dest"
 }
 
 apply_creds() {
-  local name="$1" p rel copied=0 rflag=()
-  log "Copying host AI credentials into $name (best-effort)…"
-  for p in "${CRED_PATHS[@]}"; do
-    [[ -e "$p" ]] || continue
-    case "$p" in "$HOME/"*) rel="${p#"$HOME"/}";; *) continue;; esac
-    limactl shell "$name" -- bash -c "$_COPY_PREPARE_PARENT" _ "$rel" </dev/null 2>/dev/null || true
-    # Lima's recursive mode makes a file destination into a directory.  The
-    # credential list intentionally contains both files and directories.
-    rflag=()
-    [[ -d "$p" ]] && rflag=(-r)
-    if limactl copy "${rflag[@]}" "$p" "$name:$rel" 2>/dev/null; then copied=$((copied+1)); else warn "could not copy $p"; fi
-  done
-  log "Copied $copied credential path(s)."
-}
-
-agent_config_files() { # paths -> NUL-delimited regular files
-  local path
-  for path in "$@"; do
-    if [[ -f "$path" ]]; then
-      printf '%s\0' "$path"
-    elif [[ -d "$path" ]]; then
-      # A user may keep an allowlisted config directory (notably
-      # ~/.claude/hooks) in a separate, versioned vault.  Follow only the
-      # path supplied by the allowlist; links encountered beneath it remain
-      # untouched, so a config tree cannot pull arbitrary host files in.
-      find -H "$path" -type f -print0
+  local name="$1" temporary="" root="${_DB_INPUT_SNAPSHOT:-}" path relative requests=()
+  if [[ -z "$root" ]]; then
+    temporary="$(new_host_snapshot)" || die "could not create credential snapshot"
+    for path in "${CRED_PATHS[@]}"; do
+      [[ -e "$path" || -L "$path" ]] || continue
+      case "$path" in "$HOME/"*) relative="${path#"$HOME"/}";; *) continue;; esac
+      requests+=(credentials "$path" "$relative")
+    done
+    if ! host_files snapshot "$temporary" "${requests[@]}"; then
+      rm -rf -- "$temporary"; die "could not safely snapshot credential inputs"
     fi
-  done
-}
-
-agent_config_contains_credential() { # $1 config file; never prints its content
-  local file="$1"
-  local field_assignment="((access|refresh|id)[_-]?token|api[_-]?key|authorization|password|secret|credential)[[:space:]]*[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?[^\\\"'[:space:]]+"
-  # An empty instruction/config file is harmless. `grep -q ''` reports no
-  # match for it, so avoid mistaking it for binary input.
-  [[ -s "$file" ]] || return 1
-  # Config is text. Treat binary input as unsafe rather than copying it.
-  LC_ALL=C grep -Iq '' "$file" || return 0
-  # Require an assigned value to avoid rejecting harmless prose such as
-  # "do not commit API keys". Prefixes cover opaque keys whose field name is
-  # not recognisable. This is a defense in depth layer after the allowlist.
-  LC_ALL=C grep -IEq "$field_assignment|(sk-(proj-|ant-)?|rk-live-|sess-)[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{12,}\\.[A-Za-z0-9_-]{12,}\\.[A-Za-z0-9_-]{8,}" "$file"
+    root="$temporary"
+  fi
+  log "Copying approved host credential snapshots into $name (raw credentials and config)…"
+  local result=0
+  transfer_host_snapshots "$name" "$root" credentials || result=$?
+  [[ -z "$temporary" ]] || rm -rf -- "$temporary"
+  [[ $result -eq 0 ]] || die "could not copy host credentials into $name"
 }
 
 apply_agent_config() {
-  local name="$1" file rel copied=0 skipped=0
-  log "Copying non-secret host AI agent configuration into $name…"
-  while IFS= read -r -d '' file; do
-    case "$file" in "$HOME/"*) rel="${file#"$HOME"/}";; *) continue;; esac
-    if agent_config_contains_credential "$file"; then
-      warn "skipping possible credential in agent config: $rel"
-      skipped=$((skipped+1))
-      continue
+  local name="$1" temporary="" root="${_DB_INPUT_SNAPSHOT:-}" path relative requests=()
+  if [[ -z "$root" ]]; then
+    temporary="$(new_host_snapshot)" || die "could not create agent config snapshot"
+    for path in "${AGENT_CONFIG_PATHS[@]}"; do
+      [[ -e "$path" || -L "$path" ]] || continue
+      case "$path" in "$HOME/"*) relative="${path#"$HOME"/}";; *) continue;; esac
+      requests+=(config "$path" "$relative")
+    done
+    if ! host_files snapshot "$temporary" "${requests[@]}"; then
+      rm -rf -- "$temporary"; die "could not safely snapshot agent config inputs"
     fi
-    limactl shell "$name" -- bash -c "$_COPY_PREPARE_PARENT" _ "$rel" </dev/null 2>/dev/null || true
-    if limactl copy "$file" "$name:$rel" 2>/dev/null; then
-      copied=$((copied+1))
-    else
-      warn "could not copy agent config: $rel"
-    fi
-  done < <(agent_config_files "${AGENT_CONFIG_PATHS[@]}")
-  log "Copied $copied non-secret agent config file(s); skipped $skipped possible credential(s)."
+    root="$temporary"
+  fi
+  log "Copying safe schema fields from host agent settings into $name; free-form content is excluded"
+  local result=0
+  transfer_host_snapshots "$name" "$root" config || result=$?
+  [[ -z "$temporary" ]] || rm -rf -- "$temporary"
+  [[ $result -eq 0 ]] || die "could not copy agent settings into $name"
 }
 
 apply_session_persistence() { # $1 instance $2 mounted per-project host directory
@@ -2203,7 +2563,8 @@ seed_agent_trust() { # $1 Lima instance $2 mounted project dir
 # --------------------------------------------------------- project manifest --
 project_manifest() { # $1 .devbox.toml -> normalized JSON
   python3 - "$1" "$PROXY_DEFAULT_URL" "$DEFAULT_KEYS_FILE" "$CONFIG_DIR/policies" "$GLOBAL_CONFIG" \
-    "${_DB_MANIFEST_GRANTS_REPLACED:-0}" "${_DB_POLICY_LOOKUP:-0}" <<'PY'
+    "${_DB_MANIFEST_GRANTS_REPLACED:-0}" "${_DB_POLICY_LOOKUP:-0}" \
+    "${_DB_MANIFEST_IMAGE_REPLACED:-0}" <<'PY'
 import json
 import os
 import re
@@ -2226,6 +2587,9 @@ grants_replaced = sys.argv[6] == "1"
 # Set by policy_manifest: the operator's own --policy or machine default, which
 # the machine default's egress floor does not bind.
 policy_lookup = sys.argv[7] == "1"
+# An explicit CLI image wins over the manifest. The manifest declaration is
+# still normalized and reviewed, but it cannot reach emit_base_stanza this run.
+image_replaced = sys.argv[8] == "1"
 manifest_dir = os.path.realpath(os.path.dirname(os.path.abspath(path)))
 try:
     data = tomllib.loads(path.read_text())
@@ -2311,6 +2675,13 @@ if image and not image.startswith(("http://", "https://", "template:")) and imag
         raise SystemExit("resolved local image paths must not contain double quotes or backslashes")
     if not image.lower().endswith((".yaml", ".yml", ".qcow2", ".img", ".raw")):
         raise SystemExit("resolved local image paths must retain a supported image extension")
+    # A Lima YAML is executable host-side configuration, not merely a guest
+    # image. Passing a repository-selected file through as `base:` would let it
+    # set host capabilities (including SSH-agent forwarding) outside the grant
+    # review. Keep YAML configs available only through the operator's explicit
+    # --image option; manifests may select templates and disk-image files.
+    if not image_replaced and image.lower().endswith((".yaml", ".yml")):
+        raise SystemExit("project manifests cannot select Lima YAML configs; use --image PATH only for a trusted host config")
 
 resources = data.get("resources", {})
 if not isinstance(resources, dict):
@@ -2612,7 +2983,7 @@ if data["ssh_agent"]:
 if data["keep"]:
     emit("keep", "Keep the Devbox after the shell exits")
 if data["with_agent_config"]:
-    emit("agent-config", "Copy allowlisted non-secret AI agent configuration into the box")
+    emit("agent-config", "Copy allowlisted safe agent setting fields; free-form content stays on the host")
 
 proxy = data["proxy"]
 if proxy is not False:
@@ -2643,7 +3014,7 @@ for item in data["copies"]:
         source, destination = item.rsplit(":", 1)
     else:
         source, destination = item, os.path.basename(item)
-    emit("copy", f"Copy {source} to {destination} inside the box")
+    emit("copy", f"Copy {source} to {destination} inside the box (raw content, including any secrets)")
 PY
 }
 
@@ -3079,8 +3450,8 @@ cmd_build() {
   local manifest_requests=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --image|-i) shift; image="${1:?--image needs a value}";;
-      --image=*|-i=*) image="${1#*=}";;
+      --image|-i) shift; image="$(normalize_image_arg "${1:?--image needs a value}")";;
+      --image=*|-i=*) image="$(normalize_image_arg "${1#*=}")";;
       --manifest) shift; manifest_path="${1:?--manifest needs a path}";;
       --manifest=*) manifest_path="${1#*=}";;
       --cpus|-j) shift; cli_cpus="${1:?--cpus needs a value}";;
@@ -3101,6 +3472,8 @@ cmd_build() {
   # still wins, but the manifest's provisioning continues to apply.
   [[ -n "$manifest_path" || ! -f "$PWD/$PROJECT_MANIFEST_NAME" ]] \
     || manifest_path="$PWD/$PROJECT_MANIFEST_NAME"
+  _DB_MANIFEST_IMAGE_REPLACED=0
+  [[ -z "$image" ]] || _DB_MANIFEST_IMAGE_REPLACED=1
   local manifest='{}' digest="" provision="" provision_user=""
   if [[ -n "$manifest_path" && -f "$manifest_path" ]]; then
     manifest_digest="$(manifest_fingerprint "$manifest_path")" \
@@ -3143,9 +3516,10 @@ cmd_build() {
   size_to_gib "$memory" >/dev/null || die "invalid memory size: $memory"
   size_to_gib "$disk"   >/dev/null || die "invalid disk size: $disk"
 
-  local hash golden gy
+  local hash golden gy provenance
   hash="$(golden_spec_hash "$image" "$digest" "$provision" "$provision_user")"
   golden="$(golden_name "$image" "$hash")"; gy="$CONFIG_DIR/${golden}.yaml"
+  provenance="$(golden_identity "$image" "$digest" "$provision" "$provision_user")"
   mkdir -p "$CONFIG_DIR"
   [[ -z "$manifest_digest" ]] || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
   emit_golden_yaml "$image" "$gy" "$cpus" "$memory" "$disk" \
@@ -3154,7 +3528,9 @@ cmd_build() {
     if [[ $force -eq 1 ]]; then
       log "Rebuilding golden $golden…"
       limactl stop -f "$golden" 2>/dev/null || true; limactl delete -f "$golden"
+      forget_instance_identity "$golden"
     else
+      require_golden_identity "$golden" "$provenance" "$image"
       log "Golden $golden already exists (use 'devbox build --image $image --force' to rebuild)."
       return 0
     fi
@@ -3190,6 +3566,7 @@ cmd_build() {
   fi
   log "Stopping golden (retained as clone source)."
   limactl stop "$golden"
+  identity_state golden write "$golden" "$provenance" || die "could not record verified golden provenance"
   log "Golden ready: $golden"
 }
 
@@ -3200,17 +3577,21 @@ cmd_build() {
 run_cleanup() {
   local rc=$?
   trap - EXIT INT TERM
+  cleanup_host_inputs
   if [[ "${_DB_KEEP:-0}" -eq 1 ]]; then
     log "--keep: retained ${_DB_NAME:-?}"
-    log "  re-enter: devbox $(printf '%q' "${_DB_DIR:-.}")$([[ "${_DB_IMAGE:-}" != "$DEFAULT_IMAGE" ]] && printf ' --image %q' "${_DB_IMAGE:-}")"
+    local hint
+    hint="devbox $(printf '%q' "${_DB_DIR:-.}")"
+    [[ "${_DB_IMAGE:-}" == "$DEFAULT_IMAGE" ]] || hint+=" --image $(printf '%q' "${_DB_IMAGE:-}")"
+    [[ "${_DB_NAME:-}" == "$(instance_name "${_DB_IMAGE:-}" "${_DB_DIR:-.}" 2>/dev/null)" ]] \
+      || hint+=" -N $(printf '%q' "${_DB_NAME:-}")"
+    log "  re-enter: $hint --keep"
     log "  destroy:  devbox destroy ${_DB_NAME:-?}"
   elif [[ -n "${_DB_NAME:-}" ]]; then
     log "Destroying ${_DB_NAME}…"
+    revoke_proxy_grants "$_DB_NAME" || warn "could not revoke every proxy grant"
     limactl stop -f "$_DB_NAME" 2>/dev/null || true
-    limactl delete -f "$_DB_NAME" 2>/dev/null || true
-    clear_gh_proxy_endpoint "$_DB_NAME"
-    clear_traffic_proxy_endpoint "$_DB_NAME"
-    revoke_ai_proxy_token "$_DB_NAME"
+    if limactl delete -f "$_DB_NAME" 2>/dev/null; then forget_instance_identity "$_DB_NAME"; fi
   fi
   if [[ -n "${_DB_SESSION_DIR:-}" ]]; then
     log "AI sessions retained: ${_DB_SESSION_DIR}"
@@ -3226,10 +3607,11 @@ cmd_run() {
   local cli_cpus="" cli_memory="" cli_disk=""
   local golden_digest="" golden_provision="" golden_provision_user=""
   local manifest_digest="" manifest_digest_after="" manifest_semantics="" manifest_packages=""
+  local manifest_lima_base=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --image|-i) shift; image="${1:?--image needs a value}"; image_set=1;;
-      --image=*|-i=*) image="${1#*=}"; image_set=1;;
+      --image|-i) shift; image="$(normalize_image_arg "${1:?--image needs a value}")"; image_set=1;;
+      --image=*|-i=*) image="$(normalize_image_arg "${1#*=}")"; image_set=1;;
       --cpus|-j) shift; cli_cpus="${1:?--cpus needs a value}";;
       --cpus=*|-j=*) cli_cpus="${1#*=}";;
       --memory|-M) shift; cli_memory="${1:?--memory needs a value}";;
@@ -3283,6 +3665,7 @@ cmd_run() {
   # manifest the same way for its fingerprint to match.
   _DB_MANIFEST_GRANTS_REPLACED=0
   [[ -z "$cli_policy" ]] || _DB_MANIFEST_GRANTS_REPLACED=1
+  _DB_MANIFEST_IMAGE_REPLACED="$image_set"
   if [[ -f "$manifest_path" ]]; then
     manifest_digest="$(manifest_fingerprint "$manifest_path")" \
       || die "could not read $PROJECT_MANIFEST_NAME"
@@ -3297,6 +3680,12 @@ cmd_run() {
     manifest_image="$(manifest_value "$manifest" image)"
     if [[ $image_set -eq 0 && -n "$manifest_image" ]]; then
       image="$manifest_image"
+      # These forms become a Lima `base:` and can therefore carry inherited
+      # host-facing SSH settings. Disk images use `images:` and cannot.
+      case "$manifest_image" in
+        http://*|https://*|*.qcow2|*.img|*.raw) ;;
+        *) manifest_lima_base=1;;
+      esac
     fi
     golden_digest="$(manifest_value "$manifest" image_digest)"
     golden_provision="$(manifest_value "$manifest" image_provision)"
@@ -3398,6 +3787,13 @@ cmd_run() {
   golden_hash="$(golden_spec_hash "$image" "$golden_digest" "$golden_provision" "$golden_provision_user")"
   golden="$(golden_name "$image" "$golden_hash")"
   [[ -n "$name" ]] || name="$(instance_name "$image" "$dir")"
+  [[ "$name" != devbox-golden-* && "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$ ]] || die "invalid project instance name: $name"
+  local preexisting=0 managed_gh_proxy="" converge=0
+  if instance_exists "$name"; then
+    preexisting=1
+    require_instance_owner "$name" "$dir"
+  fi
+  [[ $policy_in_effect -eq 1 && $preexisting -eq 1 ]] && converge=1
   local session_state session_owner=""
   session_state="$(project_session_dir "$dir")"
   if [[ $ephemeral_sessions -eq 0 ]]; then
@@ -3407,9 +3803,92 @@ cmd_run() {
       die "AI session state is already attached to $session_owner; destroy it or use --ephemeral-sessions"
   fi
 
-  local preexisting=0
-  if instance_exists "$name"; then
-    preexisting=1
+  # Freeze approved host inputs before any guest provisioning. A running kept
+  # guest stays up: sources are read through descriptors, and any source beneath
+  # a guest-writable mount is refused, so the guest cannot swap one mid-read.
+  local retained_traffic_endpoint=""
+  if [[ $preexisting -eq 1 && "$traffic_audit" != off && ! ( $converge -eq 1 && -z "$traffic_audit" ) ]]; then
+    retained_traffic_endpoint="$(stored_traffic_proxy_endpoint "$name" || true)"
+    if [[ -n "$retained_traffic_endpoint" ]]; then
+      if [[ "$(instance_status "$name")" == Running ]]; then
+        persist_kept_traffic_audit "$name" "$retained_traffic_endpoint"
+      else
+        identity_state traffic check "$name" "$(traffic_firewall_identity "$retained_traffic_endpoint")" || \
+          die "stopped audited box $name predates boot-time egress enforcement; recreate it (devbox destroy $name, then rerun), or re-enter once with --traffic-audit=off"
+      fi
+    fi
+  fi
+  # Removing SSH-agent forwarding only takes effect at boot, so that is the one
+  # change that restarts a running kept box. Everything else applies to a
+  # running guest: proxy capabilities are revoked live (tokens are checked
+  # against the current generation on every request), and host inputs come
+  # only from sources outside every guest-writable mount.
+  local remove_ssh_agent=0
+  if [[ $preexisting -eq 1 && $ssh_agent -eq 0 && ( $manifest_lima_base -eq 1 || $converge -eq 1 ) ]] \
+     && [[ "$(ssh_agent_forwarding_enabled "$name")" == True ]]; then
+    remove_ssh_agent=1
+    if [[ "$(instance_status "$name")" == Running ]]; then
+      log "Restarting $name to remove host SSH-agent forwarding not granted by its policy"
+      limactl stop "$name"
+    fi
+  fi
+  # Revoke removed host grants before the guest is (re)started or reattached.
+  if [[ $preexisting -eq 1 ]]; then
+    if [[ $no_auth -eq 1 || ( $converge -eq 1 && -z "$proxy" ) ]]; then
+      revoke_ai_proxy_token "$name"
+    fi
+    if [[ $no_auth -eq 1 || $no_gh_proxy -eq 1 || ( $converge -eq 1 && -z "$gh_proxy" ) ]]; then
+      clear_gh_proxy_endpoint "$name"
+    fi
+    if [[ "$traffic_audit" == off || ( $converge -eq 1 && -z "$traffic_audit" ) ]]; then
+      clear_traffic_proxy_endpoint "$name"
+    fi
+  fi
+  local mount_spec mount_path resolved_mounts=() approved_mounts=("$dir") stored_mounts mount
+  [[ $ephemeral_sessions -eq 1 ]] || approved_mounts+=("$session_state")
+  if [[ $preexisting -eq 1 ]]; then
+    stored_mounts="$(guest_mount_paths "$name")" || die "could not inspect project instance mounts"
+    while IFS= read -r mount; do [[ -z "$mount" ]] || approved_mounts+=("$mount"); done <<< "$stored_mounts"
+  fi
+  require_writable_mount_safe "$dir"
+  for mount_spec in "${extra_mounts[@]}"; do
+    mount_path="$(_mount_spec_path "$mount_spec")"
+    require_mountable_path "$mount_path"
+    case "$mount_spec" in
+      *:rw) require_writable_mount_safe "$mount_path"; resolved_mounts+=("$mount_path:rw");;
+      *) resolved_mounts+=("$mount_path:ro");;
+    esac
+    [[ $preexisting -eq 1 ]] || approved_mounts+=("$mount_path")
+  done
+  stored_mounts="$(guest_mount_paths)" || die "could not inspect stored guest mounts"
+  local all_mounts=("${approved_mounts[@]}") writable_roots=("$dir")
+  [[ $ephemeral_sessions -eq 1 ]] || writable_roots+=("$session_state")
+  if [[ $preexisting -eq 0 ]]; then
+    for mount_spec in "${resolved_mounts[@]}"; do
+      [[ "$mount_spec" != *:rw ]] || writable_roots+=("${mount_spec%:rw}")
+    done
+  fi
+  while IFS= read -r mount; do [[ -z "$mount" ]] || all_mounts+=("$mount"); done <<< "$stored_mounts"
+  local foreign_writable_roots=()
+  stored_mounts="$(guest_writable_mount_paths "$name")" || die "could not inspect writable guest mounts"
+  while IFS= read -r mount; do [[ -z "$mount" ]] || foreign_writable_roots+=("$mount"); done <<< "$stored_mounts"
+  _DB_EARLY_CREATED=""
+  trap cleanup_early_run EXIT INT TERM
+  prepare_host_inputs "${all_mounts[@]}"
+  stored_mounts="$(guest_writable_mount_paths)" || die "could not inspect writable guest mounts"
+  while IFS= read -r mount; do [[ -z "$mount" ]] || writable_roots+=("$mount"); done <<< "$stored_mounts"
+  python3 - "$_DB_INPUT_SNAPSHOT/mount-policy.json" "${#approved_mounts[@]}" "${approved_mounts[@]}" "${writable_roots[@]}" <<'PY'
+import json, os, sys
+path, count, *paths = sys.argv[1:]
+count = int(count)
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, "w") as stream:
+    json.dump({"sources": paths[:count], "writable_roots": paths[count:]}, stream)
+PY
+  host_files mount-policy "$_DB_INPUT_SNAPSHOT/mount-policy.json" || die "approved mount has guest-writable ancestry; use non-overlapping mounts"
+  _DB_MOUNT_IDENTITY="$_DB_INPUT_SNAPSHOT/mount-identities.json"
+  prepare_mount_identities "$_DB_MOUNT_IDENTITY" "${approved_mounts[@]}" || die "could not capture approved mount identities"
+  if [[ $preexisting -eq 1 ]]; then
     log "Attaching to existing box for this path: $name"
     [[ ${#extra_mounts[@]} -gt 0 ]] && warn "--mount only applies at box creation; destroy+recreate to change mounts (--copy still works)"
   else
@@ -3421,22 +3900,15 @@ cmd_run() {
     fi
     [[ -z "$manifest" ]] \
       || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
+    require_golden_identity "$golden" "$(golden_identity "$image" "$golden_digest" "$golden_provision" "$golden_provision_user")" "$image"
     ensure_golden_stopped "$golden"
-    local clone_args=() sess="" mount_spec mount_path resolved_mounts=()
+    local clone_args=() sess=""
     [[ $ephemeral_sessions -eq 1 ]] || sess="$session_state"
     # Resolved and checked once, here: _clone_mount_args runs in a process
     # substitution, where `die` could not stop the clone, and resolving again
     # there would let a symlink change between the check and the use.
     require_mountable_path "$dir"
     [[ -z "$sess" ]] || require_mountable_path "$sess"
-    for mount_spec in "${extra_mounts[@]}"; do
-      mount_path="$(_mount_spec_path "$mount_spec")"
-      require_mountable_path "$mount_path"
-      case "$mount_spec" in
-        *:rw) resolved_mounts+=("$mount_path:rw");;
-        *)    resolved_mounts+=("$mount_path:ro");;
-      esac
-    done
     mapfile -t clone_args < <(_clone_mount_args "$dir" "$sess" "${resolved_mounts[@]}")
     # CPU/memory are per-box: applied to the clone so a project can be sized
     # without rebuilding the shared golden.
@@ -3455,20 +3927,36 @@ cmd_run() {
       warn "requested disk ${disk} is smaller than the golden's ${golden_disk}GiB; qcow2 cannot shrink — keeping ${golden_disk}GiB"
     fi
     # `limactl clone --set` applies this to the stopped destination config, so
-    # the very first boot already has the agent socket. Existing VMs still use
-    # enable_ssh_agent below and restart only if their persisted config changes.
-    [[ $ssh_agent -eq 1 ]] && clone_args+=(--set '.ssh.forwardAgent = true')
+    # the first boot receives the exact reviewed grant even when an older
+    # golden persisted an unsafe value from a custom base.
+    local ssh_forward=false
+    [[ $ssh_agent -eq 0 ]] || ssh_forward=true
+    clone_args+=(--set ".ssh.forwardAgent = $ssh_forward")
     log "Cloning $golden → $name (mount: $dir${extra_mounts:+, +${#extra_mounts[@]} extra mount(s)})"
     [[ -z "$manifest" ]] || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
+    require_mounts_unchanged "$name"
+    _DB_EARLY_CREATED="$name"
     limactl --tty=false clone "$golden" "$name" "${clone_args[@]}"
+    require_mounts_unchanged "$name"
+    require_project_writable "$name" "$dir"
+    record_instance_owner "$name" "$dir" || die "could not register project instance"
     # A new box never inherits proxy registrations left by an earlier box of
     # the same name that was deleted outside devbox.
     revoke_ai_proxy_token "$name"
     clear_gh_proxy_endpoint "$name"
     clear_traffic_proxy_endpoint "$name"
   fi
+  require_mounts_unchanged "$name"
   [[ $ephemeral_sessions -eq 1 || $preexisting -eq 0 ]] || ensure_session_mount "$name" "$session_state"
-  [[ $ssh_agent -eq 1 && $preexisting -eq 1 ]] && enable_ssh_agent "$name"
+  if [[ $preexisting -eq 1 ]]; then
+    if [[ $ssh_agent -eq 1 ]]; then
+      enable_ssh_agent "$name"
+    elif [[ $remove_ssh_agent -eq 1 ]]; then
+      # A policy without ssh_agent, or a box from an older version created
+      # from a repository-selected Lima base, must not keep forwardAgent=true.
+      disable_ssh_agent "$name"
+    fi
+  fi
   # Refuse a box whose project mount is missing or read-only before handing it
   # over, rather than letting the session's first write fail. Covers both a
   # fresh clone and a pre-existing box whose config predates the mount fix.
@@ -3477,26 +3965,26 @@ cmd_run() {
   _DB_NAME="$name"; _DB_DIR="$dir"; _DB_IMAGE="$image"; _DB_KEEP="$keep"
   _DB_SESSION_DIR=""; [[ $ephemeral_sessions -eq 1 ]] || _DB_SESSION_DIR="$session_state"
   trap run_cleanup EXIT INT TERM
+  _DB_EARLY_CREATED=""
 
   if [[ "$(instance_status "$name")" != "Running" ]]; then
     log "Booting $name…"; limactl start "$name"
   fi
+  require_mounts_unchanged "$name"
   [[ $ssh_agent -eq 1 ]] && apply_git_signing "$name"
 
   [[ -z "$manifest" ]] \
     || require_manifest_unchanged "$manifest_path" "$manifest_digest" "$manifest_semantics"
 
-  local managed_gh_proxy="" converge=0
   # A kept box follows a declared policy: grants it no longer contains are
   # removed (docs/policies.md). Without a policy, a kept box keeps what it has.
-  [[ $policy_in_effect -eq 1 && $preexisting -eq 1 ]] && converge=1
   if [[ $no_auth -eq 1 ]]; then
     clear_auth "$name"
   else
     if [[ -n "$proxy" ]]; then
       proxy_ensure "$proxy" || die "could not start credential proxy"
       apply_ai_proxy "$name" "$proxy"
-    elif [[ $converge -eq 1 && -e "$(ai_proxy_token_path "$name")" ]]; then
+    elif [[ $converge -eq 1 ]]; then
       log "Removing AI proxy access from $name: not granted by its policy"
       clear_ai_proxy "$name"
     fi
@@ -3510,10 +3998,8 @@ cmd_run() {
       # A kept box keeps the GitHub grant it was given until --gh-proxy=off or
       # --no-auth removes it; its capability is refreshed on every entry.
       if [[ -z "$managed_gh_proxy" && $converge -eq 1 ]]; then
-        if [[ -e "$(gh_proxy_state_path "$name")" ]]; then
-          log "Removing GitHub CLI proxying from $name: not granted by its policy"
-          clear_gh_proxy "$name"
-        fi
+        log "Removing GitHub CLI proxying from $name: not granted by its policy"
+        clear_gh_proxy "$name"
       elif [[ -z "$managed_gh_proxy" && $preexisting -eq 1 ]]; then
         local stored_status=0
         managed_gh_proxy="$(stored_gh_proxy_endpoint "$name")" || stored_status=$?
@@ -3546,7 +4032,9 @@ cmd_run() {
   fi
 
   local managed_traffic_audit="$traffic_audit" traffic_proxy_endpoint=""
-  if [[ -z "$managed_traffic_audit" && $preexisting -eq 1 ]]; then
+  if [[ -z "$managed_traffic_audit" && $converge -eq 1 ]]; then
+    managed_traffic_audit=off
+  elif [[ -z "$managed_traffic_audit" && $preexisting -eq 1 ]]; then
     traffic_proxy_endpoint="$(stored_traffic_proxy_endpoint "$name" || true)"
     if [[ -n "$traffic_proxy_endpoint" && $converge -eq 1 ]]; then
       traffic_proxy_endpoint=""
@@ -3580,6 +4068,8 @@ cmd_run() {
   else
     apply_session_persistence "$name" "$session_state"
   fi
+  require_mounts_unchanged "$name"
+  cleanup_host_inputs
 
   # After every profile and config write, so the seeded API-key approval matches
   # the key the guest login shell will really use.
@@ -3767,11 +4257,10 @@ cmd_destroy() {
   while IFS= read -r i; do
     [[ -n "$i" ]] || continue
     log "destroying $i"
+    revoke_proxy_grants "$i" || warn "could not revoke every proxy grant"
     limactl stop -f "$i" 2>/dev/null || true
     limactl delete -f "$i"
-    clear_gh_proxy_endpoint "$i"
-    clear_traffic_proxy_endpoint "$i"
-    revoke_ai_proxy_token "$i"
+    forget_instance_identity "$i"
   done <<< "$list"
 }
 
@@ -3790,6 +4279,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   need limactl
   case "${1:-}" in
     build)          shift; cmd_build   "$@";;
+    adopt)          shift; cmd_adopt   "$@";;
     gui)            shift; cmd_gui     "$@";;
     ls|list)        shift; cmd_ls      "$@";;
     destroy|rm)     shift; cmd_destroy "$@";;

@@ -29,8 +29,9 @@ start = "npm install"
 #
 # Table form, when the project needs a digest or its own baked-in toolchain:
 [image]
-# A Lima template name, a template:// URL, a *.yaml Lima config, or a path/URL
-# to a *.qcow2 / *.img / *.raw image.
+# A Lima template name, a template:// URL, or a path/URL to a *.qcow2 / *.img /
+# *.raw image. Local Lima YAML is trusted host configuration and is accepted
+# only through an operator's explicit --image flag, not from this manifest.
 location = "ubuntu-24.04"
 
 # Optional, for qcow2/URL images.
@@ -73,7 +74,7 @@ disk = "100GiB"
 # ai_proxy = true                      # host AI logins via the proxy; or a proxy URL
 # github = true                        # host GitHub login for gh — a separate grant
 # ssh_agent = true
-# agent_config = true                  # allowlisted settings, never auth files
+# agent_config = true                  # known setting fields only, never auth files
 # api_keys = true                      # or "/path/to/api-keys.env"
 # host_credentials = true              # copies host AI credential files
 # egress = "audit"                     # "open" (default) or "audit"

@@ -413,7 +413,8 @@ class GitHubCliProxyTests(TestCase):
              patch.object(proxy, "resolve_github_token", return_value=""), \
              patch.object(proxy.Handler, "log_message"):
             ca_path, _, _ = proxy.ensure_github_certificates()
-            capability = proxy.issue_github_proxy_token()
+            proxy.register_proxy_box("github", "devbox-test", "http://host.lima.internal:4141")
+            capability = proxy.issue_github_proxy_token("devbox-test")
             server = proxy.ThreadingHTTPServer(("127.0.0.1", 0), proxy.Handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -444,7 +445,8 @@ class GitHubCliProxyTests(TestCase):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(proxy, "STATE_DIR", directory), \
              patch.object(proxy, "GITHUB_PROXY_TOKEN_TTL_SECONDS", 60):
-            capability = proxy.issue_github_proxy_token()
+            proxy.register_proxy_box("github", "devbox-test", "http://host.lima.internal:4141")
+            capability = proxy.issue_github_proxy_token("devbox-test")
             encoded = b64encode(f"{capability}:".encode()).decode()
             self.assertTrue(proxy.valid_github_proxy_token(capability))
             headers = {"Proxy-Authorization": f"Basic {encoded}"}
@@ -473,7 +475,8 @@ class GitHubCliProxyTests(TestCase):
         self.assertEqual(second["renewed"], 0)
         self.assertEqual(third["renewed"], 1)
         self.assertEqual(deliver.call_count, 2)
-        deliver.assert_called_with("devbox-existing-1234", "http://host.lima.internal:4141")
+        self.assertEqual(deliver.call_args.args, ("devbox-existing-1234", "http://host.lima.internal:4141"))
+        self.assertIn("expected_generation", deliver.call_args.kwargs)
 
     def test_daemon_ignores_registrations_from_the_old_combined_proxy(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -513,7 +516,7 @@ class GitHubCliProxyTests(TestCase):
                  patch.object(proxy, "BIND_PORT", 4141), \
                  patch.object(proxy, "running_lima_instances", return_value={"devbox-a"}), \
                  patch.object(proxy, "deliver_github_proxy_capability",
-                              side_effect=lambda *_: registration.unlink()), \
+                              side_effect=lambda *_, **__: registration.unlink()), \
                  patch.object(proxy, "retract_github_proxy_capability") as retract:
                 summary = proxy.refresh_registered_github_proxy_boxes(force=True)
             retract.assert_called_once_with("devbox-a")
@@ -727,7 +730,10 @@ class ProxyAuditTests(TestCase):
                 self.assertEqual(proxy.read_audit_events(), [event])
                 output = proxy.write_audit_html(str(report_path))
             self.assertEqual(output, str(report_path))
-            self.assertEqual(audit_path.stat().st_mode & 0o777, 0o600)
+            # AI-route events rotate in their own file next to the main log.
+            self.assertFalse(audit_path.exists())
+            ai_path = audit_path.with_name(audit_path.stem + "-ai" + audit_path.suffix)
+            self.assertEqual(ai_path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(report_path.stat().st_mode & 0o777, 0o600)
             rendered = report_path.read_text()
             self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", rendered)
@@ -782,13 +788,21 @@ class ProxyAuditTests(TestCase):
                 upstream.server_close()
                 upstream_thread.join(timeout=5)
             self.assertEqual(upstream.request_body, body)
+            opening = [event for event in events if event.get("phase") == "request-open"]
+            self.assertEqual(len(opening), 1)
+            events = [event for event in events if event.get("phase") != "request-open"]
             self.assertEqual(len(events), 1)
             event = events[0]
+            self.assertEqual(opening[0]["request_id"], event["request_id"])
             self.assertEqual(event["request"]["action"], "create-or-action")
             self.assertTrue(event["request"]["mutating"])
             self.assertEqual(event["request"]["query_keys"], ["credential"])
-            self.assertEqual(event["request"]["body"]["json"]["prompt"], "audit this request")
-            self.assertEqual(event["request"]["body"]["json"]["token"], "[redacted]")
+            # The body is captured once, in the opening event; the completed
+            # event keeps only its length and hash.
+            self.assertEqual(opening[0]["request"]["body"]["json"]["prompt"], "audit this request")
+            self.assertEqual(opening[0]["request"]["body"]["json"]["token"], "[redacted]")
+            self.assertNotIn("json", event["request"]["body"])
+            self.assertEqual(event["request"]["body"]["sha256"], opening[0]["request"]["body"]["sha256"])
             self.assertEqual(event["response"]["status"], 201)
             self.assertEqual(event["response"]["bytes"], 2)
             self.assertEqual(event["box"], "devbox-audit-1234")
@@ -1230,7 +1244,8 @@ class RouteScopeTests(TestCase):
 class TrafficProxyTests(TestCase):
     def test_traffic_capability_is_separate_from_github_and_limited_to_web_ports(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(proxy, "STATE_DIR", directory):
-            token = proxy.issue_traffic_proxy_token()
+            proxy.register_proxy_box("traffic", "devbox-test", "http://host.lima.internal:4141")
+            token = proxy.issue_traffic_proxy_token("devbox-test")
             header = {"Proxy-Authorization": "Basic " + b64encode((token + ":").encode()).decode()}
             self.assertTrue(proxy.traffic_proxy_authorized(header))
             self.assertFalse(proxy.github_proxy_authorized(header))
@@ -1290,7 +1305,7 @@ class TrafficProxyTests(TestCase):
             server_thread.start()
             body = b'{"operation":"update"}'
             try:
-                with patch.object(proxy, "traffic_proxy_authorized", return_value=True), \
+                with patch.object(proxy, "traffic_request_box", return_value="fixture-box"), \
                      patch.object(proxy, "open_traffic_connection", side_effect=lambda *_: socket.create_connection(upstream.server_address)), \
                      patch.object(proxy, "AUDIT_PATH", str(audit_path)), \
                      patch.object(proxy, "AUDIT_ENABLED", True), \
@@ -1315,6 +1330,10 @@ class TrafficProxyTests(TestCase):
             self.assertEqual(upstream.request_path, "/action?secret=not-logged")
             self.assertEqual(upstream.request_body, body)
             self.assertIsNone(upstream.proxy_authorization)
+            opening = [event for event in events if event.get("phase") == "request-open"]
+            self.assertEqual(len(opening), 1)
+            events = [event for event in events if event.get("phase") != "request-open"]
+            self.assertEqual(opening[0]["request_id"], events[0]["request_id"])
             self.assertEqual(events[0]["source"], "traffic-http")
             self.assertEqual(events[0]["request"]["query_keys"], ["secret"])
             self.assertEqual(events[0]["response"]["status"], 202)

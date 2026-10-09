@@ -62,10 +62,31 @@ token. Refreshing does not send empty model prompts or consume model usage.
 The VM never receives an access or refresh token; the repository also has a
 pre-commit guard against embedding one in production scripts.
 
+GitHub and traffic capabilities are bound to a box, audience, expiry, and
+host-owned registration generation. Every request validates that live record;
+revocation invalidates copied tokens, and recreating a grant never revives its
+previous tokens. Older stateless tokens are rejected after upgrading the proxy.
+
+The listener admits at most 256 concurrent connections. Every guest reaches the
+proxy from 127.0.0.1, so the per-source cap defaults to the same value; fairness
+between boxes is enforced after authentication, with 32 concurrent requests and
+64 concurrent CONNECT tunnels per box. Before authentication, a guest can still
+occupy connection slots, so a compromised guest can degrade the shared proxy for
+other boxes; headers must arrive within 15 seconds, which limits how long it can
+hold each one. Headers have a 15-second deadline; request bodies have a
+300-second deadline and a 256 MiB limit. Aggregate body reservations are capped
+at 768 MiB globally and 256 MiB per box (or across anonymous clients when
+client authentication is disabled). Chunked uploads are charged incrementally
+as bounded pieces are read. Streams and tunnels close after ten idle minutes or
+eight hours. These defaults can be adjusted through `limits` in the example
+configuration; the per-box body cap must remain below the global cap.
+
 ## Detailed audit log
 
 By default, every request that reaches an authenticated AI or GitHub route is
-recorded on the host at `~/.config/devbox/proxy-audit.jsonl` with mode `0600`.
+recorded on the host with mode `0600`: AI routes in
+`~/.config/devbox/proxy-audit-ai.jsonl`, GitHub and audited web traffic in
+`~/.config/devbox/proxy-audit.jsonl`.
 This is intentionally a detailed action log, not only access metadata: it
 captures AI prompts and queries, GitHub REST/GraphQL request payloads, request
 method/path, classification (`read`, `create-or-action`, `modify`, `delete`, or
@@ -109,6 +130,9 @@ only guest loopback and this proxy's host, so AI clients still reach the
 credential proxy directly), and blocks direct guest TCP/UDP ports 80 and 443
 with nftables. Normal proxy-aware tools
 therefore use this host proxy or fail visibly instead of bypassing its log.
+The firewall survives guest restarts through a root-owned boot policy required
+before supported systemd network services. Guests without that boot interface
+are refused for audited egress.
 
 HTTPS CONNECT records are intentionally metadata-only: destination host/port,
 time, status, and byte counts. TLS remains end-to-end, so request paths and
@@ -156,6 +180,7 @@ into the guest, and injects the host token after TLS termination for
 `devbox-proxy` routing marker plus a short-lived Devbox proxy capability, never
 the real GitHub token. The capability authenticates only the local proxy and
 expires after eight hours. The long-lived proxy daemon scans host-owned box
+registrations on every request to enforce revocation. Its background renewal scans
 registrations once a minute and renews due capabilities every seven hours.
 Renewal uses the recorded Lima box name directly: it does not depend on a
 `devbox` terminal remaining open, re-read `.devbox.toml`, start a stopped box,
@@ -225,10 +250,21 @@ devbox --keep --policy agent-github     # or [grants] github = true
 To use static API keys or custom routes, configure them once:
 
 ```sh
-mkdir -p ~/.config/devbox
-cp proxy/api-keys.env.example       ~/.config/devbox/api-keys.env      # fill in
-cp proxy/proxy.config.example.json  ~/.config/devbox/proxy.config.json # optional route overrides
+install -d -m 700 "$HOME/.config/devbox"
+install -m 600 proxy/api-keys.env.example      "$HOME/.config/devbox/api-keys.env"      # fill in
+install -m 600 proxy/proxy.config.example.json "$HOME/.config/devbox/proxy.config.json" # optional route overrides
 ```
+
+The API-key file is parsed as data, not sourced as a shell script. Use one
+`NAME=value` or `export NAME=value` assignment per line; literal unquoted,
+single-quoted, and double-quoted values are supported. The proxy refuses links,
+non-regular files, files owned by another user, and files with any group/other
+permissions. If upgrading an older setup, run
+`chmod 700 ~/.config/devbox && chmod 600 ~/.config/devbox/api-keys.env`.
+Shell syntax such as `$(op read …)` is not evaluated; export such values in the
+environment that starts devbox instead, which the proxy reads as a fallback.
+Settings other than credentials (for example `DEVBOX_PROXY_AUDIT`) belong in
+that environment or in `proxy.config.json`, not in this file.
 
 Then grant `ai_proxy` — for example with `--policy agent` or `ai_proxy = true`
 in `[grants]` — and **devbox auto-starts the host proxy** (once, shared across

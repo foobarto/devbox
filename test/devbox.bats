@@ -8,6 +8,7 @@
 
 setup() {
   DEVBOX="${BATS_TEST_DIRNAME}/../bin/devbox"
+  export DEVBOX_PROXY_ENV="$BATS_TEST_TMPDIR/no-host-api-keys.env"
   # sourceable: dispatch is guarded, so this loads functions only.
   source "$DEVBOX"
   # Relax only nounset: test bodies reference optional vars. errexit MUST stay
@@ -196,7 +197,7 @@ print("" if d is None else d)' "$1"
   # 1 and `set -e` ended devbox right after the edit, before the box booted.
   run bash -c "
     source '$DEVBOX' 2>/dev/null; set +u
-    SSH_AUTH_SOCK=\$(mktemp -u); python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' \"\$SSH_AUTH_SOCK\"
+    require_ssh_agent() { :; } # this test exercises config convergence, not socket admission
     limactl() {
       case \"\$*\" in
         *--json*)   printf '{}\n';;          # forwarding not enabled yet
@@ -209,7 +210,6 @@ print("" if d is None else d)' "$1"
     ssh_agent=1 preexisting=1
     [[ \$ssh_agent -eq 1 && \$preexisting -eq 1 ]] && enable_ssh_agent box
     echo CONTINUED
-    rm -f \"\$SSH_AUTH_SOCK\"
   "
   [ "$status" -eq 0 ]
   [[ "$output" == *"EDIT: edit box --set .ssh.forwardAgent = true"* ]]
@@ -303,6 +303,16 @@ print("" if d is None else d)' "$1"
   [ "$fwd" = False ] || [ -z "$fwd" ]
 }
 
+@test "a resolved golden overrides SSH-agent forwarding from a named local template" {
+  require_resolver
+  local templates="$BATS_TEST_TMPDIR/templates" base="$BATS_TEST_TMPDIR/templates/hostile.yaml"
+  mkdir -p "$templates"
+  printf 'images:\n- location: "https://example.invalid/hostile.qcow2"\n  arch: "x86_64"\nssh:\n  forwardAgent: true\n' > "$base"
+  export LIMA_TEMPLATES_PATH="$templates"
+
+  [ "$(resolved_golden template:hostile | yaml_get ssh.forwardAgent)" = False ]
+}
+
 @test "a resolved golden disables Lima's unused containerd bootstrap" {
   require_resolver
   local resolved
@@ -325,9 +335,10 @@ print("" if d is None else d)' "$1"
   ! grep -q 'git-signing-key' "$tmp"
 }
 
-@test "new SSH-agent boxes set forwarding in the clone config before boot" {
+@test "new boxes set the exact SSH-agent grant in the clone config before boot" {
   source_text="$(<"$DEVBOX")"
-  [[ "$source_text" == *"clone_args+=(--set '.ssh.forwardAgent = true')"* ]]
+  [[ "$source_text" == *'clone_args+=(--set ".ssh.forwardAgent = $ssh_forward")'* ]]
+  [[ "$source_text" == *'local ssh_forward=false'* ]]
   [[ "$source_text" == *'limactl --tty=false clone'* ]]
 }
 
@@ -338,7 +349,7 @@ print("" if d is None else d)' "$1"
   grep -q 'brew install codex' "$tmp"
   grep -q 'brew install gh' "$tmp"
   grep -q 'sst/tap/opencode' "$tmp"
-  grep -q 'claude.ai/install.sh' "$tmp"
+  grep -q 'brew install --cask claude-code' "$tmp"
   grep -q 'brew install node' "$tmp"
   grep -q 'npm install -g --ignore-scripts @earendil-works/pi-coding-agent' "$tmp"
   grep -q 'brew install herdr' "$tmp"
@@ -483,6 +494,27 @@ print("" if d is None else d)' "$1"
   [[ "$output" == *--mount-none* ]]
 }
 
+@test "an explicit build image overrides a rejected manifest YAML" {
+  project="$BATS_TEST_TMPDIR/override-project"
+  mkdir -p "$project"
+  printf 'base: "template:ubuntu-24.04"\nssh:\n  forwardAgent: true\n' > "$project/hostile.yaml"
+  printf 'image = "./hostile.yaml"\n' > "$project/.devbox.toml"
+
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    CONFIG_DIR='$BATS_TEST_TMPDIR/override-config'; mkdir -p \"\$CONFIG_DIR\"
+    instance_exists() { return 1; }
+    apply_golden_provisioning() { :; }
+    verify_golden() { :; }
+    identity_state() { :; }
+    limactl() { :; }
+    cmd_build --image ubuntu-24.04 --manifest '$project/.devbox.toml' --yes
+    grep -Fx 'base: \"template:ubuntu-24.04\"' \"\$CONFIG_DIR\"/*.yaml
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'base: "template:ubuntu-24.04"'* ]]
+}
+
 @test "require_project_writable refuses a box whose project mount is missing or read-only" {
   # The guard reads the resolved mount state and refuses before handover, so a
   # box that cannot write its project fails loudly instead of on first write.
@@ -531,32 +563,34 @@ print("" if d is None else d)' "$1"
   [[ "$config_paths" != *"$HOME/.config/stado/keys"* ]]
 }
 
-@test "agent config credential detector skips assignments but accepts ordinary settings" {
-  safe="$BATS_TEST_TMPDIR/safe.toml"
-  suspect="$BATS_TEST_TMPDIR/suspect.toml"
-  empty="$BATS_TEST_TMPDIR/empty.md"
-  printf 'model = "gpt-5"\n' > "$safe"
-  printf 'api_key = "placeholder-value"\n' > "$suspect"
-  : > "$empty"
-  run agent_config_contains_credential "$safe"
-  [ "$status" -ne 0 ]
-  run agent_config_contains_credential "$empty"
-  [ "$status" -ne 0 ]
-  run agent_config_contains_credential "$suspect"
-  [ "$status" -eq 0 ]
+@test "agent config exports safe schema fields and omits unknown credentials and prose" {
+  fake_home="$BATS_TEST_TMPDIR/host-home"
+  mkdir -p "$fake_home/.codex" "$BATS_TEST_TMPDIR/guest"
+  printf 'model = "gpt-6-sol"\ncustom_login = "opaque-private-fixture"\ndeveloper_instructions = "private prose"\n' > "$fake_home/.codex/config.toml"
+  HOME="$fake_home"
+  AGENT_CONFIG_PATHS=("$fake_home/.codex/config.toml")
+  limactl() {
+    case "$1" in
+      copy) cp "$2" "$BATS_TEST_TMPDIR/guest/config.toml";;
+      shell) cat >/dev/null;;
+    esac
+  }
+  apply_agent_config box
+  [ "$(cat "$BATS_TEST_TMPDIR/guest/config.toml")" = 'model = "gpt-6-sol"' ]
 }
 
-@test "agent config follows an allowlisted directory symlink but not nested links" {
-  root="$BATS_TEST_TMPDIR/agent-config"
-  mkdir -p "$root/real-hooks"
-  printf '#!/bin/sh\n' > "$root/real-hooks/guard.sh"
-  printf 'not agent config\n' > "$root/outside"
-  ln -s real-hooks "$root/hooks"
-  ln -s "$root/outside" "$root/real-hooks/escape"
-
-  run bash -c 'source "$1"; agent_config_files "$2" | tr "\\0" "\\n"' _ "$DEVBOX" "$root/hooks"
+@test "agent config refuses a root symlink rather than following it" {
+  fake_home="$BATS_TEST_TMPDIR/host-home"
+  mkdir -p "$fake_home/.codex"
+  printf 'model = "gpt-6-sol"\n' > "$BATS_TEST_TMPDIR/other-config"
+  ln -s "$BATS_TEST_TMPDIR/other-config" "$fake_home/.codex/config.toml"
+  HOME="$fake_home"
+  AGENT_CONFIG_PATHS=("$fake_home/.codex/config.toml")
+  limactl() { echo UNEXPECTED-GUEST-TRANSFER; }
+  run apply_agent_config box
   [ "$status" -eq 0 ]
-  [ "$output" = "$root/hooks/guard.sh" ]
+  [[ "$output" == *"skipped unsupported/unsafe agent config"* ]]
+  [[ "$output" != *UNEXPECTED-GUEST-TRANSFER* ]]
 }
 
 # ------------------------------------------------------------------- proxy ----
@@ -667,6 +701,24 @@ print("" if d is None else d)' "$1"
   [[ "$output" == *"Restarting the older host credential proxy"* ]]
 }
 
+@test "proxy_ensure rejects and stops a launched proxy missing the required feature" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR/config"
+  health_checks=0
+  proxy_health() { health_checks=$((health_checks + 1)); (( health_checks > 1 )); }
+  proxy_current_health() { return 1; }
+  proxy_port_open() { return 1; }
+  proxy_launcher() { printf '/fixture/old-devbox-ai-proxy'; }
+  proxy_stop_process() { touch "$BATS_TEST_TMPDIR/stopped"; }
+  setsid() { :; }
+  sleep() { :; }
+
+  run proxy_ensure http://host.lima.internal:4141
+
+  [ "$status" -ne 0 ]
+  [ -e "$BATS_TEST_TMPDIR/stopped" ]
+  [[ "$output" == *"missing required feature: $PROXY_REQUIRED_FEATURE"* ]]
+}
+
 @test "the default proxy profile carries the box capability, not a shared marker" {
   CONFIG_DIR="$BATS_TEST_TMPDIR/config"; mkdir -p "$CONFIG_DIR"
   rendered="$BATS_TEST_TMPDIR/rendered"
@@ -707,11 +759,33 @@ print("" if d is None else d)' "$1"
   [ "$status" -ne 0 ]
 }
 
+@test "writable mounts may not contain home or contain or lie inside Devbox state" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR/config"; mkdir -p "$CONFIG_DIR/ai-proxy-boxes" "$BATS_TEST_TMPDIR/project"
+  for path in "$HOME" "$CONFIG_DIR" "$CONFIG_DIR/ai-proxy-boxes" "$(dirname "$CONFIG_DIR")"; do
+    run require_writable_mount_safe "$path"
+    [ "$status" -ne 0 ]
+  done
+  run require_writable_mount_safe "$BATS_TEST_TMPDIR/project"
+  [ "$status" -eq 0 ]
+}
+
+@test "the --keep re-enter hint keeps the box and names a custom box" {
+  run bash -c "source '$DEVBOX'; set +u
+    _DB_KEEP=1 _DB_DIR=/w/proj _DB_IMAGE=\$DEFAULT_IMAGE _DB_NAME=\$(instance_name \$DEFAULT_IMAGE /w/proj); run_cleanup"
+  [[ "$output" == *"re-enter: devbox /w/proj --keep"* ]]
+
+  run bash -c "source '$DEVBOX'; set +u
+    _DB_KEEP=1 _DB_DIR=/w/proj _DB_IMAGE=kali _DB_NAME=my-box; run_cleanup"
+  [[ "$output" == *"re-enter: devbox /w/proj --image kali -N my-box --keep"* ]]
+}
+
 @test "--no-auth revokes host-side access even when a guest cleanup step fails" {
   CONFIG_DIR="$BATS_TEST_TMPDIR/config"
   mkdir -p "$CONFIG_DIR/ai-proxy-boxes" "$CONFIG_DIR/gh-proxy-boxes"
+  chmod 700 "$CONFIG_DIR/gh-proxy-boxes"
   echo secret > "$CONFIG_DIR/ai-proxy-boxes/box.key"
   printf 'http://h:4141\ngrant=gh_proxy\n' > "$CONFIG_DIR/gh-proxy-boxes/box.url"
+  chmod 600 "$CONFIG_DIR/gh-proxy-boxes/box.url"
   limactl() { [[ "$*" == *brew* || "$*" == *-s* ]] && return 1; echo "ran: ${*: -1}" >&2; return 0; }
   run clear_auth box
   [ "$status" -ne 0 ]
@@ -744,7 +818,7 @@ print("" if d is None else d)' "$1"
   [[ "$output" == *"\"${key: -20}\""* ]]
 }
 
-@test "directory copies keep planted symlinks as links and never copy their targets" {
+@test "directory copies exclude nested symlinks and never copy their targets" {
   # Executes the real guest-side commands against a fake guest home. The stub's
   # `copy` behaves like Lima's scp fallback, which follows symlinks.
   GUEST_HOME="$BATS_TEST_TMPDIR/guest"; mkdir -p "$GUEST_HOME"
@@ -763,8 +837,10 @@ print("" if d is None else d)' "$1"
 
   apply_copy box "$src:~/tooling"
   [ "$(cat "$GUEST_HOME/tooling/sub/ok.txt")" = ok ]
-  [ -L "$GUEST_HOME/tooling/link-file" ]
-  [ -L "$GUEST_HOME/tooling/link-dir" ]
+  [ ! -e "$GUEST_HOME/tooling/link-file" ]
+  [ ! -L "$GUEST_HOME/tooling/link-file" ]
+  [ ! -e "$GUEST_HOME/tooling/link-dir" ]
+  [ ! -L "$GUEST_HOME/tooling/link-dir" ]
   ! grep -rq HOST-SECRET-CANARY "$GUEST_HOME"
 
   # Copying again merges rather than nesting tooling/tooling.
@@ -781,6 +857,84 @@ print("" if d is None else d)' "$1"
   echo single > "$BATS_TEST_TMPDIR/netrc"
   apply_copy box "$BATS_TEST_TMPDIR/netrc:~/conf/netrc"
   [ "$(cat "$GUEST_HOME/conf/netrc")" = single ]
+}
+
+@test "prepared copy snapshots are consumed even if the original file changes" {
+  source_path="$BATS_TEST_TMPDIR/original"
+  echo original > "$source_path"
+  local api_keys="" with_creds=0 with_agent_config=0
+  local extra_copies=("$source_path:target")
+  prepare_host_inputs
+  echo changed > "$source_path"
+  limactl() {
+    case "$1" in
+      copy) cp "$2" "$BATS_TEST_TMPDIR/transferred";;
+      shell) cat >/dev/null;;
+    esac
+  }
+  apply_copy box "$source_path:target"
+  [ "$(cat "$BATS_TEST_TMPDIR/transferred")" = original ]
+  snapshot="$_DB_INPUT_SNAPSHOT"
+  cleanup_host_inputs
+  [ ! -e "$snapshot" ]
+}
+
+@test "API-key inputs refuse symlinks without invoking the guest" {
+  printf 'export TEST_FIXTURE_KEY=value\n' > "$BATS_TEST_TMPDIR/fixture"
+  ln -s "$BATS_TEST_TMPDIR/fixture" "$BATS_TEST_TMPDIR/link"
+  limactl() { echo UNEXPECTED-GUEST-TRANSFER; }
+  run apply_api_keys box "$BATS_TEST_TMPDIR/link"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"could not safely snapshot API-key input"* ]]
+  [[ "$output" != *UNEXPECTED-GUEST-TRANSFER* ]]
+}
+
+@test "missing-at-snapshot API-key source is never read after it appears" {
+  source_path="$BATS_TEST_TMPDIR/original-keys"
+  local api_keys="$source_path" with_creds=0 with_agent_config=0
+  local extra_copies=()
+  prepare_host_inputs
+  printf 'export TEST_FIXTURE_KEY=later-value\n' > "$source_path"
+  [[ "$api_keys" == "$_DB_INPUT_SNAPSHOT/"* ]]
+  limactl() { echo UNEXPECTED-GUEST-TRANSFER; }
+  run apply_api_keys box "$api_keys"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no approved API-key snapshot"* ]]
+  [[ "$output" != *UNEXPECTED-GUEST-TRANSFER* ]]
+  cleanup_host_inputs
+}
+
+@test "prepared API-key snapshots ignore later changes to the original" {
+  source_path="$BATS_TEST_TMPDIR/original-keys"
+  printf 'export TEST_FIXTURE_KEY=original-value\n' > "$source_path"
+  local api_keys="$source_path" with_creds=0 with_agent_config=0
+  local extra_copies=()
+  prepare_host_inputs
+  printf 'export TEST_FIXTURE_KEY=later-value\n' > "$source_path"
+  limactl() { cat > "$BATS_TEST_TMPDIR/injected-profile"; }
+  apply_api_keys box "$api_keys"
+  [ "$(cat "$BATS_TEST_TMPDIR/injected-profile")" = 'export TEST_FIXTURE_KEY=original-value' ]
+  cleanup_host_inputs
+}
+
+@test "host credential trees use safe descriptor archives and omit nested links" {
+  fake_home="$BATS_TEST_TMPDIR/host-home"
+  mkdir -p "$fake_home/.config/tool"
+  echo fixture > "$fake_home/.config/tool/auth.json"
+  echo outside > "$BATS_TEST_TMPDIR/outside"
+  ln -s "$BATS_TEST_TMPDIR/outside" "$fake_home/.config/tool/link"
+  HOME="$fake_home"
+  CRED_PATHS=("$fake_home/.config/tool")
+  GUEST_HOME="$BATS_TEST_TMPDIR/guest"; mkdir -p "$GUEST_HOME"
+  limactl() {
+    case "$1" in
+      shell) shift 2; [[ "$1" == -- ]] && shift; (cd "$GUEST_HOME" && HOME="$GUEST_HOME" "$@");;
+      copy) cp "$2" "$GUEST_HOME/${3#*:}";;
+    esac
+  }
+  apply_creds box
+  [ "$(cat "$GUEST_HOME/.config/tool/auth.json")" = fixture ]
+  [ ! -e "$GUEST_HOME/.config/tool/link" ]
 }
 
 @test "audited egress lets the guest reach loopback and the Devbox proxy directly" {
@@ -843,14 +997,17 @@ print("" if d is None else d)' "$1"
 run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoint
   # Never the real ~/.config/devbox: config.toml could carry a default policy.
   export DEVBOX_CONFIG_DIR="${AUTH_CONFIG_DIR:-$BATS_TEST_TMPDIR/auth-config}"
+  export AUTH_FIXTURE_HOME="$BATS_TEST_TMPDIR/auth-home"
   mkdir -p "$DEVBOX_CONFIG_DIR"
   run bash -c '
+    HOME="$AUTH_FIXTURE_HOME"; mkdir -p "$HOME"
     source "$1"; shift; set +u
     project="${AUTH_PROJECT:-$(mktemp -d)}"
     instance_exists() { return 0; }
     instance_status() { echo Running; }
     prepare_session_dir() { :; }; session_state_other_instance() { :; }
     ensure_session_mount() { :; }; require_project_writable() { :; }
+    require_instance_owner() { :; }; guest_mount_paths() { :; }; guest_writable_mount_paths() { :; }
     disable_session_persistence() { :; }; remove_session_mount() { :; }
     apply_session_persistence() { :; }; seed_agent_trust() { :; }
     apply_git_signing() { :; }; enable_ssh_agent() { :; }; require_ssh_agent() { :; }
@@ -1041,6 +1198,7 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
     source "$1"; set +u
     export DEVBOX_CONFIG_DIR="$2/cfg"; CONFIG_DIR="$2/cfg"; mkdir -p "$CONFIG_DIR"
     instance_exists() { return 0; }; instance_status() { echo Running; }
+    require_instance_owner() { :; }; guest_mount_paths() { :; }; guest_writable_mount_paths() { :; }
     prepare_session_dir() { :; }; session_state_other_instance() { :; }
     require_project_writable() { :; }; disable_session_persistence() { :; }; remove_session_mount() { :; }
     seed_agent_trust() { :; }; run_cleanup() { :; }
@@ -1268,13 +1426,13 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
     'mounts = ["./cache:rw"]' \
     'copies = ["./tooling:~/tooling", "./script"]' \
     '[image]' \
-    'location = "./base.yaml"' > "$manifest"
+    'location = "./base.qcow2"' > "$manifest"
 
   from_project="$(cd "$project" && project_manifest "$manifest")"
   from_elsewhere="$(cd "$elsewhere" && project_manifest "$manifest")"
 
   [ "$from_project" = "$from_elsewhere" ]
-  [ "$(manifest_value "$from_project" image)" = "$project/base.yaml" ]
+  [ "$(manifest_value "$from_project" image)" = "$project/base.qcow2" ]
   [ "$(manifest_value "$from_project" api_keys)" = "$project/keys.env" ]
   [ "$(manifest_json_value "$from_project" mounts)" = "[\"$project/cache:rw\"]" ]
   [ "$(manifest_json_value "$from_project" copies)" = "[\"$project/tooling:~/tooling\", \"$project/script\"]" ]
@@ -1361,13 +1519,56 @@ run_auth_grants() { # args: cmd_run flags; env STORED_GH=1 remembers a gh endpoi
   target="$BATS_TEST_TMPDIR/extensionless-image"
   mkdir -p "$project"
   touch "$target"
-  ln -s "$target" "$project/base.yaml"
+  ln -s "$target" "$project/base.qcow2"
   manifest="$project/.devbox.toml"
-  printf 'image = "./base.yaml"\n' > "$manifest"
+  printf 'image = "./base.qcow2"\n' > "$manifest"
 
   run project_manifest "$manifest"
   [ "$status" -ne 0 ]
   [[ "$output" == *"resolved local image paths must retain a supported image extension"* ]]
+}
+
+@test "manifest rejects local Lima YAML configs before grant review" {
+  project="$BATS_TEST_TMPDIR/project"
+  mkdir -p "$project"
+  printf 'base: "template:ubuntu-24.04"\nssh:\n  forwardAgent: true\n' > "$project/hostile.yaml"
+
+  manifest="$project/.devbox.toml"
+  printf 'image = "./hostile.yaml"\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"project manifests cannot select Lima YAML configs"* ]]
+
+  # An explicit host image still wins over the manifest. The declaration stays
+  # in normalized review data, but cannot become the effective Lima base.
+  _DB_MANIFEST_IMAGE_REPLACED=1
+  run project_manifest "$manifest"
+  _DB_MANIFEST_IMAGE_REPLACED=0
+  [ "$status" -eq 0 ]
+  [ "$(manifest_value "$output" image)" = "$project/hostile.yaml" ]
+
+  # Check the resolved target too: a disk-image-looking symlink must not smuggle
+  # the same YAML into emit_base_stanza after normalization.
+  ln -s "$project/hostile.yaml" "$project/apparently-safe.qcow2"
+  printf '[image]\nlocation = "./apparently-safe.qcow2"\n' > "$manifest"
+  run project_manifest "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"project manifests cannot select Lima YAML configs"* ]]
+}
+
+@test "repository-selected Lima bases disable inherited forwarding on kept boxes" {
+  source_text="$(<"$DEVBOX")"
+  [[ "$source_text" == *'*) manifest_lima_base=1;;'* ]]
+  [[ "$source_text" == *'( $manifest_lima_base -eq 1 || $converge -eq 1 )'* ]]
+  [[ "$source_text" == *'elif [[ $remove_ssh_agent -eq 1 ]]; then'* ]]
+
+  run bash -c "
+    source '$DEVBOX' 2>/dev/null; set +u
+    limactl() { printf '%s\n' \"\$*\" >&2; }
+    disable_ssh_agent box
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"edit box --set .ssh.forwardAgent = false"* ]]
 }
 
 @test "manifest rejects multiline package names and injectable image digests" {
@@ -1796,7 +1997,20 @@ PY
   h2="$(golden_spec_hash /images/kali.qcow2 "" "apt-get install -y nmap" "")"
   [ -n "$h1" ]
   [ "$h1" = "$h2" ]
-  [[ "$(golden_name /images/kali.qcow2 "$h1")" =~ ^devbox-golden-kali-qcow2-[0-9a-f]{6}-[0-9a-f]{6}$ ]]
+  name="$(golden_name /images/kali.qcow2 "$h1")"
+  [[ "$name" == devbox-golden-kali-qco-"$h1" ]]
+  [[ "$h1" =~ ^[0-9a-f]{16}$ ]]
+}
+
+@test "customized golden names fit Lima's ssh socket path on macOS" {
+  # Lima creates $LIMA_HOME/<name>/ssh.sock.<16 digits>; macOS UNIX_PATH_MAX is 104.
+  h="$(golden_spec_hash /images/kali-linux-2026.2-genericcloud-amd64.qcow2 "sha512:ab" "x" "y")"
+  for image in kali-linux-headless /images/kali-linux-2026.2-genericcloud-amd64.qcow2 \
+               https://example.com/some/very/long/path/to/an-image-name.qcow2; do
+    name="$(golden_name "$image" "$h")"
+    socket="/Users/alexandra-longname/.lima/$name/ssh.sock.1234567890123456"
+    [ "${#socket}" -lt 104 ]
+  done
 }
 
 @test "changing provisioning changes the golden identity" {
@@ -2280,4 +2494,15 @@ true' ''
   # abort devbox before handover instead of just skipping the seeding.
   [ "$status" -eq 0 ]
   [ "$output" = "" ]
+}
+
+@test "relative local image paths are recorded absolutely; names and URLs are kept" {
+  cd "$BATS_TEST_TMPDIR"
+  touch base.qcow2
+  run normalize_image_arg ./base.qcow2
+  [ "$output" = "$(readlink -f "$BATS_TEST_TMPDIR/base.qcow2")" ]
+  run normalize_image_arg ubuntu-24.04
+  [ "$output" = "ubuntu-24.04" ]
+  run normalize_image_arg https://example.com/a/b.qcow2
+  [ "$output" = "https://example.com/a/b.qcow2" ]
 }

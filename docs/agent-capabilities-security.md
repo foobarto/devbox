@@ -42,9 +42,53 @@ read-write so resumable transcripts survive clone deletion; use
 | `github` (`--gh-proxy`) | Use `gh` as the host's GitHub login: read, create, modify, delete, or upload anything that account can reach through `api.github.com`. | It does not receive the host `gh` token. It is never implied by `ai_proxy` or `-a`. |
 | `egress = "audit"` (`--traffic-audit`) | Send proxy-aware public web traffic through a short-lived generic CONNECT capability. Direct TCP/UDP 80/443 fails under the guest firewall; CONNECT audit records reveal destination, timing, and byte counts, while plaintext HTTP can be recorded in detail. | It grants no AI, GitHub, SSH, or host-login credential. HTTPS remains encrypted after CONNECT, and non-web ports remain outside the rule. The generic proxy refuses host/private/LAN destinations. |
 | `--gui` / `-G` (not a grant; command-line only) | Become a Wayland client of the host session through Waypipe. | It does not receive the raw host Wayland socket or host GPU/render-device nodes. This is still a host-desktop capability, not an isolation boundary; see [GUI forwarding security](gui-security.md). |
-| `agent_config` (`--with-agent-config`) | Read selected non-secret rules, prompts, settings, and custom agents copied into the guest. Those instructions can affect agent behavior. | Authentication state, histories, caches, key directories, and files detected as credentials are excluded. |
+| `agent_config` (`--with-agent-config`) | Read selected preference fields exported from known Claude, Codex, and OpenCode structured configuration schemas. | Only explicitly permitted enum, boolean, and bounded numeric values cross the boundary. Unknown fields, credentials, free-form instructions, hooks, plugin code, and unsupported formats stay on the host. |
 | `api_keys` (`--api-keys`) or `host_credentials` (`--with-creds`) | Read actual keys or copied OAuth credentials in the guest. | These deliberately weaken the host-only credential boundary. Prefer `ai_proxy` when the provider workflow supports it. |
 | pre-accepted agent prompts *(always on, no flag)* | Start work in the mounted directory without a trust dialog, which also means the repository's own `.claude/settings.json` and hooks run unprompted. See [pre-accepted agent first-run prompts](#pre-accepted-agent-first-run-prompts). | It gains no capability the flags above do not already grant, and trust is never seeded for `$HOME` or for `--mount` paths. |
+
+## Host configuration and file transfers
+
+`agent_config` exports safe fields from `.claude/settings.json`,
+`.claude/settings.local.json`, `.codex/config.toml`, and
+`.config/opencode/opencode.json`. The current schemas preserve selected model,
+reasoning, approval, sandbox, history, and UI preferences. Fields with arbitrary
+strings or executable content are excluded. Unknown model identifiers are also
+excluded until added to the closed value sets. Stado configuration and JSONC
+currently have no supported export schema. The field schemas are in
+[`devbox-host-files.py`](../proxy/devbox-host-files.py).
+
+File-name allowlists or secret-pattern detection cannot establish that prose,
+custom agents, hooks, rules, or arbitrary configuration are free of secrets.
+Transfer such content only through an explicit `copies` grant (`--copy`), which
+copies raw data including any secrets. `host_credentials` similarly authorizes
+raw credential/configuration transfer; it is separate from `agent_config`.
+
+Before starting or resuming the guest, Devbox opens granted inputs through
+no-follow file descriptors and creates private snapshots outside guest mounts.
+API-key files must be regular files and fit within 1 MiB. Each operator-named
+source is resolved once; the resolved path is then walked without following
+links. Structured configuration inputs are capped at 2 MiB.
+Directory copies use descriptor-based traversal and omit nested symlinks rather
+than resolving their targets. Snapshots are removed when the run ends. This
+prevents a guest from changing a source path into unrelated host content during
+transfer; it does not make explicitly copied content non-sensitive.
+
+Devbox refuses approved sources below a writable mount of any stored Lima VM,
+or below another writable mount planned for this run. It checks pathname and
+device/inode ancestry and, on Linux, unfolds mount-namespace coordinates, so
+distinct bind-mount or filesystem aliases to the same writable ancestor are
+also refused. A guest must not be able to replace a source through a mounted
+parent; choose non-overlapping mounts. Grant sources (copies, credential,
+configuration and API-key files) at or below another stored instance's
+writable mount are refused for the same reason. Devbox also records the device/inode of
+mount sources and their ancestors, then checks them around clone/start
+operations and refuses changes. Lima resolves
+mount paths in a separate process: these surrounding checks cannot atomically
+pin the object Lima resolves or rule out a path that changes and changes back
+entirely during Lima's operation. Changes by external host processes remain a
+trust assumption. Do not mount sensitive paths whose ancestry can be changed
+by an untrusted host process. A path-only Lima interface needs a
+stable-object mounting mechanism to remove this remaining timing limitation.
 
 ## SSH-agent forwarding
 
@@ -110,6 +154,12 @@ to prevent accidental direct execution, while retaining a private executable
 copy for the wrapper itself. Because both remain executable by the guest user,
 this routing measure does not stop deliberately hostile same-user code from
 finding and invoking the private binary.
+
+GitHub and traffic capabilities include a box identity and registration
+generation. The proxy checks the current owner-only host record on every
+request, so removing a grant invalidates copied tokens immediately. Open
+tunnels recheck at least once per second. Kept boxes are stopped before approved
+inputs are snapshotted, and removed host grants are revoked before the next boot.
 
 The host records detailed authenticated-proxy request audits by default,
 including prompts and GitHub mutation payloads. This helps attribute actions,
@@ -236,6 +286,12 @@ an ephemeral session with local configuration and exec-policy rules ignored;
 other CLIs retain their normal provider-side and host-side session behavior.
 The manifest contents still leave the machine for the service configured for
 the selected CLI, and the result does not replace your own decision.
+
+Repository manifests cannot select local Lima YAML configurations. Those files
+are full host-side Lima configuration rather than ordinary guest images, so a
+path-only manifest review cannot safely authorize their transitive settings.
+They remain available as an explicit `--image PATH` choice for trusted host
+configuration; manifests may select templates or raw disk-image files.
 
 An explicit approval is stored as owner-only user state and reused only while
 both the manifest's exact SHA-256 fingerprint and the fingerprint of its

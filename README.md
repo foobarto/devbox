@@ -48,7 +48,7 @@ brew install foobarto/tap/devbox
 
 Installs `devbox` and `devbox-ai-proxy` on your `PATH`. The current stable
 GitHub release is
-[`v2.0.1`](https://github.com/foobarto/devbox/releases/tag/v2.0.1); source
+[`v2.0.2`](https://github.com/foobarto/devbox/releases/tag/v2.0.2); source
 archives are available from that release. Config lives under `~/.config/devbox/`
 (or `$XDG_CONFIG_HOME/devbox`).
 
@@ -75,6 +75,7 @@ devbox --gui|-G [DIR] [FLAGS] [-- APP ...]   same GUI behavior through the main 
 devbox build [--image N] [--force]   build/refresh the golden image
 devbox ls                            list devbox instances
 devbox destroy NAME | --all | --goldens
+devbox adopt NAME DIR                register a kept box from an earlier version to DIR
 devbox sessions [path|clear --yes] [DIR]
 devbox policy [list|show NAME]       list grant policies or show what one grants
 devbox proxy [start|stop|status|refresh|audit]
@@ -99,7 +100,7 @@ devbox --version
 | `--no-auth`, `-n` | explicitly disable Devbox-managed proxy, API-key, and copied-credential auth; removes its proxy/key profiles from an existing box. |
 | `--api-keys[=FILE]`, `-K[=FILE]` | inject API keys into the box from an env file (default `~/.config/devbox/api-keys.env`). |
 | `--with-creds`, `-c` | copy host AI-tool credential files into the box (OAuth logins for claude/codex without a proxy). Best-effort. |
-| `--with-agent-config`, `-g` | copy an allowlisted set of non-secret Claude, Codex, OpenCode, and Stado settings, prompts, rules, and custom agents. Auth, histories, caches, and key directories are excluded; suspected credentials are skipped. |
+| `--with-agent-config`, `-g` | copy explicitly permitted setting fields and values from Claude, Codex, and OpenCode structured configuration. Unknown fields, free-form prompts, rules, hooks, plugins, and unsupported formats are excluded; use an explicit `copies` grant for raw content, which may contain secrets. |
 | `--gui`, `-G` | start a GUI-ready Devbox shell through Waypipe; after the optional `--`, run one guest GUI app instead. |
 | `-a` | shortcut for `--with-agent-config --proxy --ssh-agent`, added to the run's grants; it never enables `--gh-proxy`, `--with-creds`, or GUI forwarding. `--policy agent` grants the same set but replaces the project's grants. |
 | `--mount PATH[:ro\|:rw]`, `-m PATH[:ro\|:rw]` | mount an extra host path into the box at the same path (default `ro`). Repeatable; applied at box creation. |
@@ -291,6 +292,11 @@ Each distinct image gets its own golden. Base-package provisioning auto-detects
 > **Kali:** Lima ships no Kali template, so pass a Kali cloud `.qcow2` (or a
 > `.yaml` referencing one) via `--image`.
 
+A local Lima YAML is trusted host configuration: it may contain arbitrary Lima
+settings, so it is accepted only through an operator's explicit `--image` flag,
+not from a repository-controlled `.devbox.toml`. Project manifests can select a
+template or a raw `.qcow2`, `.img`, or `.raw` disk image instead.
+
 ## Auth
 
 Installed ≠ authenticated. These combinable [grants](docs/policies.md) — or
@@ -302,7 +308,7 @@ their deprecated flags — cover the usual setups:
 | explicitly opt out of Devbox auth | `--policy none` (`--no-auth`) | no new credentials injected |
 | API keys (opencode, stado, OpenAI/Codex platform keys) | `api_keys` (`--api-keys`) | copied into the box |
 | Claude/Codex **subscription OAuth** without a proxy | `host_credentials` (`--with-creds`) | copied into the box |
-| AI CLI settings, prompts, rules, and custom agents without auth | `agent_config` (`--with-agent-config`) | allowlisted non-secret files copied into the box |
+| Selected AI CLI preferences without auth | `agent_config` (`--with-agent-config`) | known setting fields and closed value sets exported from structured configuration |
 | nothing | *(default)* | you log in interactively inside the box |
 
 The proxy supports API keys plus Claude, Codex, and GitHub CLI logins. A host CLI login
@@ -454,7 +460,7 @@ work but are deprecated. Because a project manifest is repository-controlled
 input, Devbox groups every declaration
 by type, gives each category a distinct icon, and prints multiline
 provisioning and startup scripts as readable blocks. Relative host paths in
-local images and in the manifest's `[grants]` resolve from the manifest's
+local disk images and in the manifest's `[grants]` resolve from the manifest's
 directory, so their meaning does not change with the shell's working directory.
 
 On the first use of a manifest, Devbox offers an optional AI summary and safety
@@ -493,10 +499,18 @@ Configuration and generated golden metadata live under `~/.config/devbox/`
 ├── config.toml                  # machine-wide [resources] and default grant policy
 ├── policies/NAME.toml           # host-defined grant policies (see docs/policies.md)
 ├── devbox-golden-<image>.yaml   # generated golden configs
-├── api-keys.env                 # for --api-keys / the proxy   (gitignored)
-├── proxy.config.json            # proxy routes                 (gitignored)
-└── proxy-env                    # optional AI-proxy env template (__PROXY_URL__, __PROXY_TOKEN__)
+├── golden-identities/           # verified golden records (rebuild a golden if missing)
+├── project-identities/          # which project directory each kept box belongs to (devbox adopt)
+├── api-keys.env                 # for --api-keys / the proxy; mode 0600, KEY=value only
+├── proxy.config.json            # proxy routes and limits
+├── proxy-env                    # optional AI-proxy env template (__PROXY_URL__, __PROXY_TOKEN__)
+└── *-proxy-*, proxy-audit*.jsonl # proxy keys, per-box capabilities and audit logs (generated)
 ```
+
+Generated state is owner-only; Devbox refuses capability keys and identity
+records that are symlinks or readable by other users. See
+[docs/security-hardening.md](docs/security-hardening.md) for what these files
+protect.
 
 `config.toml` sets the defaults for every project on this machine — top-level
 keys such as the default grant policy before any table:
@@ -529,10 +543,17 @@ is absent.
 
 ```sh
 brew install bats-core     # once
-make hooks                 # once per checkout; enables credential guard
+make hooks                 # from a reviewed revision; enables credential guard
 make test
 make lint                  # shellcheck, when installed
 ```
+
+`make hooks` copies the credential guard and its authoritative configuration
+into clone-private Git metadata. Rerun it after reviewing hook updates. Because
+the configured path is absolute, rerun it immediately after moving the checkout
+so the guard is active at the new location. Rerun it once to migrate a checkout
+that previously used the worktree-relative `.githooks` path. Checking out
+another branch does not change the installed copy or configuration.
 
 `make e2e` is the destructive integration suite: it creates real Lima boxes,
 calls the host's Claude and Codex logins through the proxy, and copies

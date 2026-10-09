@@ -15,7 +15,7 @@ one declaration instead of reconstructed from flags.
 | `ai_proxy` | `true` or proxy URL | the host's AI-provider logins through the credential proxy; the box holds only a revocable per-box capability | `--proxy`, manifest `proxy` |
 | `github` | `true` or proxy URL | the host's GitHub login for `gh` through the proxy | `--gh-proxy`, manifest `gh_proxy` |
 | `ssh_agent` | `true` | requests to the host SSH agent, and SSH-signed commits | `--ssh-agent`, manifest `ssh_agent` |
-| `agent_config` | `true` | allowlisted, non-secret Claude/Codex/OpenCode/Stado settings, prompts, and agents | `--with-agent-config`, manifest `with_agent_config` |
+| `agent_config` | `true` | explicit safe setting fields and values from Claude/Codex/OpenCode structured configuration; free-form and unknown content excluded | `--with-agent-config`, manifest `with_agent_config` |
 | `api_keys` | `true` or env-file path | the keys in that file, copied into the box | `--api-keys`, manifest `api_keys` |
 | `host_credentials` | `true` | copies of the host AI CLIs' credential files | `--with-creds`, manifest `with_creds` |
 | `egress` | `"open"` or `"audit"` | `"audit"`: ordinary web traffic only through the audited proxy | `--traffic-audit` |
@@ -94,11 +94,15 @@ the chosen grants.
 While a policy is in effect (cases 1–3 above), a kept box is brought in line
 with it on every entry: a grant the policy no longer contains is removed. That
 covers the AI and GitHub proxy wiring (and revokes the box's capability), the
-audited-egress firewall rule, and the copied API-key profile. Three things cannot
-be withdrawn from a running box this way and are only absent from a box created
-under the narrower policy: SSH-agent forwarding already enabled in its Lima
-configuration, files already copied in (agent configuration, credentials,
-`copies`), and mounts, which are fixed at creation.
+audited-egress firewall rule, and the copied API-key profile. Devbox also forces
+SSH-agent forwarding off when the current grants omit `ssh_agent` and either a
+policy is in effect or the kept box uses a repository-selected Lima template; a
+running box is restarted for this. This migrates boxes made by versions that
+could inherit forwarding from that template. Files already
+copied in (agent configuration, credentials, `copies`) and mounts fixed at
+creation cannot be withdrawn this way. Without a policy, a legacy box whose
+base was selected only with CLI flags keeps SSH-agent forwarding until it is
+recreated.
 
 Without any policy in effect, Devbox keeps its earlier behaviour: grants are
 added by flags and a kept box retains what it was given until `--no-auth` or
