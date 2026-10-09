@@ -18,7 +18,7 @@ one declaration instead of reconstructed from flags.
 | `agent_config` | `true` | explicit safe setting fields and values from Claude/Codex/OpenCode structured configuration; free-form and unknown content excluded | `--with-agent-config`, manifest `with_agent_config` |
 | `api_keys` | `true` or env-file path | the keys in that file, copied into the box | `--api-keys`, manifest `api_keys` |
 | `host_credentials` | `true` | copies of the host AI CLIs' credential files | `--with-creds`, manifest `with_creds` |
-| `egress` | `"open"` or `"audit"` | `"audit"`: ordinary web traffic only through the audited proxy | `--traffic-audit` |
+| `egress` | `"open"`, `"audit"` or `"inspect"` | `"audit"`: ordinary web traffic only through the audited proxy; `"inspect"`: also decrypted and classified per request ([inspect proxy](inspect-proxy.md)) | `--traffic-audit[=inspect]` |
 | `mounts` | list of `PATH[:ro\|:rw]` | those host paths, mounted at creation | manifest `mounts` |
 | `copies` | list of `SRC[:DEST]` | copies of those host files and directories | manifest `copies` |
 
@@ -66,10 +66,10 @@ The first of these that applies decides the grants for the run:
    `~/.config/devbox/config.toml`, when there is no manifest.
 4. Nothing: no grants.
 
-`egress = "audit"` in the machine default is a restriction a project cannot
-lift: every manifest keeps audited egress under such a default, whatever policy,
-`[grants]`, or legacy keys it declares. The operator's own `--policy` is not
-bound by it.
+`egress = "audit"` or `"inspect"` in the machine default is a restriction a
+project cannot lift: every manifest keeps at least that egress under such a
+default, whatever policy, `[grants]`, or legacy keys it declares. A manifest may
+tighten `audit` to `inspect`. The operator's own `--policy` is not bound by it.
 
 ```toml
 # .devbox.toml

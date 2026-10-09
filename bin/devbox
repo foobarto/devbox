@@ -66,13 +66,16 @@
 #                    let the guest's `gh` act as the host's GitHub login through
 #                    the same proxy (a separate, GitHub-only grant). A kept box
 #                    keeps it until --gh-proxy=off or --no-auth removes it.
-#   --traffic-audit[=connect|off], -T
+#   --traffic-audit[=connect|inspect|off], -T
 #                    opt in to proxy-or-fail web egress. `connect` sets standard
 #                    HTTP(S) proxy variables and blocks direct TCP/UDP 80/443
 #                    from the guest, leaving the audited host proxy as the way
 #                    out. NO_PROXY exempts only guest loopback and the Devbox
-#                    proxy. It is separate from -a and may break proxy-unaware
-#                    tools; `--traffic-audit=off` removes it from a kept box.
+#                    proxy. `inspect` also has the guest trust a Devbox CA so
+#                    the proxy can decrypt each request and have a configured
+#                    model allow or block it (docs/inspect-proxy.md). It is
+#                    separate from -a and may break proxy-unaware tools;
+#                    `--traffic-audit=off` removes it from a kept box.
 #   --no-auth, -n    do not inject AI/GitHub proxy, API-key, or copied host credentials;
 #                    also removes devbox-managed proxy/key profiles from an
 #                    existing box. Without any policy, a new box gets none.
@@ -991,7 +994,7 @@ proxy_port() {
 }
 # $1 bare http proxy URL; capability token arrives on stdin so it never appears
 # in the host process list. HTTP proxy URLs encode userinfo as Basic auth.
-capability_proxy_url() {
+capability_proxy_url() { # $1 bare endpoint [$2 "empty-password"]; token on stdin
   valid_gh_proxy_endpoint "$1" || return 1
   python3 -c '
 import sys
@@ -1003,12 +1006,14 @@ if source.scheme != "http" or not source.netloc or source.username or source.pas
     raise SystemExit("proxy URL must be a bare http://host:port URL")
 if not token:
     raise SystemExit("proxy capability is empty")
-print(urlunsplit((source.scheme, f"{quote(token)}@{source.netloc}", "", "", "")))
-' "$1"
+# An explicit empty password: git otherwise prompts for a proxy password.
+userinfo = quote(token) + (":" if sys.argv[2:] == ["empty-password"] else "")
+print(urlunsplit((source.scheme, f"{userinfo}@{source.netloc}", "", "", "")))
+' "$1" ${2:+"$2"}
 }
 
 github_proxy_url() { capability_proxy_url "$@"; }
-traffic_proxy_url() { capability_proxy_url "$@"; }
+traffic_proxy_url() { capability_proxy_url "$1" empty-password; }
 
 # The proxy's state directory, resolved exactly as proxy/run.sh resolves it, so
 # registrations written or revoked here are the ones the proxy reads.
@@ -1161,7 +1166,7 @@ proxy_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/nul
 # long-lived daemon, so an upgrade leaves the old one serving until something
 # restarts it; bump this marker whenever an older daemon would be unsafe or
 # incompatible with this devbox (e.g. a CA it can no longer deliver).
-PROXY_REQUIRED_FEATURE="safe-request-diagnostics"
+PROXY_REQUIRED_FEATURE="traffic-inspect"
 proxy_current_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -qw -- "$PROXY_REQUIRED_FEATURE"; }
 # is anything at all listening on the port?
 proxy_port_open() {
@@ -1718,6 +1723,8 @@ persist_kept_traffic_audit() { # $1 running kept instance $2 remembered endpoint
 clear_connect_traffic_audit() { # $1 Lima instance
   local name="$1"
   log "Removing proxy-or-fail traffic audit from $name"
+  remove_guest_inspection_ca "$name" || warn "could not remove the inspection CA from $name"
+  # Also revokes any inspection registration for the box.
   clear_traffic_proxy_endpoint "$name"
   limactl shell "$name" -- bash -s <<'EOF'
 set -euo pipefail
@@ -1782,7 +1789,109 @@ print("# host CONNECT proxy. Direct TCP/UDP 80/443 is blocked by the guest nft t
 for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
     print(f"export {key}={quoted}")
 print(f"export NO_PROXY={no_proxy} no_proxy={no_proxy}")
+# Node 24+ fetch ignores the variables above unless asked to honour them.
+print("export NODE_USE_ENV_PROXY=1")
 ' "$proxy_host" | limactl shell "$name" -- bash -c 'sudo tee /etc/profile.d/zz-devbox-30-traffic-audit.sh >/dev/null'
+}
+
+# `--traffic-audit=inspect` adds TLS inspection on top of connect mode: the
+# host proxy terminates this guest's web TLS with a Devbox CA that the guest
+# trusts, and a configured model classifies each request before it leaves
+# (docs/inspect-proxy.md). The host registration is written before the guest
+# trusts the CA and revoked only after the CA has left the guest, so a mode
+# change fails closed. The CA key never leaves the host.
+traffic_inspection_registered() { # $1 Lima instance
+  local path
+  path="$(proxy_state_dir)/traffic-inspect-boxes/$1"
+  [[ -e "$path" || -L "$path" ]]
+}
+
+require_traffic_inspection_ready() {
+  local launcher status
+  launcher="$(proxy_launcher)" || die "proxy launcher not found"
+  DEVBOX_PROXY_STATE_DIR="$(proxy_state_dir)" "$launcher" --init-inspect-ca >/dev/null \
+    || die "could not create the traffic inspection CA"
+  status="$(DEVBOX_PROXY_STATE_DIR="$(proxy_state_dir)" "$launcher" --inspect-status 2>&1)" \
+    || die "traffic inspection is not ready: $status (configure \"inspect\" in proxy.config.json; see docs/inspect-proxy.md)"
+}
+
+register_traffic_inspection() { # $1 Lima instance $2 traffic proxy endpoint
+  local launcher
+  record_traffic_proxy_endpoint "$1" "$2" || die "could not register traffic proxy grant"
+  launcher="$(proxy_launcher)" || die "proxy launcher not found"
+  DEVBOX_PROXY_STATE_DIR="$(proxy_state_dir)" "$launcher" --register-traffic-inspect-box "$1" \
+    || die "could not register traffic inspection for $1"
+}
+
+apply_traffic_inspection() { # $1 Lima instance, registered and with connect-mode audit applied
+  local name="$1" launcher ca_path
+  launcher="$(proxy_launcher)" || die "proxy launcher not found"
+  ca_path="$(DEVBOX_PROXY_STATE_DIR="$(proxy_state_dir)" "$launcher" --init-inspect-ca)" \
+    || die "could not create the traffic inspection CA"
+  traffic_inspection_registered "$name" || die "traffic inspection for $name is not registered"
+  log "Enabling TLS inspection of web traffic in $name"
+  limactl shell "$name" -- mkdir -p .devbox </dev/null || die "could not prepare $name for the inspection CA"
+  limactl copy "$ca_path" "$name:.devbox/inspect-ca.pem" || die "could not copy the inspection CA into $name"
+  limactl shell "$name" -- bash -s <<'GUEST' || die "could not install the inspection CA in $name"
+set -euo pipefail
+staged="$HOME/.devbox/inspect-ca.pem"
+sudo install -D -m 644 "$staged" /usr/local/share/devbox/inspect-ca.pem
+rm -f -- "$staged"
+if command -v update-ca-certificates >/dev/null 2>&1; then
+  sudo install -D -m 644 /usr/local/share/devbox/inspect-ca.pem /usr/local/share/ca-certificates/devbox-inspect.crt
+  # Debian warns about the bundle itself while rehashing; the bundle is checked below.
+  sudo update-ca-certificates >/dev/null 2>&1
+  bundle=/etc/ssl/certs/ca-certificates.crt
+elif command -v update-ca-trust >/dev/null 2>&1; then
+  if [ -d /etc/pki/ca-trust/source/anchors ]; then
+    sudo install -m 644 /usr/local/share/devbox/inspect-ca.pem /etc/pki/ca-trust/source/anchors/devbox-inspect.pem
+    bundle=/etc/pki/tls/certs/ca-bundle.crt
+  else
+    sudo install -D -m 644 /usr/local/share/devbox/inspect-ca.pem /etc/ca-certificates/trust-source/anchors/devbox-inspect.pem
+    bundle=/etc/ssl/certs/ca-certificates.crt
+  fi
+  sudo update-ca-trust extract
+else
+  echo "traffic inspection needs update-ca-certificates or update-ca-trust in the guest" >&2
+  exit 1
+fi
+marker="$(sed -n 2p /usr/local/share/devbox/inspect-ca.pem)"
+grep -qF -- "$marker" "$bundle" || { echo "the inspection CA did not reach $bundle" >&2; exit 1; }
+# Runtimes with their own trust stores: Node/Bun add NODE_EXTRA_CA_CERTS, Deno
+# DENO_CERT; Python requests/pip, curl and OpenSSL-based tools use the bundle.
+sudo tee /etc/profile.d/zz-devbox-31-traffic-inspect.sh >/dev/null <<PROFILE
+# devbox --traffic-audit=inspect: trust the host proxy's inspection CA.
+export NODE_EXTRA_CA_CERTS=/usr/local/share/devbox/inspect-ca.pem
+export DENO_CERT=/usr/local/share/devbox/inspect-ca.pem
+export SSL_CERT_FILE=$bundle REQUESTS_CA_BUNDLE=$bundle CURL_CA_BUNDLE=$bundle PIP_CERT=$bundle
+PROFILE
+GUEST
+}
+
+remove_guest_inspection_ca() { # $1 Lima instance
+  limactl shell "$1" -- bash -s <<'GUEST'
+set -euo pipefail
+[ -e /usr/local/share/devbox/inspect-ca.pem ] || [ -e /etc/profile.d/zz-devbox-31-traffic-inspect.sh ] || exit 0
+sudo rm -f -- /etc/profile.d/zz-devbox-31-traffic-inspect.sh /usr/local/share/devbox/inspect-ca.pem \
+  /usr/local/share/ca-certificates/devbox-inspect.crt \
+  /etc/pki/ca-trust/source/anchors/devbox-inspect.pem \
+  /etc/ca-certificates/trust-source/anchors/devbox-inspect.pem
+if command -v update-ca-certificates >/dev/null 2>&1; then
+  sudo update-ca-certificates --fresh >/dev/null
+elif command -v update-ca-trust >/dev/null 2>&1; then
+  sudo update-ca-trust extract
+fi
+GUEST
+}
+
+clear_traffic_inspection() { # $1 Lima instance keeping connect-mode audit
+  local name="$1" launcher
+  remove_guest_inspection_ca "$name" || die "could not remove the inspection CA from $name"
+  traffic_inspection_registered "$name" || return 0
+  log "Removing TLS inspection of web traffic from $name"
+  launcher="$(proxy_launcher)" || die "proxy launcher not found"
+  DEVBOX_PROXY_STATE_DIR="$(proxy_state_dir)" "$launcher" --revoke-traffic-inspect-box "$name" \
+    || die "could not revoke traffic inspection for $name"
 }
 
 # ------------------------------------------------------------ GUI / Waypipe ---
@@ -2715,6 +2824,7 @@ if "keep" in data and not isinstance(data["keep"], bool):
 if "no_auth" in data and not isinstance(data["no_auth"], bool):
     raise SystemExit("no_auth must be true or false")
 
+EGRESS_STRENGTH = {"open": 0, "audit": 1, "inspect": 2}
 BUILTIN_POLICIES = {
     "none": {},
     "agent": {"agent_config": True, "ai_proxy": True, "ssh_agent": True},
@@ -2766,8 +2876,8 @@ def normalize_grants(raw, base_dir, where):
         else:
             grants[key] = proxy_endpoint(key, value)
     if "egress" in raw:
-        if raw["egress"] not in ("open", "audit"):
-            raise SystemExit(f'{where}: egress must be "open" or "audit"')
+        if raw["egress"] not in EGRESS_STRENGTH:
+            raise SystemExit(f'{where}: egress must be "open", "audit" or "inspect"')
         grants["egress"] = raw["egress"]
     for key in ("mounts", "copies"):
         if key not in raw:
@@ -2849,7 +2959,8 @@ if legacy_keys and ("policy" in data or "grants" in data):
 # this manifest declares (its own policy, [grants], or legacy keys), it cannot
 # lift a machine default that requires egress = "audit".
 host_default = "" if grants_replaced or policy_lookup else machine_default_policy()
-egress_floor = bool(host_default) and load_policy(host_default)[0].get("egress") == "audit"
+floor_egress = load_policy(host_default)[0].get("egress", "open") if host_default else "open"
+egress_floor = floor_egress != "open"
 if grants_replaced:
     grants = {}
     policy_name = ""
@@ -2868,8 +2979,9 @@ else:
         if default_policy:
             grants, policy_source = load_policy(default_policy)
     grants.update(normalize_grants(data.get("grants", {}), manifest_dir, "[grants]"))
-if egress_floor:
-    grants["egress"] = "audit"
+# A manifest may tighten the floor (audit -> inspect), never loosen it.
+if EGRESS_STRENGTH[grants.get("egress", "open")] < EGRESS_STRENGTH[floor_egress]:
+    grants["egress"] = floor_egress
 
 proxy = grants.get("ai_proxy", False)
 gh_proxy = grants.get("github", False)
@@ -2893,7 +3005,7 @@ print(json.dumps({
     "with_agent_config": grants.get("agent_config", False),
     "no_auth": data.get("no_auth", False),
     "mounts": mounts, "copies": copies,
-    "traffic_audit": "connect" if grants.get("egress") == "audit" else "",
+    "traffic_audit": {"audit": "connect", "inspect": "inspect"}.get(grants.get("egress"), ""),
     "policy": policy_name or default_policy, "policy_source": policy_source,
     "policy_is_default": bool(default_policy),
     # A policy, [grants], or the machine default declares the box's whole grant
@@ -3000,7 +3112,11 @@ if data["no_auth"]:
     emit("no-auth", "Disable Devbox-managed authentication")
 if data.get("traffic_audit"):
     floor = " (required by this machine's default policy)" if data.get("egress_floor") else ""
-    emit("egress", f"Send ordinary web traffic only through the audited host proxy (egress = audit){floor}")
+    if data["traffic_audit"] == "inspect":
+        emit("egress", "Send ordinary web traffic only through the host proxy, which decrypts it and has "
+             f"a model classify each request before it leaves (egress = inspect){floor}")
+    else:
+        emit("egress", f"Send ordinary web traffic only through the audited host proxy (egress = audit){floor}")
 
 for item in data["mounts"]:
     if item.endswith(":rw"):
@@ -3601,7 +3717,7 @@ run_cleanup() {
 }
 
 cmd_run() {
-  local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 with_agent_config=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name="" gui=0 traffic_audit="" ephemeral_sessions=0
+  local dir="" image="$DEFAULT_IMAGE" image_set=0 keep=0 with_creds=0 with_agent_config=0 api_keys="" proxy="" no_auth=0 ssh_agent=0 name="" gui=0 traffic_audit="" traffic_audit_bare=0 ephemeral_sessions=0
   local gh_proxy="" no_gh_proxy=0 cli_policy="" legacy_flags=()
   local extra_mounts=() extra_copies=() manifest_requests=() gui_command=()
   local cli_cpus="" cli_memory="" cli_disk=""
@@ -3635,7 +3751,7 @@ cmd_run() {
       --gh-proxy=off|-H=off) no_gh_proxy=1; gh_proxy=""; legacy_flags+=(--gh-proxy);;
       --gh-proxy=|-H=) die "--gh-proxy= needs a proxy URL or off";;
       --gh-proxy=*|-H=*) gh_proxy="${1#*=}"; legacy_flags+=(--gh-proxy);;
-      --traffic-audit|-T) traffic_audit=connect; legacy_flags+=(--traffic-audit);;
+      --traffic-audit|-T) traffic_audit=connect; traffic_audit_bare=1; legacy_flags+=(--traffic-audit);;
       --traffic-audit=*|-T=*) traffic_audit="${1#*=}"; legacy_flags+=(--traffic-audit);;
       --mount|-m) shift; extra_mounts+=("${1:?--mount needs PATH[:ro|:rw]}");;
       --mount=*|-m=*) extra_mounts+=("${1#*=}");;
@@ -3653,8 +3769,8 @@ cmd_run() {
   [[ $gui -eq 1 || ${#gui_command[@]} -eq 0 ]] || \
     die "-- is only valid with devbox gui"
   case "$traffic_audit" in
-    ""|connect|off) ;;
-    *) die "--traffic-audit accepts connect or off";;
+    ""|connect|inspect|off) ;;
+    *) die "--traffic-audit accepts connect, inspect or off";;
   esac
   dir="$(abspath "${dir:-$PWD}")"
   [[ -d "$dir" ]] || die "not a directory: $dir"
@@ -3744,8 +3860,10 @@ cmd_run() {
       [[ "$(manifest_value "$grants" with_creds)" == True ]] && with_creds=1
     fi
     [[ "$(manifest_value "$grants" no_auth)" == True ]] && no_auth=1
-    if [[ -z "$traffic_audit" && "$(manifest_value "$grants" traffic_audit)" == connect ]]; then
-      traffic_audit=connect
+    if [[ -z "$traffic_audit" ]]; then
+      local traffic_grant
+      traffic_grant="$(manifest_value "$grants" traffic_audit)"
+      [[ "$traffic_grant" != connect && "$traffic_grant" != inspect ]] || traffic_audit="$traffic_grant"
     fi
     while IFS= read -r item; do
       [[ -n "$item" ]] || continue
@@ -4041,17 +4159,37 @@ PY
       managed_traffic_audit=off
     elif [[ -n "$traffic_proxy_endpoint" ]]; then
       managed_traffic_audit=connect
-      log "Refreshing remembered proxy-or-fail traffic audit for $name"
+      traffic_inspection_registered "$name" && managed_traffic_audit=inspect
+      log "Refreshing remembered proxy-or-fail traffic audit ($managed_traffic_audit) for $name"
     fi
   fi
   case "$managed_traffic_audit" in
     off) clear_connect_traffic_audit "$name";;
-    connect)
+    connect|inspect)
       [[ -n "$traffic_proxy_endpoint" ]] || \
         traffic_proxy_endpoint="$(proxy_endpoint "${proxy:-${gh_proxy:-$PROXY_DEFAULT_URL}}")" \
         || die "proxy must be a bare http://host:port URL with a numeric port"
+      # A bare --traffic-audit asks for audited egress, not for a downgrade:
+      # it keeps a box's (or the manifest's) inspection. Only =connect lowers it.
+      if [[ "$managed_traffic_audit" == connect && $traffic_audit_bare -eq 1 ]] \
+         && { traffic_inspection_registered "$name" \
+              || [[ -n "${grants:-}" && "$(manifest_value "$grants" traffic_audit)" == inspect ]]; }; then
+        managed_traffic_audit=inspect
+      fi
+      if [[ "$managed_traffic_audit" == inspect ]]; then
+        require_traffic_inspection_ready
+        proxy_ensure "$traffic_proxy_endpoint" || die "could not start traffic proxy"
+        # Registered before the guest's profile receives a fresh capability, so
+        # running processes cannot open an opaque tunnel in between.
+        register_traffic_inspection "$name" "$traffic_proxy_endpoint"
+      fi
       proxy_ensure "$traffic_proxy_endpoint" || die "could not start traffic proxy"
-      apply_connect_traffic_audit "$name" "$traffic_proxy_endpoint";;
+      apply_connect_traffic_audit "$name" "$traffic_proxy_endpoint"
+      if [[ "$managed_traffic_audit" == inspect ]]; then
+        apply_traffic_inspection "$name"
+      else
+        clear_traffic_inspection "$name"
+      fi;;
   esac
   [[ $with_agent_config -eq 1 ]] && apply_agent_config "$name"
   if [[ ${#extra_copies[@]} -gt 0 ]]; then
